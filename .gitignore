@@ -1,0 +1,10 @@
+node_modules/
+.env
+.env.*
+!.env.example
+*.log
+coverage/
+codex-bridge-state/
+codex-native-state/
+.codex/
+.omp/
