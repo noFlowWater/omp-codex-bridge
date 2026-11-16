@@ -112,7 +112,7 @@ function progressLine(method, params, state) {
  * written before each native mutation, so a crash, dispose, revive or OMP requeue never sends
  * the same input to Codex twice.
  */
-export function createCodexBridgeProvider({ EventStream, stateDir, onRequest, onProgress, createClient = options => new CodexAppServerClient(options) }) {
+export function createCodexBridgeProvider({ EventStream, stateDir, onRequest, onProgress, onRateLimits, onNotice, createClient = options => new CodexAppServerClient(options) }) {
   if (typeof stateDir !== 'string' || !stateDir) throw new TypeError('stateDir must be a nonempty path');
   const sessions = new Map();
   // Latest drive per session, and the teardown a reopened session must await.
@@ -140,7 +140,13 @@ export function createCodexBridgeProvider({ EventStream, stateDir, onRequest, on
     }
     session = loadSession(stateDir, sessionId, nativeModel, options.cwd);
     session.client = createClient({
-      onNotification: (method, params) => session.sink?.(method, params),
+      onNotification: (method, params) => {
+        if (method === 'account/rateLimits/updated') {
+          try { onRateLimits?.(params); } catch { /* UI observers cannot break native work. */ }
+          return;
+        }
+        session.sink?.(method, params);
+      },
       onRequest: onRequest?.forClient?.() ?? onRequest,
     });
     const config = session.client.config ?? {};
@@ -294,6 +300,8 @@ export function createCodexBridgeProvider({ EventStream, stateDir, onRequest, on
     if (!options.sessionId) return finish('error', 'codex-bridge requires a stable session id; no native turn started');
     if (!options.cwd) return finish('error', 'codex-bridge requires the session cwd; no native turn started');
     if (signal?.aborted) return finish('aborted', 'Cancelled before submission; no native turn started');
+    let taskName;
+    let serviceTier = options.serviceTier;
     if (options.onPayload) {
       const payload = { api: CODEX_BRIDGE_API, sessionId: options.sessionId };
       const request = { sessionId: options.sessionId, captured: false };
@@ -306,10 +314,13 @@ export function createCodexBridgeProvider({ EventStream, stateDir, onRequest, on
           return finish('error', 'Provider request hooks changed native request identity; no native turn started');
         }
         if (!request.captured) return finish('error', 'Native request hooks did not supply authoritative session context; no native turn started');
+        taskName = request.taskName;
+        serviceTier ??= request.serviceTier;
       } finally {
         payloadRequests.delete(payload);
       }
     }
+    if (serviceTier === 'auto') serviceTier = undefined;
     const yieldTool = context.tools?.find(tool => tool.name === 'yield');
     if (yieldTool && !outputSchemas.has(options.sessionId)) {
       return finish('error', 'No authoritative session_init output schema metadata is available; no native turn started');
@@ -461,13 +472,20 @@ export function createCodexBridgeProvider({ EventStream, stateDir, onRequest, on
       try {
         snapshot = await client.run({
           threadId: session.threadId, input, cwd: options.cwd, model: session.model,
-          effort, outputSchema, developerInstructions: system || undefined,
+          effort, serviceTier, outputSchema, developerInstructions: system || undefined,
           // A thread whose ID cannot be recorded gets no turn.
           onThread: (threadId) => {
             if (session.threadId !== threadId) {
               session.threadId = threadId;
               session.threads.add(threadId);
               saveSession(stateDir, session);
+            }
+            if (taskName && (session.nativeName?.threadId !== threadId || session.nativeName.name !== taskName)) {
+              session.nativeName = { threadId, name: taskName };
+              // Titles are optional metadata; their RPC must not delay or replay task input.
+              void client.setThreadName(threadId, taskName).catch(error => {
+                try { onNotice?.(`Codex task name could not be saved: ${clip(error.message, 300)}`, 'warning'); } catch { /* UI only. */ }
+              });
             }
           },
         });
@@ -812,7 +830,7 @@ export function createCodexBridgeProvider({ EventStream, stateDir, onRequest, on
     branchedSessions.set(journalId, session);
   };
   streamSimple.context = (event, ctx) => captureContext(event, ctx);
-  streamSimple.beforeProviderRequest = (event, ctx) => {
+  streamSimple.beforeProviderRequest = (event, ctx, metadata = {}) => {
     const request = payloadRequests.get(event.payload);
     if (!request) return;
     if (event.payload.api !== CODEX_BRIDGE_API || event.payload.sessionId !== request.sessionId) {
@@ -826,6 +844,10 @@ export function createCodexBridgeProvider({ EventStream, stateDir, onRequest, on
     }
     captureContext({}, ctx, request.sessionId);
     providerSessionIds.set(ctx.sessionManager.getSessionId(), request.sessionId);
+    const title = ctx.sessionManager.getSessionName?.();
+    request.taskName = typeof title === 'string' && title.trim() ? title
+      : ctx.agent?.kind === 'sub' && typeof ctx.agent.id === 'string' ? ctx.agent.id : undefined;
+    request.serviceTier = metadata.serviceTier;
     request.captured = true;
     branchedSessions.delete(journalId);
     return event.payload;

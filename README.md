@@ -6,7 +6,7 @@ Codex owns inference, native tools, authentication and persistent threads. OMP o
 
 ## Requirements
 
-- Compatibility target: OMP 18.20.3. Codex 0.167.2 supplies the protocol fixtures; native startup, diagnostics and thread-permission checks also pass on 0.169.0 without model inference. Re-run the checks below after upgrades.
+- Compatibility target: OMP 18.20.3 and Codex CLI 0.169.0. Protocol doubles exercise native contracts; real-server startup, diagnostics, permissions and naming checks run without model inference. Re-run the checks below after upgrades.
 - Codex CLI on `PATH`, authenticated with `codex login`. OMP uses its embedded Bun runtime to load the plugin.
 - Development: Node.js 20.19 or newer and Bun 1.4.2 or newer. The standalone client also supports Node.js 20.19+.
 - Local lifecycle, branching and `/clear` smoke checks also passed on OMP 18.21.0; the pinned CI target remains 18.20.3.
@@ -37,6 +37,8 @@ Ask the main assistant to delegate to `codex-bridge`, or use the task tool:
 
 Open Agent Hub with `Alt+A` or double left-arrow on an empty editor. Focus the child to inspect its progress and send messages; Hub `x` interrupts it. A follow-up to the same child continues its native thread.
 
+OMP task/session names are copied to native thread names on the next request. Child task identity supplies the name when no session title exists. Naming is metadata-only; a title failure does not replay or reject task input.
+
 Running-turn steering requires OMP's `providers.openaiLiveSteering` setting. With it disabled, a message is queued for the next native turn. Installation does not enable this setting.
 
 ### Model selection
@@ -47,9 +49,17 @@ Per-task selection requires the operator's `task.perCallModel: on` and a matchin
 
 The shipped native selectors are a compatibility snapshot, not a promise that every account exposes them. Use `codex-bridge/default` for Codex's configured model. Add new exact selectors to an operator-owned agent definition only after reviewing native model discovery; wildcard model entries do not grant per-call permission.
 
+### Processing tier
+
+Use `/codex tier` for a picker or `/codex tier priority` to change OMP's existing OpenAI-family setting for this session. `/codex tier inherit` clears that override. Hub requests use the selected tier for each new native turn; `auto` and omitted selections preserve Codex defaults. This setting also applies to other OpenAI-family models in the same OMP session.
+
+Direct calls can set `"serviceTier":"fast"` or another native tier per `run`; omission inherits native configuration. Availability depends on Codex and the account. Requests use native `serviceTierForTurn`, leaving the thread's future default unchanged. Cards distinguish requested tier from effective tier; an unreported effective tier stays unknown.
+
+Tier selection can change quota consumption or charges. The bridge does not estimate subscription cost.
+
 ## Direct tool
 
-`codex_bridge` exposes `run`, `status`, `cancel` and `shutdown`. Direct-tool threads do not appear in Agent Hub.
+`codex_bridge` exposes `run`, `fork`, `status`, `cancel` and `shutdown`. Direct-tool threads do not appear in Agent Hub.
 
 ```json
 {"action":"run","cwd":"/absolute/project","model":"gpt-6.1-sol","prompt":"Inspect the parser without edits."}
@@ -70,6 +80,14 @@ Continue or cancel a thread owned by the current direct-tool server:
 
 `status` can inspect saved native history after restart without adopting it. Direct `run` cannot continue threads from another server lifecycle; task agents use their saved lineage for revival.
 
+Fork saved history into a new locally owned direct thread:
+
+```json
+{"action":"fork","threadId":"<saved-source-id>","name":"Parser follow-up"}
+```
+
+The response returns the new thread ID and continuation arguments. Forking copies through the latest completed turn, or the explicit `lastTurnId`; it starts no inference and preserves source history and cwd. Optional naming errors appear as `nameWarning` alongside the successful admission.
+
 ## Inspect and diagnose
 
 Use OMP's `/codex` command without starting model work:
@@ -80,9 +98,14 @@ Use OMP's `/codex` command without starting model work:
 /codex history {"limit":10,"searchTerm":"parser"}
 /codex show THREAD_ID
 /codex show THREAD_ID {"includeDiff":true,"limit":10}
+/codex history --json {"limit":10}
+/codex fork THREAD_ID
+/codex tier
 ```
 
 `doctor` reports native connection, authentication availability, model catalog, supported quota information and readable OMP routing settings. Unavailable checks are labelled; credentials and account identifiers are not displayed. It never logs in, changes settings or consumes credits.
+
+Interactive `history` opens a paged native OMP picker with source name and cwd. Choose details or explicitly confirm a fork into a new direct-tool thread. Headless `history`, `history --json` and direct-tool history return JSON.
 
 `history` supports `cursor`, `limit`, `searchTerm` and `cwd`. `show` supports `includeItems`, `turnId`, `cursor`, `limit` and `includeDiff`. When paging items, retain the returned `turnId` alongside its next cursor. Use small item pages for readable diffs. Inspection does not adopt or resume threads. File changes describe native-reported edits, including rename destinations; shell or generator edits may be absent. Diff content is bounded and returned only when requested. ID-free `status` lists locally loaded direct-tool threads; use history or an explicit thread ID for other saved work.
 
@@ -95,6 +118,8 @@ The direct tool exposes the same operations:
 ```
 
 The native OMP footer shows `Codex N active · Alt+A`; Agent Hub owns per-worker progress. Execution context, activity and plans remain in the child's transcript and `codex_bridge status`, including updates beyond the transcript log cap. Failed-command output tails can contain sensitive application output; longer command output and file diffs are not automatically dumped.
+
+Native quota events generate one warning on exhaustion and an informational notice on observed recovery, shared across concurrent workers. Reset times appear when reported. Sparse or unavailable fields do not imply recovery; there is no quota polling or automatic retry.
 
 Versioned changes are recorded in [CHANGELOG.md](CHANGELOG.md). Install a reviewed release tag to pin deployment, and restart OMP after changing revisions.
 

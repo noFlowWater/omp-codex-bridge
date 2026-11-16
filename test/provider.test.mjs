@@ -133,6 +133,7 @@ async function withHost(options, store, body) {
       zod,
       registerTool: (tool) => tools.set(tool.name, tool),
       registerCommand: () => {},
+      getServiceTiers: () => options.ompServiceTier ? { openai: options.ompServiceTier } : {},
       registerProvider: (name, config) => providers.set(name, config),
       // Several registrations of one event all run, as in the host.
       on: (event, handler) => {
@@ -2839,3 +2840,101 @@ test('progress never relaxes structured final JSON validation', async () => {
   assert.match(message.errorMessage, /invalid structured data/);
   assert.ok(message.content.every(block => block.type !== 'toolCall'));
 });
+
+test('task metadata names native history and forwards the OMP tier without changing later defaults', async () => {
+  await withHost({ turns: ['finish-later', 'finish-later'], ompServiceTier: 'priority' }, undefined, async ({ child, dir }) => {
+    const worker = await child('ParserReview');
+    let title = 'Parser review';
+    worker.ctx.sessionManager.getSessionName = () => title;
+    const sessionId = worker.ctx.sessionManager.getSessionId();
+    const onPayload = payload => worker.handlers.get('before_provider_request')({ payload }, worker.ctx);
+    const firstPrompt = user('inspect parser');
+    const first = await stream(worker.providers, { messages: [firstPrompt] }, { sessionId, onPayload });
+    assert.equal(first.final.type, 'done', first.message.errorMessage);
+    await until(() => trace(dir).some(entry => entry.message?.method === 'thread/name/set'));
+    title = 'Parser error paths';
+    const second = await stream(worker.providers, { messages: [firstPrompt, first.message, user('inspect errors')] }, { sessionId, onPayload, serviceTier: 'auto' });
+    assert.equal(second.final.type, 'done', second.message.errorMessage);
+    await until(() => trace(dir).filter(entry => entry.message?.method === 'thread/name/set').length === 2);
+    const calls = trace(dir).map(entry => entry.message).filter(Boolean);
+    assert.deepEqual(calls.filter(call => call.method === 'thread/name/set').map(call => call.params.name), ['Parser review', 'Parser error paths']);
+    const turns = calls.filter(call => call.method === 'turn/start');
+    assert.equal(turns[0].params.serviceTierForTurn, 'priority');
+    assert.ok(!Object.hasOwn(turns[1].params, 'serviceTierForTurn'));
+    assert.ok(turns.every(turn => !Object.hasOwn(turn.params, 'serviceTier')));
+    assert.equal(new Set(turns.map(turn => turn.params.threadId)).size, 1);
+  });
+}, TIMEOUT);
+
+test('native title failure cannot reject or replay a task', async () => {
+  await withHost({ turns: ['finish-later'], nameError: 'title refused' }, undefined, async ({ child, dir }) => {
+    const worker = await child('Review');
+    const result = await stream(worker.providers, { messages: [user('inspect')] }, {
+      sessionId: worker.ctx.sessionManager.getSessionId(),
+      onPayload: payload => worker.handlers.get('before_provider_request')({ payload }, worker.ctx),
+    });
+    assert.equal(result.final.type, 'done', result.message.errorMessage);
+    assert.equal(trace(dir).filter(entry => entry.message?.method === 'turn/start').length, 1);
+  });
+}, TIMEOUT);
+
+test('Hub and direct-tool quota notifications share one native warning without starting extra work', async () => {
+  const event = { rateLimits: { limitId: 'codex', limitName: 'Codex', primary: { usedPercent: 100, resetsAt: 1900000000 } } };
+  await withHost({ turns: ['finish-later', 'finish-later'], rateLimitUpdatesOnTurn: [event, event] }, undefined, async ({ child, ctx, call, dir }) => {
+    const notices = [];
+    ctx.hasUI = true;
+    ctx.ui.notify = (message, type) => notices.push({ message, type });
+    const worker = await child('QuotaReview');
+    const result = await stream(worker.providers, { messages: [user('inspect')] }, { sessionId: 'quota-worker' });
+    assert.equal(result.final.type, 'done', result.message.errorMessage);
+    const direct = await call({ action: 'run', prompt: 'inspect direct', cwd });
+    assert.equal(direct.isError, false);
+    await until(() => notices.length > 0);
+    assert.equal(notices.filter(notice => notice.type === 'warning').length, 1);
+    assert.match(notices[0].message, /limit reached.*100%.*reset/);
+    assert.equal(trace(dir).filter(entry => entry.message?.method === 'turn/start').length, 2);
+  });
+}, TIMEOUT);
+
+test('direct run and fork report optional naming errors without hiding admitted work', async () => {
+  await withHost({ turns: ['finish-later'], nameError: 'title refused' }, undefined, async ({ call, followUps, dir }) => {
+    const started = await call({ action: 'run', prompt: 'inspect', cwd, name: 'Review' });
+    assert.equal(started.isError, false);
+    assert.match(started.json.nameWarning, /title refused/);
+    await until(() => followUps.length > 0);
+    const forked = await call({ action: 'fork', threadId: started.json.threadId, name: 'Follow-up review' });
+    assert.equal(forked.isError, false);
+    assert.equal(forked.json.forked, true);
+    assert.match(forked.json.nameWarning, /title refused/);
+    assert.notEqual(forked.json.threadId, started.json.threadId);
+    assert.equal(trace(dir).filter(entry => entry.message?.method === 'turn/start').length, 1);
+    assert.equal(trace(dir).filter(entry => entry.message?.method === 'thread/fork').length, 1);
+  });
+}, TIMEOUT);
+
+test('direct history fork preserves its source and continues only the new owned thread', async () => {
+  const source = { id: 'saved-one', cwd, name: 'Saved review', turns: [{ id: 'saved-turn', status: 'completed', items: [] }] };
+  const store = { nextThread: 10, nextTurn: 10, threads: { 'saved-one': source } };
+  await withHost({ turns: ['finish-later', 'finish-later'] }, store, async ({ call, followUps, dir }) => {
+    const forked = await call({ action: 'fork', threadId: 'saved-one', name: 'Follow-up review' });
+    assert.equal(forked.isError, false);
+    assert.equal(forked.json.inferenceStarted, false);
+    assert.match(forked.json.scope, /not an Agent Hub worker/);
+    assert.notEqual(forked.json.threadId, source.id);
+    assert.deepEqual(JSON.parse(readFileSync(join(dir, 'store.json'), 'utf8')).threads[source.id], source);
+    assert.equal(trace(dir).filter(entry => entry.message?.method === 'turn/start').length, 0);
+    const denied = await call({ action: 'run', threadId: source.id, prompt: 'must not run', cwd });
+    assert.equal(denied.json.code, 'THREAD_NOT_OWNED');
+    const continued = await call({ action: 'run', threadId: forked.json.threadId, prompt: 'continue review', cwd, name: 'Renamed review', serviceTier: 'fast' });
+    assert.equal(continued.isError, false);
+    await until(() => followUps.length === 1);
+    const another = await call({ action: 'run', prompt: 'new review', cwd });
+    assert.equal(another.isError, false);
+    const turns = trace(dir).filter(entry => entry.message?.method === 'turn/start').map(entry => entry.message.params);
+    assert.equal(turns.length, 2);
+    assert.equal(turns[0].threadId, forked.json.threadId);
+    assert.equal(turns[0].serviceTierForTurn, 'fast');
+    assert.ok(!Object.hasOwn(turns[1], 'serviceTierForTurn'));
+    assert.deepEqual(JSON.parse(readFileSync(join(dir, 'store.json'), 'utf8')).threads[source.id], source);
+  });
+}, TIMEOUT);

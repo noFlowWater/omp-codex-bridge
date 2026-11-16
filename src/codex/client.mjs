@@ -8,13 +8,14 @@ import {
 } from './protocol.mjs';
 import {
   listModels, inspectConnection, listThreads, getThreadDetails, inspectThreadStatus, readLastTurn,
-  projectItem, recordItem, threadSnapshot,
+  projectItem, recordItem, threadSnapshot, quotaSnapshot,
 } from './inspection.mjs';
 
 function blankState(threadId) {
   return {
     threadId, turnId: null, status: 'idle', error: null, outcomeUnknown: false,
-    cwd: null, model: null, permissions: null, requestedReasoningEffort: null, developerInstructions: undefined,
+    cwd: null, model: null, name: null, permissions: null, requestedReasoningEffort: null, developerInstructions: undefined,
+    requestedServiceTier: null, serviceTier: null, threadServiceTier: null,
     latestActivity: null, latestPlan: null, fileChanges: [], commandFailure: null, inspection: 'live',
     tokenUsage: null, tokenUsageTurnId: null, usageBaseline: null, turnUsage: null,
     events: [], messages: new Map(), textSize: 0, textTruncated: false,
@@ -25,8 +26,8 @@ function blankState(threadId) {
 
 
 export class CodexAppServerClient {
-  // onNotification(method, boundedParams) observes owned-thread notifications (item progress for
-  // provider streaming); the default subscriber API stays the lightweight {threadId, turnId, status}.
+  // onNotification(method, boundedParams) observes owned-thread notifications and safe global quota
+  // updates; the default subscriber API stays the lightweight {threadId, turnId, status}.
   constructor({ command, timeoutMs, env, config, onNotification, onRequest } = {}) {
     if (onNotification !== undefined && typeof onNotification !== 'function') throw new TypeError('onNotification must be a function');
     if (onRequest !== undefined && typeof onRequest !== 'function') throw new TypeError('onRequest must be a function');
@@ -178,6 +179,7 @@ export class CodexAppServerClient {
                 throw denied;
               }
               Object.assign(state, { cwd: result.cwd ?? directory, model: result.model ?? model ?? null, developerInstructions,
+                threadServiceTier: typeof result.serviceTier === 'string' ? result.serviceTier : null,
                 permissions: bounded({ approvalPolicy: result.approvalPolicy ?? null, sandbox: result.sandbox ?? null }), attached: true });
               if (!threadId) state.usageBaseline = Object.fromEntries(USAGE_KEYS.map(key => [key, 0]));
               this._confirmOutcome(state, request.id);
@@ -218,12 +220,29 @@ export class CodexAppServerClient {
     });
   }
 
+  // Metadata-only mutation of an owned thread. Its uncertainty never changes native turn identity.
+  async setThreadName(threadId, name) {
+    nonempty(threadId, 'threadId');
+    nonempty(name, 'name');
+    const state = this._threads.get(threadId);
+    if (!state) throw new Error(`Unknown local thread: ${threadId}`);
+    try {
+      await this.connect();
+      await this._request('thread/name/set', { threadId, name }, { mutation: true,
+        onResult: () => { state.name = name.slice(0, 1024); } });
+      return this._threadSnapshot(state);
+    } catch (error) {
+      throw withThread(error, threadId);
+    }
+  }
+
 
   // onThread(threadId) runs once the thread ID is confirmed and before any turn request, so a
   // caller can record the authoritative native ID first; if it throws, no turn is requested.
-  async run({ threadId, prompt, input, cwd, model, onThread, sandbox, effort, outputSchema, developerInstructions } = {}) {
+  async run({ threadId, prompt, input, cwd, model, onThread, sandbox, effort, outputSchema, developerInstructions, serviceTier } = {}) {
     input = userInput(prompt, input);
     if (effort !== undefined) nonempty(effort, 'effort');
+    if (serviceTier != null) nonempty(serviceTier, 'serviceTier');
     if (outputSchema !== undefined) {
       if (!outputSchema || typeof outputSchema !== 'object' || Array.isArray(outputSchema)) throw new TypeError('outputSchema must be a JSON Schema object');
       outputSchema = jsonValue(outputSchema, 'outputSchema');
@@ -236,8 +255,8 @@ export class CodexAppServerClient {
         state = await this._loadThread({ threadId, cwd, model, developerInstructions });
         const directory = state.cwd;
         if (onThread) await onThread(state.threadId);
-        if (state.status === 'inProgress' && (effort !== undefined || outputSchema !== undefined)) {
-          throw new Error('effort and outputSchema cannot change an active turn through turn/steer');
+        if (state.status === 'inProgress' && (effort !== undefined || outputSchema !== undefined || serviceTier != null)) {
+          throw new Error('effort, outputSchema and serviceTier cannot change an active turn through turn/steer');
         }
         if (state.status === 'inProgress' && !state.turnId) await this._reconcile(state);
         if (state.status === 'inProgress') {
@@ -246,12 +265,15 @@ export class CodexAppServerClient {
           this._resetTurn(state);
           state.status = 'inProgress';
           state.requestedReasoningEffort = effort ?? null;
+          state.requestedServiceTier = serviceTier ?? null;
           this._publish(state);
           try {
             await this._request('turn/start', {
               threadId: state.threadId, input, cwd: directory,
               ...(model === undefined ? {} : { model }),
               ...(effort === undefined ? {} : { effort }),
+              // Native serviceTier persists into later turns; serviceTierForTurn is the one-turn override.
+              ...(serviceTier == null ? {} : { serviceTierForTurn: serviceTier }),
               ...(outputSchema === undefined ? {} : { outputSchema }),
             }, {
               state, mutation: true,
@@ -319,6 +341,7 @@ export class CodexAppServerClient {
               throw withThread(denied, id);
             }
             Object.assign(forked, { cwd: result.cwd ?? directory, model: result.model ?? model ?? null, developerInstructions,
+              threadServiceTier: typeof result.serviceTier === 'string' ? result.serviceTier : null,
               permissions: bounded({ approvalPolicy: result.approvalPolicy ?? null, sandbox: result.sandbox ?? null }), attached: true });
             this._applyThread(forked, result.thread);
             if (request.timedOut) forked.error = 'Codex thread/fork response arrived after its timeout; no turn was started';
@@ -423,9 +446,10 @@ export class CodexAppServerClient {
   }
 
   // Steers only the named active turn; a finished or different turn is refused (no new turn starts).
-  async steer({ threadId, turnId, prompt, input } = {}) {
+  async steer({ threadId, turnId, prompt, input, serviceTier } = {}) {
     nonempty(threadId, 'threadId');
     nonempty(turnId, 'turnId');
+    if (serviceTier != null) throw new Error('serviceTier cannot change an active turn through turn/steer');
     input = userInput(prompt, input);
     return this._serialize(threadId, async () => {
       const state = this._threads.get(threadId);
@@ -493,6 +517,7 @@ export class CodexAppServerClient {
   _applyThread(state, thread) {
     if (typeof thread.cwd === 'string') state.cwd = thread.cwd;
     if (typeof thread.model === 'string') state.model = thread.model;
+    if (typeof thread.name === 'string' || thread.name === null) state.name = thread.name?.slice(0, 1024) ?? null;
     const turns = Array.isArray(thread.turns) ? thread.turns : [];
     const turn = turns.findLast(entry => entry.status === 'inProgress') ?? turns.at(-1);
     if (turn) this._applyTurn(state, turn);
@@ -504,7 +529,10 @@ export class CodexAppServerClient {
   }
 
   _resetTurn(state, id = null) {
-    if (state.turnId !== id && state.turnId !== null) state.requestedReasoningEffort = null;
+    if (state.turnId !== id && state.turnId !== null) {
+      state.requestedReasoningEffort = null;
+      state.requestedServiceTier = null;
+    }
     if (state.turnId && state.turnId !== id) {
       state.retired.add(state.turnId);
       if (state.retired.size > 100) state.retired.delete(state.retired.values().next().value);
@@ -515,6 +543,7 @@ export class CodexAppServerClient {
       this._abortRequests(state.threadId, state.turnId);
       state.usageBaseline = state.tokenUsage?.total ?? state.usageBaseline;
       state.turnUsage = null;
+      state.serviceTier = null;
       state.asyncQuestions.clear();
     }
     state.turnId = id;
@@ -535,6 +564,7 @@ export class CodexAppServerClient {
     const id = nonempty(turn.id, 'turn.id');
     if (state.retired.has(id)) return;
     if (state.turnId !== id) this._resetTurn(state, id);
+    if (typeof turn.serviceTier === 'string' || turn.serviceTier === null) state.serviceTier = turn.serviceTier?.slice(0, 128) ?? null;
     const status = turn.status ?? 'inProgress';
     if (!(TERMINAL.has(state.status) && status === 'inProgress')) {
       state.status = TERMINAL.has(status) ? status : 'inProgress';
@@ -571,6 +601,12 @@ export class CodexAppServerClient {
   }
 
   _handleNotification(method, params) {
+    // Account notifications have no thread ID. Select quota fields before the ownership boundary.
+    if (method === 'account/rateLimits/updated') {
+      const projected = { rateLimits: quotaSnapshot(params?.rateLimits) };
+      try { this._onNotification?.(method, projected); } catch { /* An observer must never break the transport. */ }
+      return;
+    }
     // Only threads this client started or resumed; a notification never confers ownership.
     const state = this._threads.get(params?.threadId ?? params?.thread?.id);
     if (!state) return;
@@ -601,6 +637,9 @@ export class CodexAppServerClient {
         ? Object.fromEntries(USAGE_KEYS.map(key => [key, (total[key] ?? 0) - (baseline[key] ?? 0)])) : null;
     }
     if (method === 'thread/started' && params.thread) this._applyThread(state, params.thread);
+    else if (method === 'thread/name/updated') {
+      if (typeof params.threadName === 'string' || params.threadName === null) state.name = params.threadName?.slice(0, 1024) ?? null;
+    }
     else if (method === 'turn/started' || method === 'turn/completed') {
       if (params.turn?.id) this._applyTurn(state, params.turn);
     } else if (method === 'item/completed' || method === 'item/started') {

@@ -1,5 +1,16 @@
 # Changelog
 
+## 0.5.0
+
+- Synchronize OMP task/session names to native threads without blocking task execution on title failures.
+- Add a paged history picker and explicitly confirmed native forks into new direct-tool threads.
+- Retain headless history JSON and add `history --json` for interactive sessions.
+- Report native quota exhaustion and observed recovery once across concurrent clients, preserving sparse updates.
+- Add per-turn native `serviceTier` and `/codex tier` using OMP's existing session OpenAI-family setting.
+- Separate requested processing tier from effective tier, which remains unknown when native responses omit it.
+
+Restart OMP to load the update. Saved v0.4.0 delivery receipts remain valid. A history fork starts no inference and stays outside Agent Hub; continue the returned new thread through `codex_bridge run`.
+
 ## 0.4.0
 
 - Inherit native Codex permissions and approval policy instead of forcing cwd-only workspace-write.

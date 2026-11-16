@@ -30,7 +30,7 @@ function threadMetadata(thread) {
   nonempty(thread?.id, 'thread.id');
   if (thread.id.length > 256) throw new Error('Codex returned an invalid thread ID');
   const result = { id: thread.id };
-  for (const key of ['name', 'preview', 'cwd', 'model', 'modelProvider', 'cliVersion', 'reasoningEffort',
+  for (const key of ['name', 'preview', 'cwd', 'model', 'modelProvider', 'cliVersion', 'reasoningEffort', 'serviceTier',
     'parentThreadId', 'forkedFromId', 'source', 'createdAt', 'updatedAt', 'status']) {
     if (thread[key] !== undefined) result[key] = bounded(thread[key], { left: 1024 });
   }
@@ -45,6 +45,7 @@ function turnMetadata(turn) {
     error: turn.error == null ? null : bounded(turn.error), items: [], itemsView: 'notLoaded',
     startedAt: timestamp(turn.startedAt), completedAt: timestamp(turn.completedAt), durationMs: timestamp(turn.durationMs),
     ...(typeof turn.rootTurnId === 'string' ? { rootTurnId: turn.rootTurnId.slice(0, 256) } : {}),
+    ...(typeof turn.serviceTier === 'string' || turn.serviceTier === null ? { serviceTier: turn.serviceTier?.slice(0, 128) ?? null } : {}),
   };
 }
 
@@ -150,10 +151,13 @@ export function threadSnapshot(state) {
       : messages.findLast(message => message.phase == null)?.text ?? '',
     textTruncated: state.textTruncated, events: structuredClone(state.events),
     error: state.error, outcomeUnknown: state.outcomeUnknown,
-    cwd: state.cwd, model: state.model, inspection: state.inspection, attached: state.attached,
+    cwd: state.cwd, model: state.model, name: state.name ?? null, inspection: state.inspection, attached: state.attached,
     permissions: structuredClone(state.permissions ?? null),
     requestedReasoningEffort: state.requestedReasoningEffort,
-    execution: { model: state.model, cwd: state.cwd, requestedReasoningEffort: state.requestedReasoningEffort },
+    requestedServiceTier: state.requestedServiceTier ?? null, serviceTier: state.serviceTier ?? null,
+    threadServiceTier: state.threadServiceTier ?? null,
+    execution: { model: state.model, cwd: state.cwd, requestedReasoningEffort: state.requestedReasoningEffort,
+      requestedServiceTier: state.requestedServiceTier ?? null, serviceTier: state.serviceTier ?? null },
     latestActivity: structuredClone(state.latestActivity), latestPlan: structuredClone(state.latestPlan),
     fileChanges: structuredClone(state.fileChanges), commandFailure: structuredClone(state.commandFailure),
     tokenUsage: structuredClone(state.tokenUsage), tokenUsageTurnId: state.tokenUsageTurnId,
@@ -170,6 +174,9 @@ function historySnapshot(threadId, thread, turn, items = []) {
       ? turn.error.message.slice(0, MAX_EVENT_TEXT) : JSON.stringify(bounded(turn.error)),
     cwd: typeof thread.cwd === 'string' ? thread.cwd : null, model: typeof thread.model === 'string' ? thread.model : null,
     inspection: 'history', attached: false, requestedReasoningEffort: null, outcomeUnknown: false,
+    name: typeof thread.name === 'string' ? thread.name.slice(0, 1024) : null,
+    requestedServiceTier: null, serviceTier: typeof turn?.serviceTier === 'string' ? turn.serviceTier.slice(0, 128) : null,
+    threadServiceTier: typeof thread.serviceTier === 'string' ? thread.serviceTier.slice(0, 128) : null,
     latestActivity: null, latestPlan: null, fileChanges: [], commandFailure: null,
     messages: new Map(), textSize: 0, textTruncated: false, events: [],
     tokenUsage: null, tokenUsageTurnId: null, turnUsage: null,
@@ -282,13 +289,17 @@ function requireResponse(condition) {
   if (!condition) throw Object.assign(new Error('Invalid native diagnostic response'), { code: 'INVALID_RESPONSE' });
 }
 
-function quotaSnapshot(value) {
+export function quotaSnapshot(value) {
   requireResponse(value && typeof value === 'object' && !Array.isArray(value));
   const result = {};
-  for (const key of ['limitId', 'limitName', 'normalModelSlug', 'planType', 'rateLimitReachedType', 'spendControlReached']) {
-    if (value[key] !== undefined) result[key] = bounded(value[key], { left: 256 });
+  for (const key of ['limitId', 'limitName', 'normalModelSlug', 'planType', 'rateLimitReachedType']) {
+    if (typeof value[key] === 'string' || value[key] === null) result[key] = value[key]?.slice(0, 256) ?? null;
+  }
+  if (typeof value.spendControlReached === 'boolean' || value.spendControlReached === null) {
+    result.spendControlReached = value.spendControlReached;
   }
   for (const key of ['primary', 'secondary']) {
+    if (value[key] === undefined) continue; // Rolling notifications are sparse; omission never clears a prior window.
     const window = value[key];
     if (window == null) { result[key] = null; continue; }
     requireResponse(Number.isFinite(window.usedPercent));

@@ -21,12 +21,17 @@ const BIG_TEXT = '가🙂'.repeat(100000);
 const UTF8_TEXT = '한글 ✓ 🙂 mixed — 끝';
 const ENV_NAMES = ['HOME', 'PATH', 'CODEX_HOME', 'OPENAI_API_KEY', 'AWS_SECRET_ACCESS_KEY', 'KUBECONFIG',
   'CODEX_TEST_SECRET', 'CODEX_TEST_UNSET', 'HTTPS_PROXY', 'CODEX_CA_CERTIFICATE'];
-const MUTATIONS = new Set(['thread/start', 'thread/resume', 'thread/fork', 'thread/compact/start', 'turn/start', 'turn/steer', 'turn/interrupt']);
+const MUTATIONS = new Set(['thread/start', 'thread/resume', 'thread/fork', 'thread/name/set', 'thread/compact/start', 'turn/start', 'turn/steer', 'turn/interrupt']);
 
-// Protocol double of `codex app-server --stdio` using Codex 0.167.2 message shapes; it never starts Codex
+// Protocol double of `codex app-server --stdio` using Codex 0.169 message shapes; it never starts Codex
 // or requests inference. $CODEX_HOME holds options.json (behaviour), store.json (persisted threads that
 // survive restarts) and trace.jsonl (one spawn record per process plus every message the client sent).
 // Turn behaviour is selected by the prompt text.
+// Metadata/tier fixtures: serviceTier is the inherited thread setting; effectiveServiceTier, when
+// present, adds an exposed turn serviceTier. Turn requests are captured in trace.jsonl and the store.
+// rateLimitUpdates and rateLimitUpdatesOnTurn are arrays of account/rateLimits/updated params,
+// emitted after initialized and on turn/start respectively. nameDelayMs delays name admission;
+// nameDropReply loses the admission reply; nameError rejects without changing metadata.
 export function fakeServer() {
   const home = process.env.CODEX_HOME;
   const file = (name) => join(home, name);
@@ -97,6 +102,7 @@ export function fakeServer() {
     id: turn.id, rootTurnId: null, items: itemsView === 'full' ? turn.items : [], itemsView,
     status: turn.status, error: turn.error ?? null, startedAt: 1,
     completedAt: turn.status === 'inProgress' ? null : 2, durationMs: null,
+    ...(Object.hasOwn(turn, 'serviceTier') ? { serviceTier: turn.serviceTier } : {}),
   });
   const agentMessage = (id, text) => ({
     type: 'agentMessage', id, text, phase: 'final_answer', memoryCitation: null, delivery: null, questions: null,
@@ -240,7 +246,7 @@ export function fakeServer() {
     save();
     const mode = params.sandbox ?? config.sandbox_mode ?? 'workspace-write';
     const result = {
-      thread: threadView(thread), model: thread.model, modelProvider: 'openai', serviceTier: null,
+      thread: threadView(thread), model: thread.model, modelProvider: 'openai', serviceTier: options.serviceTier ?? null,
       disabledPluginIds: [], cwd: params.cwd ?? thread.cwd, instructionSources: [],
       approvalPolicy: params.approvalPolicy ?? config.approval_policy ?? 'on-request', approvalsReviewer: 'user',
       // Effective policies as reported by a real 0.167.2 server for these modes.
@@ -296,6 +302,8 @@ export function fakeServer() {
     let turn;
     save(() => {
       turn = { id: `turn-${++store.nextTurn}`, prompt, status: 'inProgress', items: [], error: null };
+      if (Object.hasOwn(params, 'serviceTierForTurn')) turn.requestedServiceTier = params.serviceTierForTurn;
+      if (Object.hasOwn(options, 'effectiveServiceTier')) turn.serviceTier = options.effectiveServiceTier;
       thread.turns.push(turn);
       running.set(thread.id, turn);
     });
@@ -303,6 +311,7 @@ export function fakeServer() {
     const admission = turnView(turn);
     const admit = () => reply(id, options.malformedTurnReply ? {} : { turn: admission });
     notify('turn/started', { threadId: thread.id, turn: turnView(turn) });
+    for (const update of options.rateLimitUpdatesOnTurn ?? []) notify('account/rateLimits/updated', update);
     if (mode === 'early') {
       item(thread, turn, commandItem('early-command', 'early output'));
       complete(thread, turn, 'completed', 'early answer');
@@ -509,6 +518,7 @@ export function fakeServer() {
     }
     if (method === 'initialized') {
       initialized = true;
+      for (const update of options.rateLimitUpdates ?? []) notify('account/rateLimits/updated', update);
       return;
     }
     if (id === undefined) return;
@@ -550,6 +560,7 @@ export function fakeServer() {
       return;
     }
     if (method === 'thread/list') {
+      sync();
       const threads = Object.values(store.threads).filter(thread => (!params.cwd || thread.cwd === params.cwd)
         && (!params.searchTerm || (thread.name ?? '').includes(params.searchTerm)));
       const offset = Number(params.cursor ?? 0);
@@ -590,6 +601,15 @@ export function fakeServer() {
     if (method === 'thread/read') {
       // Paginated history: turns are never hydrated here.
       reply(id, { thread: threadView(thread) });
+      return;
+    }
+    if (method === 'thread/name/set') {
+      if (options.nameError) { refuse(id, String(options.nameError), -32602); return; }
+      save(() => { thread.name = params.name; });
+      later(options.nameDelayMs ?? 0, () => {
+        if (!options.nameDropReply) reply(id, {});
+        notify('thread/name/updated', { threadId: thread.id, threadName: thread.name });
+      });
       return;
     }
     if (!loaded.has(thread.id)) {
@@ -1001,6 +1021,9 @@ it('keeps a timed-out steer unknown while native history shows the same turn act
     return unknownOutcome(active.threadId)(error);
   });
   const inspected = await client.status(active.threadId);
+  const renamed = await client.setThreadName(active.threadId, 'Unconfirmed turn');
+  assert.equal(renamed.turnId, active.turnId);
+  assert.equal(renamed.outcomeUnknown, true, 'metadata admission cannot confirm an uncertain turn mutation');
   assert.equal(inspected.status, 'inProgress');
   assert.equal(inspected.outcomeUnknown, true);
   await assert.rejects(client.run({ threadId: active.threadId, prompt: 'second steer', cwd }), unknownOutcome(active.threadId));
@@ -1438,7 +1461,7 @@ it('rejects turn-only settings on a resumed active turn instead of discarding th
   const { client, dir } = makeClient(t, { staleTurns: true, liveResume: true, earlyThread: true }, {}, savedStore([
     ['active', [savedTurn('running', 'inProgress')]],
   ]));
-  for (const settings of [{ effort: 'high' }, { outputSchema: { type: 'object' } }]) {
+  for (const settings of [{ effort: 'high' }, { outputSchema: { type: 'object' } }, { serviceTier: 'fast' }]) {
     await assert.rejects(client.run({ threadId: 'active', prompt: 'x', cwd, ...settings }), /cannot change an active turn/);
   }
   assert.equal(client.snapshot('active').status, 'inProgress');
@@ -2099,7 +2122,8 @@ it('retains structured plan, file metadata and failed command tail after event e
   assert.equal(done.fileChanges[0].changes[0].movePath, 'new.txt');
   assert.equal(done.fileChanges[0].changes[0].diff, undefined);
   assert.equal(done.latestActivity.params.item.command, 'LATEST NATIVE ACTIVITY');
-  assert.deepEqual(done.execution, { model: 'fake-model', cwd, requestedReasoningEffort: 'high' });
+  assert.deepEqual(done.execution, { model: 'fake-model', cwd, requestedReasoningEffort: 'high',
+    requestedServiceTier: null, serviceTier: null });
   const before = client.snapshot(admitted.threadId);
   const history = await client.getThreadDetails(admitted.threadId, { includeItems: true, includeDiff: true, limit: 2 });
   assert.equal(history.snapshot.inspection, 'history');
@@ -2297,13 +2321,18 @@ it('allocates unique native identities and merges history across concurrent fake
     command: [process.execPath, fileURLToPath(import.meta.url), FAKE_FLAG],
     timeoutMs: 3000, env: { CODEX_HOME: dir },
   }));
+  const reader = new CodexAppServerClient({
+    command: [process.execPath, fileURLToPath(import.meta.url), FAKE_FLAG], env: { CODEX_HOME: dir },
+  });
   t.after(async () => {
-    await Promise.all(clients.map(client => client.close()));
+    await Promise.all([...clients, reader].map(client => client.close()));
     rmSync(dir, { recursive: true, force: true });
   });
+  assert.deepEqual((await reader.listThreads()).data, []);
   const admitted = await Promise.all(clients.map((client, index) => client.run({ prompt: `concurrent ${index}`, cwd })));
   assert.equal(new Set(admitted.map(snapshot => snapshot.threadId)).size, 3);
   assert.equal(new Set(admitted.map(snapshot => snapshot.turnId)).size, 3);
+  assert.deepEqual(new Set((await reader.listThreads()).data.map(thread => thread.id)), new Set(admitted.map(snapshot => snapshot.threadId)));
   const saved = JSON.parse(readFileSync(join(dir, 'store.json'), 'utf8'));
   assert.equal(Object.keys(saved.threads).length, 3);
   assert.equal(saved.nextThread, 3);
@@ -2320,6 +2349,143 @@ it('allocates unique native identities and merges history across concurrent fake
   assert.ok(Object.values(completed.threads).every(thread => thread.turns[0].status === 'interrupted'));
   assert.equal(sent(dir, 'thread/start').length, 3);
   assert.equal(sent(dir, 'turn/start').length, 3);
+});
+
+it('renames only owned native metadata without changing or replaying its active turn', async (t) => {
+  const { client, dir } = makeClient(t);
+  const active = await client.run({ prompt: 'hold', cwd,
+    onThread: threadId => client.setThreadName(threadId, 'Admission name') });
+  assert.equal(active.name, 'Admission name', 'awaiting naming inside onThread must not deadlock run');
+  const renamed = await client.setThreadName(active.threadId, 'Native name');
+  assert.equal(renamed.name, 'Native name');
+  assert.equal(renamed.turnId, active.turnId);
+  assert.equal(renamed.status, 'inProgress');
+  assert.equal(renamed.outcomeUnknown, false);
+  assert.equal((await client.getThreadDetails(active.threadId)).thread.name, 'Native name');
+  assert.equal((await client.listThreads({ searchTerm: 'Native name' })).data[0].name, 'Native name');
+  await assert.rejects(client.setThreadName('foreign', 'Do not adopt'), /Unknown local thread/);
+  assert.equal(client.snapshot('foreign'), undefined);
+  assert.deepEqual(sent(dir, 'thread/name/set'), [
+    { threadId: active.threadId, name: 'Admission name' }, { threadId: active.threadId, name: 'Native name' },
+  ]);
+  assert.deepEqual(prompts(dir), ['hold']);
+  assert.equal(sent(dir, 'turn/steer').length, 0);
+  assert.equal(sent(dir, 'thread/resume').length, 0);
+});
+
+it('keeps name refusals and timeouts separate from active turn identity and cancellation', async (t) => {
+  for (const options of [{ nameError: 'name refused' }, { nameDelayMs: 700, nameDropReply: true }, { nameDelayMs: 700 }]) {
+    const { client, dir } = makeClient(t, options, { timeoutMs: 400 });
+    const active = await client.run({ prompt: 'hold', cwd });
+    await assert.rejects(client.setThreadName(active.threadId, 'New name'), error => {
+      assert.equal(error.threadId, active.threadId);
+      if (options.nameDelayMs) {
+        assert.equal(error.code, 'RPC_TIMEOUT');
+        assert.equal(error.outcomeUnknown, true);
+      } else assert.match(error.message, /name refused/);
+      return true;
+    });
+    const after = client.snapshot(active.threadId);
+    assert.equal(after.turnId, active.turnId);
+    assert.equal(after.status, 'inProgress');
+    assert.equal(after.outcomeUnknown, false);
+    assert.equal(after.error, null);
+    await client.cancel(active.threadId);
+    const done = await untilSnapshot(client, active.threadId, value => value.status === 'interrupted');
+    assert.equal(done.turnId, active.turnId);
+    if (options.nameDelayMs) {
+      const late = await untilSnapshot(client, active.threadId, value => value.name === 'New name');
+      assert.equal(late.turnId, active.turnId);
+      assert.equal(late.status, 'interrupted');
+      assert.equal(late.outcomeUnknown, false);
+      assert.equal(late.error, null);
+    }
+    assert.equal(sent(dir, 'thread/name/set').length, 1);
+    assert.deepEqual(prompts(dir), ['hold']);
+    assert.equal(sent(dir, 'turn/interrupt')[0].turnId, active.turnId);
+  }
+});
+
+it('sends service tier overrides for one native turn and omits inherited defaults', async (t) => {
+  const { client, dir } = makeClient(t, { serviceTier: 'fast' });
+  for (const serviceTier of [undefined, 'default', 'fast', null]) {
+    const prior = client.snapshot()[0];
+    const admitted = await client.run({ threadId: prior?.threadId, prompt: 'tier', cwd, serviceTier });
+    const done = await untilSnapshot(client, admitted.threadId, value => completed(value) && value.turnId === admitted.turnId);
+    assert.equal(done.requestedServiceTier, serviceTier ?? null);
+    assert.equal(done.execution.requestedServiceTier, serviceTier ?? null);
+    assert.equal(done.serviceTier, null, 'no native turn field means effective tier remains unavailable');
+    assert.equal(done.threadServiceTier, 'fast');
+  }
+  const starts = sent(dir, 'turn/start');
+  assert.ok(!('serviceTierForTurn' in starts[0]));
+  assert.equal(starts[1].serviceTierForTurn, 'default');
+  assert.equal(starts[2].serviceTierForTurn, 'fast');
+  assert.ok(!('serviceTierForTurn' in starts[3]));
+  assert.ok(starts.every(params => !('serviceTier' in params)));
+  assert.ok(sent(dir, 'thread/start').every(params => !('serviceTier' in params)));
+  assert.equal(sent(dir, 'turn/steer').length, 0);
+  const { client: reported } = makeClient(t, { effectiveServiceTier: 'native-effective' });
+  const active = await reported.run({ prompt: 'hold', cwd, serviceTier: 'fast' });
+  assert.equal(active.requestedServiceTier, 'fast');
+  assert.equal(active.serviceTier, 'native-effective');
+  assert.equal(active.execution.serviceTier, 'native-effective');
+  await assert.rejects(client.run({ prompt: 'invalid', cwd, serviceTier: 42 }), /serviceTier must be/);
+});
+
+it('refuses service tier changes through run or steer while keeping native input untouched', async (t) => {
+  const { client, dir } = makeClient(t);
+  const active = await client.run({ prompt: 'hold', cwd, serviceTier: 'fast' });
+  for (const serviceTier of ['default', 'fast']) {
+    await assert.rejects(client.run({ threadId: active.threadId, prompt: 'not sent', cwd, serviceTier }), /cannot change an active turn/);
+    await assert.rejects(client.steer({ threadId: active.threadId, turnId: active.turnId, prompt: 'not sent', serviceTier }), /cannot change an active turn/);
+  }
+  assert.equal(client.snapshot(active.threadId).requestedServiceTier, 'fast');
+  assert.deepEqual(prompts(dir), ['hold']);
+  assert.equal(sent(dir, 'turn/steer').length, 0);
+  await client.run({ threadId: active.threadId, prompt: 'inherit active', cwd });
+  assert.equal(sent(dir, 'turn/steer').length, 1);
+  assert.ok(!('serviceTierForTurn' in sent(dir, 'turn/steer')[0]));
+});
+
+it('surfaces global native quota notifications before ownership filtering without account secrets', async (t) => {
+  const observed = [];
+  const { client, dir } = makeClient(t, {
+    rateLimitUpdates: [{ accountId: 'PRIVATE-ACCOUNT', apiKey: 'PRIVATE-KEY', rateLimits: {
+      limitId: 'codex', planType: 'plus', primary: { usedPercent: 95, resetsAt: 123, accountId: 'PRIVATE-WINDOW' },
+      spendControlReached: true, credits: { balance: 'PRIVATE-BALANCE' }, accountId: 'PRIVATE-INNER',
+    } }],
+    rateLimitUpdatesOnTurn: [{ rateLimits: { limitId: 'codex', secondary: null, spendControlReached: null } }],
+  }, { onNotification: (method, params) => observed.push({ method, params, owned: client.snapshot().length }) });
+  await client.connect();
+  await until(() => observed.some(event => event.method === 'account/rateLimits/updated'));
+  const first = observed.find(event => event.method === 'account/rateLimits/updated');
+  assert.equal(first.owned, 0);
+  assert.deepEqual(first.params, { rateLimits: { limitId: 'codex', planType: 'plus', spendControlReached: true,
+    primary: { usedPercent: 95, windowDurationMins: null, resetsAt: 123 } } });
+  assert.deepEqual(client.snapshot(), []);
+  await client.run({ prompt: 'hold', cwd });
+  await until(() => observed.filter(event => event.method === 'account/rateLimits/updated').length === 2);
+  const update = observed.filter(event => event.method === 'account/rateLimits/updated')[1];
+  assert.deepEqual(update.params, { rateLimits: { limitId: 'codex', spendControlReached: null, secondary: null } });
+  assert.doesNotMatch(JSON.stringify(observed), /PRIVATE-|accountId|apiKey|credits|cost/i);
+  assert.equal(sent(dir, 'account/rateLimits/read').length, 0);
+  assert.equal(sent(dir, 'account/read').length, 0);
+});
+
+it('forks saved external native history without owning or mutating its source', async (t) => {
+  const source = savedStore([['external', [savedTurn('anchor', 'completed', 'history')]]]);
+  source.threads.external.name = 'Original';
+  const { client, dir } = makeClient(t, {}, {}, source);
+  const forked = await client.fork({ threadId: 'external', lastTurnId: 'anchor', cwd });
+  assert.notEqual(forked.threadId, 'external');
+  assert.equal(client.snapshot('external'), undefined);
+  await client.setThreadName(forked.threadId, 'Branch');
+  assert.equal((await client.getThreadDetails('external')).thread.name, 'Original');
+  assert.deepEqual(sent(dir, 'thread/fork').map(({ threadId, lastTurnId }) => ({ threadId, lastTurnId })),
+    [{ threadId: 'external', lastTurnId: 'anchor' }]);
+  assert.equal(sent(dir, 'thread/resume').length, 0);
+  assert.deepEqual(prompts(dir), []);
 });
 
 if (FAKE_MODE) fakeServer();

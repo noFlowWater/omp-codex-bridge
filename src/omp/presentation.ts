@@ -36,7 +36,7 @@ function changeMetadata(value: unknown) {
 }
 
 export type RunSnapshot = {
-  threadId: string; turnId: string | null; status: string;
+  threadId: string; turnId: string | null; status: string; name?: string | null;
   text?: string; textTruncated?: boolean; error?: string | null; outcomeUnknown?: boolean;
   model?: string | null; execution?: unknown; latestActivity?: unknown; latestPlan?: unknown;
   fileChanges?: unknown; commandFailure?: unknown;
@@ -62,6 +62,7 @@ export function summarizeRun(state: RunSnapshot) {
     .filter(change => change && typeof change === "object");
   const result = {
     threadId: state.threadId, turnId: state.turnId, status: state.status,
+    name: utf8Preview(state.name, 256).text || null,
     outcomeUnknown: Boolean(state.outcomeUnknown), model: utf8Preview(state.model, 256).text || null,
     execution, latestActivity, latestPlan, fileChanges, commandFailure,
     fileChangesOmitted: changes.length - fileChanges.length,
@@ -99,10 +100,16 @@ export function executionCard(result: unknown, expanded = false): string {
   }
   const execution = objectRecord(state.execution);
   const lines = [
-    `Codex execution [${screenLine(state.status ?? (data.error ? "error" : "read-only"))}]`,
+    `Codex execution [${screenLine(state.status ?? (data.forked ? "forked" : data.error ? "error" : "read-only"))}]`,
     `model=${screenLine(execution.model ?? state.model)} cwd=${screenLine(execution.cwd ?? state.cwd)} requestedEffort=${screenLine(execution.requestedReasoningEffort)} effectiveEffort=unknown`,
   ];
+  if (state.name) lines.push(`Name: ${screenLine(state.name, 256)}`);
+  if (execution.requestedServiceTier != null || execution.serviceTier != null) {
+    lines.push(`Requested tier: ${screenLine(execution.requestedServiceTier)} · Effective tier: ${screenLine(execution.serviceTier)}`);
+  }
   if (state.threadId) lines.push(`Thread: ${screenLine(state.threadId)} Turn: ${screenLine(state.turnId)}`);
+  if (data.forked) lines.push(`Source: ${screenLine(data.sourceThreadId)} through ${screenLine(data.lastTurnId)} · direct tool · no inference started`);
+  if (data.nameWarning) lines.push(`Name warning: ${screenLine(data.nameWarning, 300)}`);
   if (state.latestActivity) lines.push(`Activity: ${activityLabel(state.latestActivity)}`);
   if (state.latestPlan) lines.push(`Plan: ${screenLine(typeof state.latestPlan === "string" ? state.latestPlan : JSON.stringify(state.latestPlan), 1200)}`);
   if (Array.isArray(state.fileChanges) && state.fileChanges.length) {
@@ -134,6 +141,7 @@ export type ProgressStatus = {
 // Agent Hub owns per-worker activity. The native footer only summarizes active Codex work.
 export function createProgressDisplay() {
   const active = new Set<string>();
+  const quotas = new Map<string, Record<string, unknown>>();
   let root: ExtensionContext | undefined;
   let rendered: string | undefined;
   function render() {
@@ -143,7 +151,38 @@ export function createProgressDisplay() {
     root.ui.setStatus("codex-bridge", text);
     rendered = text;
   }
+  function notify(message: string, type: "info" | "warning" | "error" = "info") {
+    try { if (root?.hasUI) root.ui.notify(message, type); } catch { /* Native work does not depend on UI delivery. */ }
+  }
   return {
+    notify,
+    rateLimits(value: unknown) {
+      if (!root?.hasUI) return;
+      const incoming = objectRecord(objectRecord(value).rateLimits);
+      const id = typeof incoming.limitId === "string" ? incoming.limitId : "default";
+      const previous = quotas.get(id) ?? {};
+      const current: Record<string, unknown> = { ...previous };
+      for (const key of ["primary", "secondary"] as const) {
+        const window = objectRecord(incoming[key]);
+        if (typeof window.usedPercent !== "number" || !Number.isFinite(window.usedPercent)) continue;
+        current[key] = { ...objectRecord(previous[key]), ...Object.fromEntries(Object.entries(window).filter(([, entry]) => entry != null)) };
+      }
+      if (typeof incoming.spendControlReached === "boolean") current.spendControlReached = incoming.spendControlReached;
+      if (typeof incoming.limitName === "string") current.limitName = incoming.limitName;
+      const windows = ["primary", "secondary"].map(key => objectRecord(current[key]));
+      const reached = current.spendControlReached === true || windows.some(window => typeof window.usedPercent === "number" && window.usedPercent >= 100);
+      current.reached = reached;
+      quotas.set(id, current);
+      if (reached === (previous.reached === true)) return;
+      const detail = ["primary", "secondary"].flatMap(key => {
+        const window = objectRecord(current[key]);
+        if (typeof window.usedPercent !== "number") return [];
+        const date = typeof window.resetsAt === "number" ? new Date(window.resetsAt * 1000) : undefined;
+        const reset = date && Number.isFinite(date.getTime()) ? `, reset ${date.toISOString()}` : "";
+        return [`${key} ${window.usedPercent}%${reset}`];
+      }).join("; ");
+      notify(`Codex ${screenLine(current.limitName ?? id, 80)}: ${reached ? "limit reached" : "usage window recovered"}${detail ? ` · ${detail}` : ""}`, reached ? "warning" : "info");
+    },
     update(sessionId: string, status?: ProgressStatus) {
       if (status) active.add(sessionId);
       else active.delete(sessionId);
@@ -154,6 +193,7 @@ export function createProgressDisplay() {
       if (root && root.sessionManager.getSessionId() !== ctx.sessionManager.getSessionId()) {
         if (root.hasUI) root.ui.setStatus("codex-bridge", undefined);
         active.clear();
+        quotas.clear();
         rendered = undefined;
       }
       root = ctx;
@@ -165,6 +205,7 @@ export function createProgressDisplay() {
       root = undefined;
       rendered = undefined;
       active.clear();
+      quotas.clear();
     },
   };
 }

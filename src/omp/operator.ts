@@ -113,18 +113,64 @@ export async function readOnlyAction(action: string, params: OperatorParams, cli
   }
 }
 
-const HELP = "Usage: /codex doctor | status [THREAD_ID] | history [JSON options] | show THREAD_ID [JSON options]. Status without ID lists locally loaded direct-tool threads only; use history or status THREAD_ID for Hub/saved threads. History options: cursor, limit, searchTerm, cwd. Show options: includeItems, turnId, cursor, limit, includeDiff. Inspection never resumes, adopts or replays a thread. Diff output may contain secrets.";
+const HELP = "Usage: /codex doctor | status [THREAD_ID] | history [--json] [JSON options] | show THREAD_ID [JSON options] | fork THREAD_ID [JSON options] | tier [inherit|default|flex|scale|priority|ultrafast|auto]. tier reads/sets the OpenAI-family setting for this OMP session. Interactive history offers details or an explicitly confirmed fork; --json and headless history return JSON. Fork options: lastTurnId, name; creates a direct-tool thread, not an Agent Hub worker, without starting inference. Status without ID lists locally loaded direct-tool threads only. History options: cursor, limit, searchTerm, cwd. Show options: includeItems, turnId, cursor, limit, includeDiff. Inspection never resumes, adopts or replays a thread. Diff output may contain secrets.";
+
+// Escape controls and directional overrides before native history enters terminal labels.
+const historyLabel = (value: unknown) => JSON.stringify(utf8Preview(String(value ?? ""), 512).text)
+  .replace(/[\u007f-\u009f\u202a-\u202e\u2066-\u2069]/g, char => `\\u${char.charCodeAt(0).toString(16).padStart(4, "0")}`);
+
+async function pickHistory(params: OperatorParams, client: CodexAppServerClient, pi: ExtensionAPI, ctx: ExtensionContext,
+  fork: (params: { threadId: string; lastTurnId?: string; name?: string }) => Promise<unknown>) {
+  let cursor = params.cursor;
+  const previous: (string | undefined)[] = [];
+  for (;;) {
+    const page = await client.listThreads({ ...params, cursor });
+    const labels = page.data.map((thread, index) =>
+      `${index + 1}. ${historyLabel(thread.name || thread.preview || thread.id)} | cwd ${historyLabel(thread.cwd)} | ${historyLabel(thread.id)}`);
+    const choices = [...labels, ...(previous.length ? ["Previous page"] : []),
+      ...(page.nextCursor ? ["Next page"] : []), "Cancel"];
+    const choice = await ctx.ui.select("Codex saved history — inspection only until you confirm a fork", choices);
+    if (choice === undefined || choice === "Cancel") return { readOnly: true, cancelled: true };
+    if (choice === "Next page") {
+      if (!page.nextCursor || page.nextCursor === cursor || previous.includes(page.nextCursor)) throw new Error("Native history returned a repeated cursor");
+      previous.push(cursor);
+      cursor = page.nextCursor;
+      continue;
+    }
+    if (choice === "Previous page") { cursor = previous.pop(); continue; }
+    const index = labels.indexOf(choice);
+    if (index < 0) return { readOnly: true, cancelled: true };
+    const threadId = page.data[index].id;
+    const details = await readOnlyAction("details", { threadId, limit: 100 }, client, pi, ctx);
+    const boundary = details.turns.data.find(turn => turn.status === "completed")?.id;
+    const action = await ctx.ui.select(
+      `Source ${historyLabel(threadId)} | name ${historyLabel(details.thread.name)} | cwd ${historyLabel(details.thread.cwd)}`,
+      ["View details", "Fork as new direct thread", "Cancel"]);
+    if (action === "View details") return details;
+    if (action !== "Fork as new direct thread") return { readOnly: true, cancelled: true };
+    if (!boundary) throw new Error("Source has no completed turn boundary to fork");
+    const confirm = await ctx.ui.select(
+      `Fork ${historyLabel(threadId)} through completed turn ${historyLabel(boundary)}?\nCreates a direct-tool thread outside Agent Hub. Source stays unchanged. No inference starts.`,
+      ["Cancel", "Confirm fork"]);
+    if (confirm !== "Confirm fork") return { readOnly: true, cancelled: true };
+    return fork({ threadId, lastTurnId: boundary });
+  }
+}
 
 export function registerOperator(pi: ExtensionAPI, access: {
   getClient(): Promise<CodexAppServerClient>;
   status(threadId?: string): Promise<unknown>;
+  fork(params: { threadId: string; lastTurnId?: string; name?: string }): Promise<unknown>;
 }) {
   const z = pi.zod;
   const page = { cursor: z.string().min(1).optional(), limit: z.number().int().min(1).max(100).optional() };
   const history = z.object({ ...page, searchTerm: z.string().min(1).optional(), cwd: z.string().min(1).optional() }).strict();
   const details = z.object({ ...page, includeItems: z.boolean().optional(), includeDiff: z.boolean().optional(), turnId: z.string().min(1).optional() }).strict();
+  const forkOptions = z.object({ lastTurnId: z.string().min(1).optional(), name: z.string().min(1).optional() }).strict();
+  const tierChoices = ["inherit", "default", "flex", "scale", "priority", "ultrafast", "auto"] as const;
+  const tiers = z.enum(tierChoices);
   pi.registerCommand("codex", {
-    description: "Read-only Codex doctor, status, saved history and thread details; /codex for help",
+    description: "Codex doctor, status, saved history picker, details and explicit direct-thread fork; /codex for help",
     handler: async (args, ctx) => {
       let selectedThreadId: string | undefined;
       try {
@@ -135,8 +181,28 @@ export function registerOperator(pi: ExtensionAPI, access: {
           if (rest) throw new Error("doctor takes no arguments");
           result = await readOnlyAction("diagnose", {}, await access.getClient(), pi, ctx);
         } else if (command === "history") {
-          const params = history.parse(rest ? JSON.parse(rest) : {});
-          result = await readOnlyAction("history", params, await access.getClient(), pi, ctx);
+          const raw = rest === "--json" || rest.startsWith("--json ");
+          const input = raw ? rest.slice(6).trim() : rest;
+          const params = history.parse(input ? JSON.parse(input) : {});
+          const client = await access.getClient();
+          result = ctx.hasUI && !raw ? await pickHistory(params, client, pi, ctx, access.fork) : await readOnlyAction("history", params, client, pi, ctx);
+        } else if (command === "fork") {
+          const [threadId, options = ""] = rest.trim().split(/\s+(.*)/s);
+          if (!threadId) throw new Error("fork requires THREAD_ID");
+          selectedThreadId = threadId;
+          result = await access.fork({ threadId, ...forkOptions.parse(options ? JSON.parse(options) : {}) });
+        } else if (command === "tier") {
+          const current = pi.getServiceTiers().openai;
+          const selected = rest || (ctx.hasUI ? await ctx.ui.select(
+            `OpenAI-family service tier for this OMP session (current: ${current ?? "inherit"}). Native account/model availability applies.`,
+            [...tierChoices]) : undefined);
+          if (selected === undefined) {
+            result = { readOnly: true, serviceTier: current ?? "inherit", scope: "OpenAI-family setting for this OMP session", ...(ctx.hasUI ? { cancelled: true } : {}) };
+          } else {
+            const tier = tiers.parse(selected);
+            await pi.setServiceTier("openai", tier === "inherit" ? undefined : tier);
+            result = { readOnly: false, serviceTier: tier, scope: "OpenAI-family setting for this OMP session", note: "Native tier availability, quota use and charges depend on the account/model. auto/inherit preserve native defaults; direct-tool serviceTier is per-call." };
+          }
         } else if (command === "show") {
           const [threadId, options = ""] = rest.trim().split(/\s+(.*)/s);
           if (!threadId) throw new Error("show requires THREAD_ID");
@@ -156,7 +222,8 @@ export function registerOperator(pi: ExtensionAPI, access: {
           pi.sendMessage({ customType: "codex-bridge-operator", content: HELP, display: true }, { triggerTurn: false });
           return;
         }
-        pi.sendMessage({ customType: "codex-bridge-operator", content: `Codex ${label} (read-only):\n${JSON.stringify(result, null, 2)}`, display: true }, { triggerTurn: false });
+        const readOnly = !(result && typeof result === "object" && ("forked" in result || ("readOnly" in result && result.readOnly === false)));
+        pi.sendMessage({ customType: "codex-bridge-operator", content: `Codex ${label}${readOnly ? " (read-only)" : ""}:\n${JSON.stringify(result, null, 2)}`, display: true }, { triggerTurn: false });
       } catch (error) {
         pi.sendMessage({ customType: "codex-bridge-operator", content: `Codex operator error:\n${JSON.stringify(errorDetails(error, selectedThreadId), null, 2)}`, display: true }, { triggerTurn: false });
       }

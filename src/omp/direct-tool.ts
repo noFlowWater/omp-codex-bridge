@@ -9,12 +9,12 @@ const TERMINAL = new Set(["completed", "failed", "interrupted", "disconnected"])
 const terminalKey = (state: { threadId: string; turnId?: string | null; status: string }) =>
   `${state.threadId}/${state.turnId ?? ""}/${state.status}`;
 
-export function registerDirectTool(pi: ExtensionAPI) {
+export function registerDirectTool(pi: ExtensionAPI, options: { onRateLimits?: (params: unknown) => void } = {}) {
   const z = pi.zod;
   let client: CodexAppServerClient | undefined;
   let unsubscribe: (() => void) | undefined;
   let closeBarrier: Promise<void> = Promise.resolve();
-  // Threads this session ran; inspected-only or unknown threads never trigger follow-ups.
+  // Threads this session ran or explicitly forked; inspection never grants ownership.
   const owned = new Set<string>();
   const delivered = new Map<string, string>();
   // Terminal transitions seen while a run call is in flight are held until it settles,
@@ -52,7 +52,12 @@ export function registerDirectTool(pi: ExtensionAPI) {
       if (pending === closeBarrier) break;
     }
     if (!client) {
-      client = new CodexAppServerClient({ onRequest: onRequest.forClient() });
+      client = new CodexAppServerClient({
+        onRequest: onRequest.forClient(),
+        onNotification(method: string, params: unknown) {
+          if (method === "account/rateLimits/updated") options.onRateLimits?.(params);
+        },
+      });
       // Notifications carry only {threadId, turnId, status}; filter before reading a snapshot.
       // Held events are checked for ownership on release: a new thread's ID is learned when run returns.
       unsubscribe = client.subscribe((event: { threadId: string; turnId: string | null; status: string }) => {
@@ -74,7 +79,14 @@ export function registerDirectTool(pi: ExtensionAPI) {
     return summarizeRun(state);
   }
 
-  async function run(params: { threadId?: string; prompt?: string; input?: unknown[]; cwd: string; model?: string; effort?: string; outputSchema?: unknown }) {
+  async function nameThread(active: CodexAppServerClient, threadId: string, name?: string) {
+    if (name === undefined || client !== active) return undefined;
+    try { await active.setThreadName(threadId, name); }
+    catch (error) { return String(error instanceof Error ? error.message : error).slice(0, 300); }
+    return undefined;
+  }
+
+  async function run(params: { threadId?: string; prompt?: string; input?: unknown[]; cwd: string; model?: string; effort?: string; outputSchema?: unknown; name?: string; serviceTier?: string }) {
     // A shutdown/session switch during admission replaces the client; the old continuation
     // must not touch the new session's ownership, delivery or hold state.
     const admissionBarrier = closeBarrier;
@@ -86,8 +98,11 @@ export function registerDirectTool(pi: ExtensionAPI) {
     }
     runsInFlight++;
     try {
-      const result = await active.run(params);
-      return client === active ? reported(result.threadId) : summarizeRun(result);
+      const { name, ...native } = params;
+      const result = await active.run(native);
+      if (client === active) reported(result.threadId);
+      const nameWarning = await nameThread(active, result.threadId, name);
+      return { ...(client === active ? reported(result.threadId) : summarizeRun(result)), ...(nameWarning ? { nameWarning } : {}) };
     } catch (error) {
       if (client !== active) throw error;
       // A rejected admission is reported here, not again as a follow-up.
@@ -101,6 +116,49 @@ export function registerDirectTool(pi: ExtensionAPI) {
         for (const threadId of threads) deliver(threadId);
       }
     }
+  }
+
+  async function fork(params: { threadId: string; lastTurnId?: string; name?: string }) {
+    const admissionBarrier = closeBarrier;
+    const active = await getClient();
+    if (admissionBarrier !== closeBarrier) throw new Error("Session changed before native admission; nothing was sent");
+    // Read only: freeze a completed source boundary without adopting or resuming the source.
+    let cursor: string | undefined;
+    const cursors = new Set<string>();
+    let sourceCwd: string | undefined;
+    let boundary: string | undefined;
+    for (;;) {
+      const source = await active.getThreadDetails(params.threadId, { limit: 100, cursor });
+      sourceCwd = source.thread.cwd;
+      if (typeof sourceCwd !== "string" || !sourceCwd) throw new Error("Source history did not report cwd; no fork was sent");
+      const turn = source.turns.data.find(turn => params.lastTurnId ? turn.id === params.lastTurnId : turn.status === "completed");
+      if (turn) {
+        if (turn.status !== "completed") throw new Error("Fork boundary must be a completed turn");
+        boundary = turn.id;
+        break;
+      }
+      const next = source.turns.nextCursor;
+      if (!next) throw new Error(params.lastTurnId ? "Completed fork boundary was not found in source history" : "Source has no completed turn boundary to fork");
+      if (cursors.has(next)) throw new Error("Native history returned a repeated cursor");
+      cursors.add(next);
+      cursor = next;
+    }
+    if (client !== active || admissionBarrier !== closeBarrier) throw new Error("Session changed before native admission; nothing was sent");
+    const result = await active.fork({
+      threadId: params.threadId, lastTurnId: boundary, cwd: sourceCwd,
+      onThread: (threadId: string) => {
+        if (client === active) owned.add(threadId);
+      },
+    });
+    if (client === active) reported(result.threadId);
+    const nameWarning = await nameThread(active, result.threadId, params.name);
+    return {
+      forked: true, threadId: result.threadId, cwd: result.cwd,
+      sourceThreadId: params.threadId, lastTurnId: boundary, inferenceStarted: false,
+      ...(nameWarning ? { nameWarning } : {}),
+      scope: "Direct-tool thread only; not an Agent Hub worker. Original thread unchanged.",
+      continuation: { tool: "codex_bridge", action: "run", threadId: result.threadId, cwd: result.cwd },
+    };
   }
 
   async function shutdown() {
@@ -122,18 +180,21 @@ export function registerDirectTool(pi: ExtensionAPI) {
     return client ? client.status() : [];
   }
 
-  registerOperator(pi, { getClient, status });
+  registerOperator(pi, { getClient, status, fork });
 
   pi.registerTool({
     name: "codex_bridge",
     label: "Codex bridge agent",
-    description: "Direct native Codex control. For Agent Hub delegation, spawn agent codex-bridge. run starts or continues a locally owned thread; active turns receive steering. Uses parent's cwd unless isolation requested. Inherits native Codex configuration, including sandbox, network and approval policy; optional OMP_CODEX_BRIDGE_CONFIG JSON provides operator-set native overrides. Approval requests require explicit user confirmation; unavailable UI declines them. run accepts prompt/native input, native effort and outputSchema. Returns bounded execution/activity/plan/file-change metadata; terminal results arrive as follow-ups. status reads retained state; diagnose checks executable/version/auth/models/permissions/steering without config writes. history lists saved native threads with cursor/limit/searchTerm/cwd. details inspects threadId without ownership/resume/replay; includeItems, turnId, cursor, limit select native items. includeDiff explicitly includes bounded diff which may expose secrets; native file events are not a complete audit. cancel interrupts a locally loaded thread. shutdown closes this session's server. /codex exposes read-only operator commands.",
+    description: "Direct native Codex control, outside Agent Hub. For Agent Hub delegation, spawn agent codex-bridge. run starts or continues a locally owned thread; active turns receive steering. fork creates a locally owned direct thread through a completed source boundary, preserving source cwd and original history, with no inference; continue via run. Uses parent's cwd unless isolation requested. Inherits native Codex permissions/environment; optional OMP_CODEX_BRIDGE_CONFIG JSON provides operator-set native overrides. Approval requests require explicit user confirmation; unavailable UI declines them. run accepts prompt/native input, effort, outputSchema, optional name and native serviceTier for a new turn only. Omitted serviceTier preserves native defaults; no pricing/quota override. Returns bounded execution/activity/plan/file-change metadata; terminal results arrive as follow-ups. status reads retained state; diagnose inspects native availability. history and details inspect saved native history without ownership/resume/replay. includeDiff explicitly includes bounded native diff which may expose secrets and is not a complete audit. cancel interrupts a locally loaded thread. shutdown closes this session's server.",
     parameters: z.object({
-      action: z.enum(["run", "status", "diagnose", "history", "details", "cancel", "shutdown"]),
+      action: z.enum(["run", "fork", "status", "diagnose", "history", "details", "cancel", "shutdown"]),
       threadId: z.string().min(1).optional(),
       prompt: z.string().min(1).optional(),
       cwd: z.string().min(1).optional(),
       model: z.string().min(1).optional(),
+      name: z.string().min(1).optional().describe("Native thread name for run or fork."),
+      serviceTier: z.string().min(1).optional().describe("Native service tier for a new turn only; omitted inherits native default. Availability is account/model dependent."),
+      lastTurnId: z.string().min(1).optional().describe("Completed source turn boundary for fork; omitted selects latest completed turn."),
       input: z.array(z.union([
         z.object({ type: z.literal("text"), text: z.string(), text_elements: z.array(z.unknown()).optional() }).strict(),
         z.object({ type: z.literal("image"), url: z.string().min(1), detail: z.enum(["auto", "low", "high", "original"]).nullable().optional() }).strict(),
@@ -168,7 +229,13 @@ export function registerDirectTool(pi: ExtensionAPI) {
               input: params.input,
               effort: params.effort,
               outputSchema: params.outputSchema,
+              name: params.name,
+              serviceTier: params.serviceTier,
             });
+            break;
+          case "fork":
+            if (!params.threadId) throw new Error("fork requires threadId");
+            result = await fork({ threadId: params.threadId, lastTurnId: params.lastTurnId, name: params.name });
             break;
           case "status":
             result = await status(params.threadId);

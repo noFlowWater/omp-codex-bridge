@@ -42,11 +42,13 @@ const saved = {
 async function withOperator(options, body) {
   const dir = mkdtempSync(join(tmpdir(), 'codex-bridge-operator-'));
   writeFileSync(join(dir, 'options.json'), JSON.stringify(options));
-  writeFileSync(join(dir, 'store.json'), JSON.stringify(saved));
+  writeFileSync(join(dir, 'store.json'), JSON.stringify(options.savedState ?? saved));
   const messages = [];
   const execs = [];
   const commands = new Map();
   const clients = [];
+  const tierChanges = [];
+  let serviceTier = options.initialTier;
   let client;
   const getClient = async () => {
     if (!client) {
@@ -68,12 +70,21 @@ async function withOperator(options, body) {
     registerCommand: (name, command) => commands.set(name, command),
     sendMessage: (message, delivery) => messages.push({ message, delivery }),
     exec: async (command, args) => { execs.push({ command, args }); return { code: 0, stdout: 'codex-cli 0.167.2\n', stderr: 'NEVER-ECHO-STDERR' }; },
+    getServiceTiers: () => ({ openai: serviceTier }),
+    setServiceTier: (family, value) => { tierChanges.push({ family, value }); serviceTier = value; },
   };
-  registerOperator(pi, { getClient, status: async threadId => threadId ? (await getClient()).status(threadId) : client?.snapshot() ?? [] });
+  registerOperator(pi, {
+    getClient,
+    status: async threadId => threadId ? (await getClient()).status(threadId) : client?.snapshot() ?? [],
+    fork: options.fork ?? (async params => {
+      const result = await (await getClient()).fork({ threadId: params.threadId, lastTurnId: params.lastTurnId, cwd });
+      return { forked: true, threadId: result.threadId, cwd: result.cwd };
+    }),
+  });
   const invoke = async args => {
     const previous = currentScopedSettings;
     currentScopedSettings = options.noScopedSettings ? undefined : scopedSettings;
-    try { await commands.get('codex').handler(args, { cwd }); }
+    try { await commands.get('codex').handler(args, { cwd, hasUI: Boolean(options.ui), ui: options.ui }); }
     finally { currentScopedSettings = previous; }
     const message = messages.at(-1);
     assert.equal(message.delivery.triggerTurn, false);
@@ -83,7 +94,7 @@ async function withOperator(options, body) {
   const trace = () => existsSync(join(dir, 'trace.jsonl'))
     ? readFileSync(join(dir, 'trace.jsonl'), 'utf8').trim().split('\n').filter(Boolean).map(line => JSON.parse(line)) : [];
   try {
-    await body({ invoke, messages, execs, getClient, trace, restart: async () => { await client?.close(); client = undefined; } });
+    await body({ invoke, messages, execs, getClient, trace, tierChanges, restart: async () => { await client?.close(); client = undefined; } });
   } finally {
     await Promise.all(clients.map(entry => entry.close()));
     rmSync(dir, { recursive: true, force: true });
@@ -280,4 +291,159 @@ test('automatic result budgets include multiple files, multibyte metadata, and J
   assert.equal(result.metadataTruncated, true);
   assert.ok(result.fileChangesOmitted > 0);
   assert.doesNotMatch(JSON.stringify(result), /PRIVATE-DIFF/);
+});
+
+test('interactive history pages with filters, views details, and cancels without mutation', async () => {
+  const screens = [];
+  const answers = ['Next page', 'Previous page', 0, 'View details'];
+  const ui = { select: async (title, choices) => {
+    screens.push({ title, choices });
+    const answer = answers.shift();
+    return typeof answer === 'number' ? choices[answer] : answer;
+  } };
+  await withOperator({ ui }, async ({ invoke, trace, getClient }) => {
+    const result = await invoke(`history ${JSON.stringify({ limit: 1, searchTerm: 'saved operator', cwd })}`);
+    assert.equal(result.inspectionOnly, true);
+    assert.equal(result.thread.id, 'saved-one');
+    assert.match(screens[0].choices[0], /saved operator first/);
+    assert.ok(screens[0].choices[0].includes(JSON.stringify(cwd)));
+    assert.ok(screens[1].choices.includes('Previous page'));
+    for (const entry of trace().filter(entry => entry.message?.method === 'thread/list')) {
+      assert.equal(entry.message.params.searchTerm, 'saved operator');
+      assert.equal(entry.message.params.cwd, cwd);
+      assert.equal(entry.message.params.limit, 1);
+    }
+    assert.equal((await getClient()).snapshot().length, 0);
+    assert.equal(trace().filter(entry => MUTATIONS.has(entry.message?.method)).length, 0);
+  });
+  for (const answers of [[undefined], [0, undefined], [0, 'Fork as new direct thread', undefined]]) {
+    await withOperator({ ui: { select: async (_title, choices) => {
+      const answer = answers.shift();
+      return typeof answer === 'number' ? choices[answer] : answer;
+    } } }, async ({ invoke, trace }) => {
+      assert.equal((await invoke('history')).cancelled, true);
+      assert.equal(trace().filter(entry => MUTATIONS.has(entry.message?.method)).length, 0);
+    });
+  }
+});
+
+test('interactive fork requires confirmation and freezes completed boundary without source mutation or inference', async () => {
+  const answers = [0, 'Fork as new direct thread', 'Confirm fork'];
+  let selected;
+  await withOperator({
+    ui: { select: async (_title, choices) => {
+      const answer = answers.shift();
+      return typeof answer === 'number' ? choices[answer] : answer;
+    } },
+    fork: async params => { selected = params; return { forked: true, threadId: 'new-direct', cwd }; },
+  }, async ({ invoke, trace }) => {
+    const result = await invoke('history');
+    assert.deepEqual(selected, { threadId: 'saved-one', lastTurnId: 'old-turn' });
+    assert.equal(result.threadId, 'new-direct');
+    assert.equal(trace().filter(entry => MUTATIONS.has(entry.message?.method)).length, 0);
+    const source = await invoke('show saved-one');
+    assert.equal(source.thread.name, 'saved operator first');
+    assert.equal(source.turns.data[0].id, 'old-turn');
+  });
+});
+
+test('explicit fork parses only native boundary and optional name', async () => {
+  const calls = [];
+  await withOperator({ fork: async params => { calls.push(params); return { forked: true, threadId: 'new-direct', cwd }; } },
+    async ({ invoke, trace }) => {
+      await invoke('fork saved-one {"lastTurnId":"old-turn","name":"new name"}');
+      assert.deepEqual(calls, [{ threadId: 'saved-one', lastTurnId: 'old-turn', name: 'new name' }]);
+      await invoke('fork saved-one {"prompt":"must not infer"}');
+      assert.equal(calls.length, 1);
+      assert.equal(trace().length, 0);
+    });
+});
+
+
+test('history picker safely renders source name and cwd controls', async () => {
+  const state = structuredClone(saved);
+  state.threads['saved-one'].name = 'name\u001b[31m\u009b\u202e\ninjected';
+  state.threads['saved-one'].cwd = '/source/\u001b[2J\u2066';
+  let choices;
+  await withOperator({ savedState: state, ui: { select: async (_title, options) => { choices = options; } } },
+    async ({ invoke, trace }) => {
+      assert.equal((await invoke('history')).cancelled, true);
+      assert.doesNotMatch(choices[0], /[\u001b\u009b\u202e\u2066\n]/);
+      assert.match(choices[0], /\\u001b/);
+      assert.match(choices[0], /\\u202e/);
+      assert.match(choices[0], /cwd/);
+      assert.equal(trace().filter(entry => MUTATIONS.has(entry.message?.method)).length, 0);
+    });
+});
+
+test('tier command uses existing session OpenAI-family setting without native admission', async () => {
+  await withOperator({ initialTier: 'priority' }, async ({ invoke, tierChanges, trace }) => {
+    const current = await invoke('tier');
+    assert.equal(current.serviceTier, 'priority');
+    assert.equal(current.readOnly, true);
+    assert.match(current.scope, /OpenAI-family setting for this OMP session/);
+    assert.equal(tierChanges.length, 0);
+    await invoke('tier flex');
+    await invoke('tier inherit');
+    assert.deepEqual(tierChanges, [{ family: 'openai', value: 'flex' }, { family: 'openai', value: undefined }]);
+    await invoke('tier fast');
+    assert.equal(tierChanges.length, 2);
+    assert.equal(trace().length, 0);
+  });
+  for (const choice of ['ultrafast', undefined]) {
+    await withOperator({ ui: { select: async () => choice } }, async ({ invoke, tierChanges, trace }) => {
+      const result = await invoke('tier');
+      if (choice) assert.deepEqual(tierChanges, [{ family: 'openai', value: choice }]);
+      else {
+        assert.equal(result.cancelled, true);
+        assert.equal(tierChanges.length, 0);
+      }
+      assert.equal(trace().length, 0);
+    });
+  }
+});
+
+test('interactive history can explicitly return JSON without opening a picker', async () => {
+  await withOperator({ ui: { select: async () => assert.fail('JSON history must not open a picker') } }, async ({ invoke, trace }) => {
+    const result = await invoke('history --json {"limit":1}');
+    assert.equal(result.data[0].id, 'saved-one');
+    assert.equal(typeof result.nextCursor, 'string');
+    assert.equal(trace().filter(entry => MUTATIONS.has(entry.message?.method)).length, 0);
+  });
+});
+
+test('quota notices merge sparse windows, deduplicate clients, and require observed recovery', () => {
+  const display = createProgressDisplay();
+  const notices = [];
+  display.capture({ agent: { kind: 'main' }, hasUI: true, sessionManager: { getSessionId: () => 'quota-root' },
+    ui: { setStatus() {}, notify: (message, type) => notices.push({ message, type }) } });
+  const send = rateLimits => display.rateLimits({ rateLimits });
+  send({ limitId: 'codex', primary: { usedPercent: 80 } });
+  assert.equal(notices.length, 0);
+  const reached = { limitId: 'codex', primary: { usedPercent: 100, resetsAt: 1900000000 }, secondary: { usedPercent: 20 } };
+  send(reached);
+  send(reached);
+  send({ limitId: 'codex', primary: null, secondary: { usedPercent: 10 }, accountId: 'PRIVATE-ACCOUNT' });
+  assert.equal(notices.length, 1);
+  assert.equal(notices[0].type, 'warning');
+  assert.match(notices[0].message, /primary 100%.*reset/);
+  assert.doesNotMatch(notices[0].message, /PRIVATE-ACCOUNT/);
+  send({ limitId: 'codex', primary: { usedPercent: 30 } });
+  assert.equal(notices[1].type, 'info');
+  assert.match(notices[1].message, /usage window recovered/);
+  send({ limitId: 'codex', spendControlReached: true });
+  send({ limitId: 'codex', primary: { usedPercent: 0 }, spendControlReached: null });
+  assert.equal(notices.length, 3);
+  send({ limitId: 'codex', spendControlReached: false });
+  assert.equal(notices.length, 4);
+  display.release();
+  send(reached);
+  assert.equal(notices.length, 4, 'headless/released roots cannot notify');
+});
+
+test('execution card separates requested tier from an unreported effective tier', () => {
+  const card = executionCard({ threadId: 'thread', name: 'Parser review', status: 'inProgress',
+    execution: { requestedServiceTier: 'priority', serviceTier: null } });
+  assert.match(card, /Name: Parser review/);
+  assert.match(card, /Requested tier: priority.*Effective tier: unknown/);
 });

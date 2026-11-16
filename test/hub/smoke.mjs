@@ -105,6 +105,9 @@ function assertSingleWorkspaceTurn(turns = 1, resumes = 0) {
   assert.equal(sent("thread/start").length, 1, "one native thread per child session");
   assert.equal(sent("thread/resume").length, resumes, "the live child keeps its loaded thread; only a revived one resumes it");
   assert.equal(sent("turn/start").length, turns, "no duplicate native turn (yield reminder, retry or queued steer)");
+  const named = sent("thread/name/set").find(params => params.threadId === sent("turn/start")[0].threadId);
+  assert.ok(named?.name?.trim(), "OMP task metadata names the native thread");
+  assert.equal(JSON.parse(readFileSync(join(FIX, "store.json"), "utf8")).threads[named.threadId].name, named.name);
 }
 
 async function tui() {
@@ -112,9 +115,13 @@ async function tui() {
   const output = [];
   const env = { ...process.env, CODEX_HUB_FIXTURE_DIR: FIX, OMP_TUI_DEBUG: socket, CODEX_HUB_FIXTURE_CONTEXT: CONTEXT,
     ...(["tui-question", "tui-question-secret"].includes(mode) ? { CODEX_HUB_FIXTURE_OPTIONS: JSON.stringify({ turns: ["question"], questionIsSecret: mode === "tui-question-secret" }) } : {}),
-    ...(mode === "tui-progress-many" ? { CODEX_HUB_FIXTURE_CHILDREN: "3", CODEX_HUB_FIXTURE_OPTIONS: '{"turns":["usability-many","usability-many","usability-many"]}' } : {}),
+    ...(mode === "tui-progress-many" ? { CODEX_HUB_FIXTURE_CHILDREN: "3", CODEX_HUB_FIXTURE_OPTIONS: JSON.stringify({
+      turns: ["usability-many", "usability-many", "usability-many"],
+      rateLimitUpdatesOnTurn: [{ rateLimits: { limitId: "codex", primary: { usedPercent: 100, resetsAt: 1900000000 } } }],
+    }) } : {}),
     ...(mode === "tui-clear" ? { CODEX_HUB_FIXTURE_ROOT_MODEL: "codex-bridge/default", CODEX_HUB_FIXTURE_OPTIONS: '{"turns":["rich-output","finish-later","finish-later"]}', CODEX_HUB_FIXTURE_KEEP_RECENT_TOKENS: "1" } : {}),
     ...(USABILITY_MODES.includes(mode) ? { CODEX_HUB_FIXTURE_OPTIONS: '{"turns":["usability"]}' } : {}),
+    ...(mode === "tui-operator" ? { CODEX_HUB_FIXTURE_OPTIONS: '{"turns":["usability","finish-later"]}' } : {}),
     ...(["tui-operator", "tui-progress"].includes(mode) ? { CODEX_HUB_FIXTURE_ROOT_MODEL: "codex-bridge/default" } : {}),
     ...(mode === "tui-execution" ? { CODEX_HUB_FIXTURE_DIRECT_JSON: JSON.stringify({ action: "run", prompt: "fixture execution card", effort: "high" }) } : {}),
   };
@@ -212,6 +219,12 @@ async function tui() {
       assert.ok(!live.includes("Codex activity ["));
       assert.ok(!live.includes("sessions omitted"));
       assert.ok(!live.includes("Plan: unknown"));
+      const quota = await until("one native quota warning across three workers", async () => {
+        const text = visibleText(await screen());
+        return text.includes("limit reached") ? text : undefined;
+      });
+      assert.equal(quota.split("limit reached").length - 1, 1);
+      assert.ok(quota.includes("100%") && quota.includes("reset"));
       assert.equal(sent("thread/start").length, 3);
       assert.equal(sent("turn/start").length, 3);
       assert.equal(sent("thread/resume").length, 0);
@@ -267,7 +280,7 @@ async function tui() {
         await until("restarted first paint", async () => (await reply({ op: "text" })).parsed.ok);
         const doctor = await command("/codex doctor", "doctor");
         assert.match(doctor, /"readOnly"\s*:\s*true/);
-        const history = await command('/codex history {"limit":1}', "history");
+        const history = await command('/codex history --json {"limit":1}', "history");
         assert.ok(history.includes(threadId), "saved native thread is discoverable after an actual OMP restart");
         assert.match(history, /"readOnly"\s*:\s*true/);
         assert.ok(trace().filter(entry => entry.spawn).length > spawns, "history is read by a new native process");
@@ -303,6 +316,39 @@ async function tui() {
         assert.deepEqual(mutationTrace(), beforeRestart, "doctor/history/details after restart must never create, attach, replay, steer, fork or interrupt a thread");
         assert.equal(readFileSync(join(FIX, "store.json"), "utf8"), savedStore, "read-only inspection leaves native saved history unchanged");
         await show("read-only history and details after process restart");
+        await enter("/codex tier");
+        await until("native processing tier picker", async () => (await painted()).includes("OpenAI-family service tier"));
+        for (let index = 0; index < 4; index++) await ask({ op: "keys", keys: "down" });
+        await ask({ op: "keys", keys: "enter" });
+        await until("priority selection recorded", async () => /"serviceTier"\s*:\s*"priority"/.test(visibleText(await screen())));
+        await enter("fixture completed history boundary");
+        await until("completed boundary for explicit fork", () => {
+          const store = JSON.parse(readFileSync(join(FIX, "store.json"), "utf8"));
+          return sent("turn/start").length === 2 && Object.values(store.threads).some(thread => thread.turns?.at(-1)?.status === "completed");
+        });
+        await until("completed native request leaves the active footer", async () => !(await painted()).includes("Codex 1 active"));
+        assert.equal(sent("turn/start")[1].serviceTierForTurn, "priority");
+        assert.ok(!Object.hasOwn(sent("turn/start")[1], "serviceTier"));
+        const sourceId = sent("turn/start")[1].threadId;
+        const beforeFork = structuredClone(JSON.parse(readFileSync(join(FIX, "store.json"), "utf8")).threads[sourceId]);
+        await enter('/codex history {"limit":10}');
+        await until("native history picker", async () => (await painted()).includes("Codex saved history"));
+        await ask({ op: "keys", keys: "down" });
+        await show("native saved-history choices");
+        await ask({ op: "keys", keys: "enter" });
+        await until("history action picker", async () => (await painted()).includes("Fork as new direct thread"));
+        await ask({ op: "keys", keys: "down" });
+        await ask({ op: "keys", keys: "enter" });
+        await until("explicit fork confirmation", async () => (await painted()).includes("Confirm fork"));
+        await ask({ op: "keys", keys: "down" });
+        await ask({ op: "keys", keys: "enter" });
+        await until("fork receipt rendered", async () => /"forked"\s*:\s*true/.test(visibleText(await screen())));
+        const afterFork = JSON.parse(readFileSync(join(FIX, "store.json"), "utf8"));
+        assert.deepEqual(afterFork.threads[sourceId], beforeFork);
+        assert.equal(sent("thread/fork").length, 1);
+        assert.equal(sent("thread/fork")[0].threadId, sourceId);
+        assert.equal(sent("turn/start").length, 2, "history fork never starts inference");
+        await show("native history picker, processing tier and explicit fork");
         return;
       }
       await until("terminal native footer cleared", async () => !(await painted()).includes("Codex 1 active"));

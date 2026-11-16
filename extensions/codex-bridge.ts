@@ -16,6 +16,8 @@ const streamSimple = createCodexBridgeProvider({
   stateDir: process.env.OMP_CODEX_BRIDGE_STATE_DIR || join(getAgentDir(), "codex-bridge-state"),
   onRequest,
   onProgress: progressDisplay.update,
+  onRateLimits: progressDisplay.rateLimits,
+  onNotice: progressDisplay.notify,
 });
 
 export default function (pi: ExtensionAPI) {
@@ -33,7 +35,7 @@ export default function (pi: ExtensionAPI) {
   });
 
   const parsers = createRequestParsers(pi.zod);
-  const shutdown = registerDirectTool(pi);
+  const shutdown = registerDirectTool(pi, { onRateLimits: progressDisplay.rateLimits });
   let preparedBranch;
 
   pi.on("session_start", (_event, ctx) => {
@@ -78,7 +80,9 @@ export default function (pi: ExtensionAPI) {
   pi.on("session_before_tree", (event, ctx) => streamSimple.beforeTree(event, ctx));
   pi.on("session_tree", (event, ctx) => streamSimple.afterTree(event, ctx));
   pi.on("context", (event, ctx) => streamSimple.context(event, ctx));
-  pi.on("before_provider_request", (event, ctx) => streamSimple.beforeProviderRequest(event, ctx));
+  pi.on("before_provider_request", (event, ctx) => streamSimple.beforeProviderRequest(event, ctx, {
+    serviceTier: pi.getServiceTiers().openai,
+  }));
   pi.on("session_clear", async (_event, ctx) => {
     if (ctx.agent.kind === "main") {
       releaseRoot();
