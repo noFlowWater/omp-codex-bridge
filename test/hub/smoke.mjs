@@ -329,11 +329,11 @@ async function tui() {
         await until("completed native request leaves the active footer", async () => !(await painted()).includes("Codex 1 active"));
         assert.equal(sent("turn/start")[1].serviceTierForTurn, "priority");
         assert.ok(!Object.hasOwn(sent("turn/start")[1], "serviceTier"));
-        const sourceId = sent("turn/start")[1].threadId;
+        const sourceId = sent("turn/start")[0].threadId;
         const beforeFork = structuredClone(JSON.parse(readFileSync(join(FIX, "store.json"), "utf8")).threads[sourceId]);
+        assert.equal(beforeFork.turns.at(-1).status, "failed", "the picker must retain failed history");
         await enter('/codex history {"limit":10}');
         await until("native history picker", async () => (await painted()).includes("Codex saved history"));
-        await ask({ op: "keys", keys: "down" });
         await show("native saved-history choices");
         await ask({ op: "keys", keys: "enter" });
         await until("history action picker", async () => (await painted()).includes("Fork as new direct thread"));
@@ -347,6 +347,7 @@ async function tui() {
         assert.deepEqual(afterFork.threads[sourceId], beforeFork);
         assert.equal(sent("thread/fork").length, 1);
         assert.equal(sent("thread/fork")[0].threadId, sourceId);
+        assert.equal(sent("thread/fork")[0].lastTurnId, beforeFork.turns.at(-1).id);
         assert.equal(sent("turn/start").length, 2, "history fork never starts inference");
         await show("native history picker, processing tier and explicit fork");
         return;

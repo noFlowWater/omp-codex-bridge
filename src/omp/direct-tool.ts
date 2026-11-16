@@ -1,5 +1,6 @@
 import type { ExtensionAPI } from "@oh-my-pi/pi-coding-agent";
 import { CodexAppServerClient } from "../codex/client.mjs";
+import { TERMINAL as NATIVE_TERMINAL } from "../codex/protocol.mjs";
 import { onRequest } from "./dialogs.ts";
 import { errorDetails, readOnlyAction, registerOperator } from "./operator.ts";
 import { executionCard, summarizeRun } from "./presentation.ts";
@@ -122,7 +123,7 @@ export function registerDirectTool(pi: ExtensionAPI, options: { onRateLimits?: (
     const admissionBarrier = closeBarrier;
     const active = await getClient();
     if (admissionBarrier !== closeBarrier) throw new Error("Session changed before native admission; nothing was sent");
-    // Read only: freeze a completed source boundary without adopting or resuming the source.
+    // Read only: freeze a finished source boundary without adopting or resuming the source.
     let cursor: string | undefined;
     const cursors = new Set<string>();
     let sourceCwd: string | undefined;
@@ -131,14 +132,14 @@ export function registerDirectTool(pi: ExtensionAPI, options: { onRateLimits?: (
       const source = await active.getThreadDetails(params.threadId, { limit: 100, cursor });
       sourceCwd = source.thread.cwd;
       if (typeof sourceCwd !== "string" || !sourceCwd) throw new Error("Source history did not report cwd; no fork was sent");
-      const turn = source.turns.data.find(turn => params.lastTurnId ? turn.id === params.lastTurnId : turn.status === "completed");
+      const turn = source.turns.data.find(turn => params.lastTurnId ? turn.id === params.lastTurnId : NATIVE_TERMINAL.has(turn.status));
       if (turn) {
-        if (turn.status !== "completed") throw new Error("Fork boundary must be a completed turn");
+        if (!NATIVE_TERMINAL.has(turn.status)) throw new Error("Fork boundary must be a finished turn");
         boundary = turn.id;
         break;
       }
       const next = source.turns.nextCursor;
-      if (!next) throw new Error(params.lastTurnId ? "Completed fork boundary was not found in source history" : "Source has no completed turn boundary to fork");
+      if (!next) throw new Error(params.lastTurnId ? "Finished fork boundary was not found in source history" : "Source has no finished turn boundary to fork");
       if (cursors.has(next)) throw new Error("Native history returned a repeated cursor");
       cursors.add(next);
       cursor = next;
@@ -185,7 +186,7 @@ export function registerDirectTool(pi: ExtensionAPI, options: { onRateLimits?: (
   pi.registerTool({
     name: "codex_bridge",
     label: "Codex bridge agent",
-    description: "Direct native Codex control, outside Agent Hub. For Agent Hub delegation, spawn agent codex-bridge. run starts or continues a locally owned thread; active turns receive steering. fork creates a locally owned direct thread through a completed source boundary, preserving source cwd and original history, with no inference; continue via run. Uses parent's cwd unless isolation requested. Inherits native Codex permissions/environment; optional OMP_CODEX_BRIDGE_CONFIG JSON provides operator-set native overrides. Approval requests require explicit user confirmation; unavailable UI declines them. run accepts prompt/native input, effort, outputSchema, optional name and native serviceTier for a new turn only. Omitted serviceTier preserves native defaults; no pricing/quota override. Returns bounded execution/activity/plan/file-change metadata; terminal results arrive as follow-ups. status reads retained state; diagnose inspects native availability. history and details inspect saved native history without ownership/resume/replay. includeDiff explicitly includes bounded native diff which may expose secrets and is not a complete audit. cancel interrupts a locally loaded thread. shutdown closes this session's server.",
+    description: "Direct native Codex control, outside Agent Hub. For Agent Hub delegation, spawn agent codex-bridge. run starts or continues a locally owned thread; active turns receive steering. fork creates a locally owned direct thread through a finished source boundary (completed, failed or interrupted), preserving source cwd and original history, with no inference; continue via run. Uses parent's cwd unless isolation requested. Inherits native Codex permissions/environment; optional OMP_CODEX_BRIDGE_CONFIG JSON provides operator-set native overrides. Approval requests require explicit user confirmation; unavailable UI declines them. run accepts prompt/native input, effort, outputSchema, optional name and native serviceTier for a new turn only. Omitted serviceTier preserves native defaults; availability, quota use and cost depend on the account/model. Returns bounded execution/activity/plan/file-change metadata; terminal results arrive as follow-ups. status reads retained state; diagnose inspects native availability. history and details inspect saved native history without ownership/resume/replay. includeDiff explicitly includes bounded native diff which may expose secrets and is not a complete audit. cancel interrupts a locally loaded thread. shutdown closes this session's server.",
     parameters: z.object({
       action: z.enum(["run", "fork", "status", "diagnose", "history", "details", "cancel", "shutdown"]),
       threadId: z.string().min(1).optional(),
@@ -194,7 +195,7 @@ export function registerDirectTool(pi: ExtensionAPI, options: { onRateLimits?: (
       model: z.string().min(1).optional(),
       name: z.string().min(1).optional().describe("Native thread name for run or fork."),
       serviceTier: z.string().min(1).optional().describe("Native service tier for a new turn only; omitted inherits native default. Availability is account/model dependent."),
-      lastTurnId: z.string().min(1).optional().describe("Completed source turn boundary for fork; omitted selects latest completed turn."),
+      lastTurnId: z.string().min(1).optional().describe("Finished source turn boundary for fork; omitted selects latest completed, failed or interrupted turn."),
       input: z.array(z.union([
         z.object({ type: z.literal("text"), text: z.string(), text_elements: z.array(z.unknown()).optional() }).strict(),
         z.object({ type: z.literal("image"), url: z.string().min(1), detail: z.enum(["auto", "low", "high", "original"]).nullable().optional() }).strict(),

@@ -447,3 +447,24 @@ test('execution card separates requested tier from an unreported effective tier'
   assert.match(card, /Name: Parser review/);
   assert.match(card, /Requested tier: priority.*Effective tier: unknown/);
 });
+
+test('history picker forks the latest failed or interrupted turn rather than an older success', async () => {
+  for (const status of ['failed', 'interrupted']) {
+    const state = structuredClone(saved);
+    state.threads['saved-one'].turns.push({ id: 'latest', status, items: [] });
+    const answers = [0, 'Fork as new direct thread', 'Confirm fork'];
+    let chosen;
+    await withOperator({
+      savedState: state,
+      ui: { select: async (_title, choices) => {
+        const answer = answers.shift();
+        return typeof answer === 'number' ? choices[answer] : answer;
+      } },
+      fork: async params => { chosen = params; return { forked: true, threadId: 'new-thread', cwd }; },
+    }, async ({ invoke }) => {
+      const result = await invoke('history');
+      assert.equal(result.forked, true);
+      assert.equal(chosen.lastTurnId, 'latest');
+    });
+  }
+});

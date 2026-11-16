@@ -2938,3 +2938,37 @@ test('direct history fork preserves its source and continues only the new owned 
     assert.deepEqual(JSON.parse(readFileSync(join(dir, 'store.json'), 'utf8')).threads[source.id], source);
   });
 }, TIMEOUT);
+
+test('direct fork retains the latest failed or interrupted context and can continue without replay', async () => {
+  for (const status of ['failed', 'interrupted']) {
+    const source = { id: 'source', cwd, turns: [
+      { id: 'older-success', status: 'completed', items: [] },
+      { id: 'latest', status, items: [], error: status === 'failed' ? { message: 'native failure' } : null },
+    ] };
+    await withHost({ turns: ['finish-later'], staleTurns: true }, { nextThread: 1, nextTurn: 2, threads: { source } }, async ({ call, followUps, dir }) => {
+      const forked = await call({ action: 'fork', threadId: source.id });
+      assert.equal(forked.isError, false);
+      assert.equal(forked.json.lastTurnId, 'latest');
+      const continued = await call({ action: 'run', threadId: forked.json.threadId, cwd, prompt: 'Investigate the failure' });
+      assert.equal(continued.isError, false);
+      await until(() => followUps.length === 1);
+      assert.equal(followUps[0].summary.status, 'completed');
+      assert.deepEqual(JSON.parse(readFileSync(join(dir, 'store.json'), 'utf8')).threads.source, source);
+      assert.equal(trace(dir).filter(entry => entry.message?.method === 'turn/start').length, 1);
+      assert.equal(trace(dir).filter(entry => entry.message?.method === 'thread/fork').length, 1);
+    });
+  }
+}, TIMEOUT);
+
+test('explicit running and unknown fork boundaries remain unmodified', async () => {
+  for (const status of ['inProgress', 'unknown']) {
+    const source = { id: 'source', cwd, turns: [{ id: 'pending', status, items: [] }] };
+    await withHost({ staleTurns: true }, { nextThread: 1, nextTurn: 1, threads: { source } }, async ({ call, dir }) => {
+      const result = await call({ action: 'fork', threadId: source.id, lastTurnId: 'pending' });
+      assert.equal(result.isError, true);
+      assert.match(result.json.error, /finished turn/);
+      assert.equal(trace(dir).filter(entry => entry.message?.method === 'thread/fork').length, 0);
+      assert.deepEqual(JSON.parse(readFileSync(join(dir, 'store.json'), 'utf8')).threads.source, source);
+    });
+  }
+}, TIMEOUT);

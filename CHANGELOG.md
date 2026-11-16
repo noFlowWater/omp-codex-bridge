@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.5.1
+
+- Fork the latest completed, failed or interrupted native turn instead of skipping failure context or rejecting it.
+- Keep running and unknown boundaries out of explicit forks; source history remains unchanged.
+- Pin CI to OMP 18.21.0 with the official release asset checksum.
+
 ## 0.5.0
 
 - Synchronize OMP task/session names to native threads without blocking task execution on title failures.

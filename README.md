@@ -6,10 +6,9 @@ Codex owns inference, native tools, authentication and persistent threads. OMP o
 
 ## Requirements
 
-- Compatibility target: OMP 18.20.3 and Codex CLI 0.169.0. Protocol doubles exercise native contracts; real-server startup, diagnostics, permissions and naming checks run without model inference. Re-run the checks below after upgrades.
+- Compatibility target: OMP 18.21.0 and Codex CLI 0.169.0. Protocol doubles exercise native contracts; real-server startup, diagnostics, permissions and naming checks run without model inference. Re-run the checks below after upgrades.
 - Codex CLI on `PATH`, authenticated with `codex login`. OMP uses its embedded Bun runtime to load the plugin.
 - Development: Node.js 20.19 or newer and Bun 1.4.2 or newer. The standalone client also supports Node.js 20.19+.
-- Local lifecycle, branching and `/clear` smoke checks also passed on OMP 18.21.0; the pinned CI target remains 18.20.3.
 
 ## Install
 
@@ -86,7 +85,7 @@ Fork saved history into a new locally owned direct thread:
 {"action":"fork","threadId":"<saved-source-id>","name":"Parser follow-up"}
 ```
 
-The response returns the new thread ID and continuation arguments. Forking copies through the latest completed turn, or the explicit `lastTurnId`; it starts no inference and preserves source history and cwd. Optional naming errors appear as `nameWarning` alongside the successful admission.
+The response returns the new thread ID and continuation arguments. Forking copies through the latest finished turn (`completed`, `failed` or `interrupted`), or the explicit finished `lastTurnId`; it starts no inference and preserves source history and cwd. Optional naming errors appear as `nameWarning` alongside the successful admission.
 
 ## Inspect and diagnose
 
@@ -178,14 +177,14 @@ Unit tests and Hub smoke tests use a protocol double, isolated homes and tempora
 
 Runtime responsibilities live under `src/codex/` (native transport, thread/turn ownership and side-effect-free `inspection.mjs`) and `src/omp/` (provider, receipts, operator commands and `presentation.ts` for cards and footer status). Byte budgets and screen-line limits stay separate. Codex owns durable native history outside this package. `extensions/codex-bridge.ts` is the package entrypoint; tests stay under `test/` and are excluded from the package file list.
 
-CI pins OMP 18.20.3 and runs the unit and isolated package/Hub checks without credentials. Release delivery is the reviewed source commit/tag plus the native local install above. No publishing workflow, registry token, generated bundle or preview channel is required. Re-run these gates before changing the compatibility target.
+CI pins OMP 18.21.0 and runs the unit and isolated package/Hub checks without credentials. Release delivery is the reviewed source commit/tag plus the native local install above. No publishing workflow, registry token, generated bundle or preview channel is required. Re-run these gates before changing the compatibility target.
 
 ## References
 
 - [Codex app-server API](https://learn.chatgpt.com/docs/app-server.md)
 - [Codex native configuration](https://learn.chatgpt.com/docs/config-file/config-reference)
-- [OMP package install/update/remove contracts](https://github.com/can1357/oh-my-pi/blob/v18.20.3/docs/plugin-manager-installer-plumbing.md)
-- [OMP agent discovery and per-call grants](https://github.com/can1357/oh-my-pi/blob/v18.20.3/docs/task-agent-discovery.md)
+- [OMP package install/update/remove contracts](https://github.com/can1357/oh-my-pi/blob/v18.21.0/docs/plugin-manager-installer-plumbing.md)
+- [OMP agent discovery and per-call grants](https://github.com/can1357/oh-my-pi/blob/v18.21.0/docs/task-agent-discovery.md)
 - [Current OMP extension loading guide](https://github.com/can1357/oh-my-pi/blob/main/docs/extension-loading.md)
 - [Codex execution rules](https://learn.chatgpt.com/docs/agent-configuration/rules.md)
 - [Official Codex ACP adapter](https://github.com/agentclientprotocol/codex-acp)

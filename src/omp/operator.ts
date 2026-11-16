@@ -1,5 +1,6 @@
 import type { ExtensionAPI, ExtensionContext } from "@oh-my-pi/pi-coding-agent";
 import type { CodexAppServerClient } from "../codex/client.mjs";
+import { TERMINAL as NATIVE_TERMINAL } from "../codex/protocol.mjs";
 import { utf8Preview } from "./presentation.ts";
 
 const ERROR_BYTES = 4 * 1024;
@@ -142,15 +143,15 @@ async function pickHistory(params: OperatorParams, client: CodexAppServerClient,
     if (index < 0) return { readOnly: true, cancelled: true };
     const threadId = page.data[index].id;
     const details = await readOnlyAction("details", { threadId, limit: 100 }, client, pi, ctx);
-    const boundary = details.turns.data.find(turn => turn.status === "completed")?.id;
+    const boundary = details.turns.data.find(turn => NATIVE_TERMINAL.has(turn.status))?.id;
     const action = await ctx.ui.select(
       `Source ${historyLabel(threadId)} | name ${historyLabel(details.thread.name)} | cwd ${historyLabel(details.thread.cwd)}`,
       ["View details", "Fork as new direct thread", "Cancel"]);
     if (action === "View details") return details;
     if (action !== "Fork as new direct thread") return { readOnly: true, cancelled: true };
-    if (!boundary) throw new Error("Source has no completed turn boundary to fork");
+    if (!boundary) throw new Error("Source has no finished turn boundary to fork");
     const confirm = await ctx.ui.select(
-      `Fork ${historyLabel(threadId)} through completed turn ${historyLabel(boundary)}?\nCreates a direct-tool thread outside Agent Hub. Source stays unchanged. No inference starts.`,
+      `Fork ${historyLabel(threadId)} through finished turn ${historyLabel(boundary)}?\nCreates a direct-tool thread outside Agent Hub. Source stays unchanged. No inference starts.`,
       ["Cancel", "Confirm fork"]);
     if (confirm !== "Confirm fork") return { readOnly: true, cancelled: true };
     return fork({ threadId, lastTurnId: boundary });

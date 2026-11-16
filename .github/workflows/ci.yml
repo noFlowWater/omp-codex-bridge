@@ -26,9 +26,9 @@ jobs:
         run: |
           mkdir -p "$RUNNER_TEMP/bin"
           curl --fail --location --silent --show-error \
-            https://github.com/can1357/oh-my-pi/releases/download/v18.20.3/omp-linux-x64 \
+            https://github.com/can1357/oh-my-pi/releases/download/v18.21.0/omp-linux-x64 \
             --output "$RUNNER_TEMP/bin/omp"
-          echo "f34ec9b0f0c368f1937701e2fe111b3c29a7cf53314a642448b3c6cf2925d85a  $RUNNER_TEMP/bin/omp" | sha256sum --check
+          echo "b00bd7ecdf7ad24d103ea56850969c9a8cc050527e1b9db64c25bbbf13fbedcc  $RUNNER_TEMP/bin/omp" | sha256sum --check
           chmod 755 "$RUNNER_TEMP/bin/omp"
           echo "$RUNNER_TEMP/bin" >> "$GITHUB_PATH"
       - run: bun install --frozen-lockfile
