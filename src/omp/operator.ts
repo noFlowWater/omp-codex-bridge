@@ -184,12 +184,15 @@ export function registerOperator(pi: ExtensionAPI, access: {
   status(threadId?: string): Promise<unknown>;
   fork(params: { threadId: string; lastTurnId?: string; name?: string }): Promise<unknown>;
 }) {
-  pi.registerMessageRenderer<{ label: string; raw: boolean }>("codex-bridge-operator", (message, options) => {
+  pi.registerMessageRenderer<{ label: string; raw: boolean; result?: unknown }>("codex-bridge-operator", (message, options) => {
     const details = message.details;
     if (details?.label === "help") return new CustomMessageComponent({ ...message, customType: "Codex commands" });
-    if (!details || details.raw || options.expanded) return undefined;
+    if (!details || details.raw) return undefined;
     if (typeof message.content !== "string") return undefined;
-    const result = JSON.parse(message.content.slice(message.content.indexOf("\n") + 1));
+    const result = details.result ?? JSON.parse(message.content.slice(message.content.indexOf("\n") + 1));
+    if (options.expanded) return details.result === undefined ? undefined : new CustomMessageComponent({ ...message,
+      content: `${message.content.slice(0, message.content.indexOf("\n"))}\n${JSON.stringify(result, null, 2)}`,
+    });
     const summary = operatorContent(details.label, result);
     if (summary === undefined) return undefined;
     // Reuse OMP's frame, theme and native Markdown tables without nesting custom renderers.
@@ -197,6 +200,11 @@ export function registerOperator(pi: ExtensionAPI, access: {
       customType: message.content.slice(0, message.content.indexOf("\n")), content: summary,
     });
   });
+  function report(title: string, label: string, result: unknown, raw: boolean, ctx: ExtensionContext) {
+    const summary = ctx.hasUI && !raw ? operatorContent(label, result) : undefined;
+    pi.sendMessage({ customType: "codex-bridge-operator", content: `${title}\n${summary ?? JSON.stringify(result, null, 2)}`,
+      details: { label, raw, ...(summary === undefined ? {} : { result }) }, display: true }, { triggerTurn: false });
+  }
   const z = pi.zod;
   const page = { cursor: z.string().min(1).optional(), limit: z.number().int().min(1).max(100).optional() };
   const history = z.object({ ...page, searchTerm: z.string().min(1).optional(), cwd: z.string().min(1).optional() }).strict();
@@ -275,9 +283,9 @@ export function registerOperator(pi: ExtensionAPI, access: {
           default: throw new Error(`Unknown command: ${command}. Use /codex for help.`);
         }
         const readOnly = !(result && typeof result === "object" && ("forked" in result || ("readOnly" in result && result.readOnly === false)));
-        pi.sendMessage({ customType: "codex-bridge-operator", content: `Codex ${label}${readOnly ? " (read-only)" : ""}:\n${JSON.stringify(result, null, 2)}`, details: { label, raw }, display: true }, { triggerTurn: false });
+        report(`Codex ${label}${readOnly ? " (read-only)" : ""}:`, label, result, raw, ctx);
       } catch (error) {
-        pi.sendMessage({ customType: "codex-bridge-operator", content: `Codex operator error:\n${JSON.stringify(errorDetails(error, selectedThreadId), null, 2)}`, details: { label: "error", raw }, display: true }, { triggerTurn: false });
+        report("Codex operator error:", "error", errorDetails(error, selectedThreadId), raw, ctx);
       }
     },
   });

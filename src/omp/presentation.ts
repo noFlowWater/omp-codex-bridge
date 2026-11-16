@@ -91,6 +91,7 @@ function doctorCard(result: Record<string, unknown>): string {
     ["Login", login],
     check("permissions", `${screenLine(settings.sandboxMode)} · approval=${screenLine(settings.approvalPolicy)} · source=${screenLine(result.permissionSource)}`),
     ["Configured", `${screenLine(settings.model)} · effort=${screenLine(settings.modelReasoningEffort)}`],
+    ["Cost", "Not reported · native account usage applies; OMP free/$0 is a placeholder"],
   ];
   for (const name of ["auth", "executable", "models", "steering", "rateLimits"]) {
     if (objectRecord(result[name]).status !== "available") rows.push(check(name));

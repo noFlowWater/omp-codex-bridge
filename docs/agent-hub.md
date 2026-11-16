@@ -40,7 +40,7 @@ Native quota events generate one warning on exhaustion and an informational noti
 
 ### Tokens and cost
 
-Model labels show only the native provider and selected model. The active footer identifies the model reported by Codex without changing the selected OMP model. Result cards show reported turn tokens with `Cost: not reported`; compact result JSON uses `cost: null`. Missing usage stays unavailable.
+Model picker labels identify the native model and say `cost unknown`. OMP may still display `free` or `$0` from its required numeric placeholder fields; this does not describe native account charges or quota use. The active footer identifies the model reported by Codex without changing the selected OMP model. Result cards show reported turn tokens with `Cost: not reported`; compact result JSON uses `cost: null`. Missing usage stays unavailable.
 
 The [app-server API](https://learn.chatgpt.com/docs/app-server) reports token usage and account limits, not a per-turn billed amount. Its model catalog does not include prices. OMP's zero-valued price fields are placeholders for unavailable pricing, not a claim that execution is free.
 
@@ -56,5 +56,6 @@ The [official pricing page](https://learn.chatgpt.com/docs/pricing) publishes to
 - Tree navigation, entry branches and whole-session forks preserve the source history and fork native history at the selected completed boundary. Compaction creates an opaque native checkpoint; Codex exposes no readable summary. An incompatible model cannot consume it.
 - OMP may refuse compaction of a small local transcript before the native hook runs. Focused compaction instructions and unsupported mid-turn branches are rejected.
 - Reload preserves confirmed task lineage. Clear starts a fresh conversation. Unknown mutation outcomes and missing lineage stop processing without replaying work.
+- New main conversations without an OMP title use the first user question's opening line as their native history name. Diagnostics stay available as compact context; full interactive operator payloads are retained for expansion rather than sent to the model by default.
 - Cancellation releases previous-turn waits without consuming new input. Once native admission is confirmed, cancellation retains the delivery receipt; a later request cannot replay that input. Host UI failures propagate as native request errors instead of prompting the user to correct an answer.
 - Malformed successful mutation replies retain an unknown outcome, preventing automatic replay. Failed pre-send cancellation and confirmed late interrupt refusal release their cancellation slot; unresolved native mutations remain guarded.

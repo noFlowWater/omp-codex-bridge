@@ -29,7 +29,7 @@ const profile = (id, name, native = {}) => ({
   contextWindow: native.contextWindow ?? 1_000_000,
   maxTokens: 128_000,
 });
-export const CODEX_BRIDGE_MODELS = [profile(DEFAULT_MODEL_ID, 'Codex native')];
+export const CODEX_BRIDGE_MODELS = [profile(DEFAULT_MODEL_ID, 'Codex native · cost unknown')];
 
 // OMP fetchDynamicModels: the default profile plus one per native model/list entry. One short-lived
 // app-server (initialize + model/list only, never a thread), always closed.
@@ -42,7 +42,7 @@ export async function fetchCodexModels({ createClient = options => new CodexAppS
     return [
       profile(DEFAULT_MODEL_ID, CODEX_BRIDGE_MODELS[0].name, defaultModel),
       ...listed.filter(entry => entry.model !== DEFAULT_MODEL_ID && parseCodexModelId(entry.model))
-        .map(entry => profile(entry.model, `Codex native on ${entry.model}`, entry)),
+        .map(entry => profile(entry.model, `Codex · cost unknown · ${entry.model}`, entry)),
     ];
   } finally {
     await client.close();

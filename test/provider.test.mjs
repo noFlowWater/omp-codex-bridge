@@ -1233,9 +1233,27 @@ test('fetchDynamicModels lists every native model page as one exact profile each
     assert.deepEqual(config.models.map(({ id }) => id), ['default']);
     const models = await config.fetchDynamicModels(undefined);
     assert.deepEqual(models.map(({ id }) => id), ['default', ...NATIVE_MODELS]);
+    assert.ok(config.models.every(model => model.name.includes('cost unknown')), 'static picker labels disclose missing prices');
+    assert.ok(models.every(model => model.name.includes('cost unknown')), 'dynamic picker labels disclose missing prices');
     for (const model of models.slice(1)) assert.ok(model.name.includes(model.id), model.name);
     assert.ok(sentParams(dir, 'model/list').length >= 3, 'all pages read');
     assert.deepEqual(mutations(dir), [], 'discovery never starts a thread or turn');
+  });
+}, TIMEOUT);
+
+test('an unnamed main conversation uses its first user question as native history title instead of diagnostics', async () => {
+  await withHost({ turns: ['finish-later', 'finish-later'] }, undefined, async ({ providers, dir }) => {
+    const diagnostic = at('Codex doctor: diagnostic summary', 1000, { role: 'developer' });
+    const notice = at('<system-reminder>Current directory</system-reminder>', 1500);
+    const question = at([{ type: 'text', text: '<system-reminder>Host context</system-reminder>' }, { type: 'text', text: 'Review my parser\nKeep the scope small.' }], 2000);
+    const first = await stream(providers, { messages: [diagnostic, notice, question] }, { sessionId: 'question-title' });
+    assert.equal(first.final.type, 'done', first.message.errorMessage);
+    const names = sentParams(dir, 'thread/name/set');
+    assert.equal(names.length, 1);
+    assert.equal(names[0].name, 'Review my parser');
+    const second = await stream(providers, { messages: [diagnostic, notice, question, first.message, at('Continue', 3000)] }, { sessionId: 'question-title' });
+    assert.equal(second.final.type, 'done', second.message.errorMessage);
+    assert.equal(sentParams(dir, 'thread/name/set').length, 1, 'follow-ups keep the existing question title');
   });
 }, TIMEOUT);
 
@@ -2940,6 +2958,7 @@ async function progressConsumer({ initial = {}, updates = [], finalText = '{"ok"
       notifications = options.onNotification;
       return {
         snapshot: () => structuredClone(state),
+        setThreadName: async () => structuredClone(state),
         run: async options => { request = options; options.onThread(state.threadId); return structuredClone(state); },
         subscribe(listener) {
           listeners.add(listener);

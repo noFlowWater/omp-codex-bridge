@@ -385,6 +385,10 @@ export function createCodexBridgeProvider({ EventStream, stateDir, onRequest, on
     const { client } = session;
     const { options, serviceTier, outputSchema, taskName, systemPrompt } = request;
     const { signal } = options;
+    const question = fresh.filter(message => message.role === 'user' && !message.synthetic)
+      .flatMap(message => typeof message.content === 'string' ? [message.content] : (message.content ?? []).filter(block => block.type === 'text').map(block => block.text))
+      .find(text => text.trim() && !text.trimStart().startsWith('<system-reminder>'));
+    const title = taskName ?? (!session.threadId ? question?.trim().split('\n')[0].slice(0, 120) : undefined);
     let effectiveModel = session.model;
     // A full record cannot hold these ids; checked before any native request, including reads.
     const ids = fresh.map(inputId);
@@ -445,10 +449,10 @@ export function createCodexBridgeProvider({ EventStream, stateDir, onRequest, on
             session.threads.add(threadId);
             saveSession(stateDir, session);
           }
-          if (taskName && (session.nativeName?.threadId !== threadId || session.nativeName.name !== taskName)) {
-            session.nativeName = { threadId, name: taskName };
+          if (title && (session.nativeName?.threadId !== threadId || session.nativeName.name !== title)) {
+            session.nativeName = { threadId, name: title };
             // Titles are optional metadata; their RPC must not delay or replay task input.
-            void client.setThreadName(threadId, taskName).catch(error => {
+            void client.setThreadName(threadId, title).catch(error => {
               try { onNotice?.(`Codex task name could not be saved: ${clip(error.message, 300)}`, 'warning'); } catch { /* UI only. */ }
             });
           }

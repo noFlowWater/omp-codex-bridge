@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.6.3 — 2026-11-17
+
+- Keep interactive operator payloads in message details and send compact summaries as model context; retain expanded JSON, explicit `--json` and headless structured output.
+- Name untitled main conversations after their first user question so diagnostic messages do not dominate native history labels.
+- Label every model picker entry `cost unknown` and clarify the host's zero-price placeholders in doctor output.
+
 ## 0.6.2 — 2026-11-17
 
 - Resolve the current native turn before rejecting turn-start options on a resumed thread with omitted turns; retain the guard for a confirmed running turn and explain how to send a live follow-up.

@@ -62,6 +62,27 @@ test('operator renderer summarizes doctor and empty status while expanded and JS
   });
 });
 
+test('interactive operator content carries a short model summary while expansion and explicit JSON retain all data', async () => {
+  await withOperator({ ui: {} }, async ({ invoke, messages, renderers, trace }) => {
+    const result = await invoke('doctor');
+    const message = messages.at(-1).message;
+    assert.deepEqual(message.details.result, result);
+    assert.match(message.content, /Signed in/);
+    assert.doesNotMatch(message.content, /supportedReasoningEfforts|perCallModelAllow|omp_codex_bridge/);
+    assert.ok(message.content.length < JSON.stringify(result).length / 2, 'catalog and routing data stay out of default model context');
+    const render = expanded => renderers.get('codex-bridge-operator')(message, { expanded }, {});
+    assert.match(render(false).text, /Signed in/);
+    assert.match(render(true).text, /supportedReasoningEfforts/);
+    await invoke('doctor --json');
+    assert.deepEqual(JSON.parse(messages.at(-1).message.content.split('\n').slice(1).join('\n')), result);
+    assert.equal(messages.at(-1).message.details.result, undefined);
+    await invoke('unknown-command');
+    assert.match(messages.at(-1).message.content, /Use \/codex for help/);
+    assert.doesNotMatch(messages.at(-1).message.content, /"error"\s*:/);
+    assert.deepEqual(trace().filter(entry => MUTATIONS.has(entry.message?.method)), []);
+  });
+});
+
 test('operator help preserves line breaks and remaining commands render summaries without JSON', async () => {
   await withOperator({}, async ({ invoke, messages, renderers }) => {
     const render = () => renderers.get('codex-bridge-operator')(messages.at(-1).message, { expanded: false }, { fg: (_color, text) => text }).text;
@@ -191,7 +212,7 @@ async function withOperator(options, body) {
     assert.equal(message.delivery.triggerTurn, false);
     assert.equal(message.message.display, true);
     if (message.message.details?.label === 'help') return message.message.content;
-    return JSON.parse(message.message.content.slice(message.message.content.indexOf('\n') + 1));
+    return message.message.details?.result ?? JSON.parse(message.message.content.slice(message.message.content.indexOf('\n') + 1));
   };
   const trace = () => existsSync(join(dir, 'trace.jsonl'))
     ? readFileSync(join(dir, 'trace.jsonl'), 'utf8').trim().split('\n').filter(Boolean).map(line => JSON.parse(line)) : [];

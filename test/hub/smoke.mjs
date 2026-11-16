@@ -194,6 +194,16 @@ async function tui() {
     const mutationTrace = () => trace().filter(({ message }) =>
       /^(thread\/(start|resume|fork|compact\/start)|turn\/(start|steer|interrupt))$/.test(message?.method ?? "")).map(({ message }) => message);
     if (mode === "tui-operator") {
+      await enter("/model");
+      await until("model picker opened", async () => /free per M|Search models/i.test(await painted()));
+      await ask({ op: "paste", text: "codex-bridge" });
+      await until("model picker discloses unknown native cost", async () => {
+        const text = await painted();
+        return text.includes("codex-bridge") && text.includes("cost unknown");
+      });
+      await ask({ op: "keys", keys: "escape" });
+      await ask({ op: "keys", keys: "escape" });
+      await until("model picker closed", async () => !(await painted()).includes("free per M"));
       await enter("/codex");
       await until("multiline command help", async () => (await screen()).includes("Codex commands"));
       const helpLines = (await screen()).split("\n");
@@ -226,6 +236,13 @@ async function tui() {
     await ask({ op: "keys", keys: "enter" });
     // The child provider reached the fake app-server; the `work` turn stays active.
     await until("native turn/start", () => sent("turn/start").length === (mode === "tui-progress-many" ? 3 : 1));
+    if (mode === "tui-operator") {
+      const input = JSON.stringify(sent("turn/start")[0].input);
+      assert.ok(input.includes("Signed in"), "native input retains the compact diagnostic summary");
+      assert.ok(!input.includes("supportedReasoningEfforts") && !input.includes("perCallModelAllow"), "raw diagnostic catalogs stay out of native input");
+      const names = await until("native history named after the question", () => sent("thread/name/set").length ? sent("thread/name/set") : undefined);
+      assert.equal(names[0].name, "Run the Codex hub fixture.");
+    }
     if (mode === "tui-progress-many") {
       const turns = sent("turn/start");
       const ids = turns.map(turn => turn.threadId);
