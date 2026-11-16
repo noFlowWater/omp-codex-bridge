@@ -1,5 +1,10 @@
 # Changelog
 
+## Unreleased
+
+- Focus the README on installation and first use; move detailed integration, configuration and development guides into `docs/`.
+- Include the documentation guides in the package file list.
+
 ## 0.5.1
 
 - Fork the latest completed, failed or interrupted native turn instead of skipping failure context or rejecting it.
