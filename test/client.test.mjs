@@ -6,10 +6,10 @@ import { join } from 'node:path';
 import { createInterface } from 'node:readline';
 import { fileURLToPath } from 'node:url';
 import { setTimeout as delay } from 'node:timers/promises';
-import { CodexNativeClient } from './client.mjs';
+import { CodexAppServerClient } from '../src/codex/client.mjs';
 
 // `node client.test.mjs --fake-app-server` runs the protocol double below instead of the tests.
-// extension.test.mjs starts the same double through a temporary `codex` executable.
+// provider.test.mjs starts the same double through a temporary `codex` executable.
 const FAKE_FLAG = '--fake-app-server';
 const FAKE_MODE = process.argv.includes(FAKE_FLAG);
 const it = FAKE_MODE ? () => {} : test;
@@ -25,7 +25,7 @@ const MUTATIONS = new Set(['thread/start', 'thread/resume', 'thread/fork', 'thre
 // or requests inference. $CODEX_HOME holds options.json (behaviour), store.json (persisted threads that
 // survive restarts) and trace.jsonl (one spawn record per process plus every message the client sent).
 // Turn behaviour is selected by the prompt text.
-function fakeServer() {
+export function fakeServer() {
   const home = process.env.CODEX_HOME;
   const file = (name) => join(home, name);
   const options = existsSync(file('options.json')) ? JSON.parse(readFileSync(file('options.json'), 'utf8')) : {};
@@ -52,6 +52,7 @@ function fakeServer() {
   const running = new Map();
   const serverRequests = new Map();
   let optOut = new Set();
+  let openaiForms = false;
   let initialized = false;
   process.stdout.on('error', () => {});
   if (options.slowExit) process.on('SIGTERM', () => setTimeout(() => process.exit(0), options.slowExit));
@@ -124,7 +125,7 @@ function fakeServer() {
     const form = mode === 'elicitation';
     const id = form ? 902 : 901;
     const params = form ? {
-      threadId: thread.id, turnId: turn.id, serverName: 'fixture', mode: 'form', message: 'Which environment?',
+      threadId: thread.id, turnId: turn.id, serverName: 'fixture', mode: options.elicitationMode ?? 'form', message: 'Which environment?',
       requestedSchema: options.elicitationSchema ?? { type: 'object', properties: { environment: { type: 'string', enum: ['Staging', 'Production'] } }, required: ['environment'] },
     } : {
       threadId: thread.id, turnId: turn.id, itemId: `${turn.id}-question`, isBlocking: true,
@@ -133,6 +134,10 @@ function fakeServer() {
         options: [{ label: 'Staging', description: 'Test environment' }, { label: 'Production', description: 'Live environment' }],
       }],
     };
+    if (form && params.mode !== 'form' && !openaiForms) {
+      complete(thread, turn, 'failed', null, 'openai/form capability was not negotiated');
+      return;
+    }
     serverRequests.set(id, () => complete(thread, turn, 'completed', form ? 'elicitation answered' : 'question answered'));
     send({ id, method: form ? 'mcpServer/elicitation/request' : 'item/tool/requestUserInput', params });
     if (mode === 'question-resolved') later(50, () => {
@@ -267,7 +272,7 @@ function fakeServer() {
     save();
     // The admission view is taken before any completion, as a racing server would send it.
     const admission = turnView(turn);
-    const admit = () => reply(id, { turn: admission });
+    const admit = () => reply(id, options.malformedTurnReply ? {} : { turn: admission });
     notify('turn/started', { threadId: thread.id, turn: turnView(turn) });
     if (mode === 'early') {
       item(thread, turn, commandItem('early-command', 'early output'));
@@ -419,6 +424,7 @@ function fakeServer() {
     }
     if (method === 'initialize') {
       optOut = new Set(params.capabilities?.optOutNotificationMethods ?? []);
+      openaiForms = params.capabilities?.mcpServerOpenaiFormElicitation === true;
       reply(id, { userAgent: 'fake-codex/0.167.2', codexHome: home, platformFamily: 'unix', platformOs: 'linux' });
       return;
     }
@@ -477,7 +483,8 @@ function fakeServer() {
       thread.turns.push(compactTurn);
       running.set(thread.id, compactTurn);
       save();
-      reply(id, {});
+      if (!options.compactDropReply) reply(id, {});
+      if (options.compactDisconnect) later(20, () => process.exit(18));
       later(options.compactStartDelay ?? 0, () => notify('turn/started', { threadId: thread.id, turn: turnView(compactTurn) }));
       const entry = { type: 'contextCompaction', id: `${compactTurn.id}-compact` };
       later(options.compactStartDelay ?? 0, () => notify('item/started', { threadId: thread.id, turnId: compactTurn.id, item: entry }));
@@ -508,7 +515,12 @@ function fakeServer() {
         refuse(id, 'expectedTurnId does not match the active turn', -32602);
       } else if (text === 'steer-lost') {
         // Accepted, but the response outlives the client's RPC timeout; the turn stays active meanwhile.
-        later(1500, () => { reply(id, { turnId: turn.id }); complete(thread, turn); });
+        later(1500, () => {
+          reply(id, { turnId: turn.id });
+          if (!options.steerHolds) complete(thread, turn);
+        });
+      } else if (options.malformedSteerReply) {
+        reply(id, { turnId: 'unexpected-turn' });
       } else if (options.steerHolds) {
         // Accepted into the active turn, which keeps running (until interrupted).
         reply(id, { turnId: turn.id });
@@ -535,6 +547,9 @@ function fakeServer() {
         } });
         item(thread, turn, { ...agentMessage(`${turn.id}-late-async`, 'Late async?'),
           phase: 'commentary', delivery: 'async', questions: [{ title: 'Late async?' }] });
+      } else if (options.rejectFirstInterruptAfter) {
+        later(options.rejectFirstInterruptAfter, () => refuse(id, 'interrupt refused by native validation', -32602));
+        options.rejectFirstInterruptAfter = 0;
       } else if (options.loseInterrupt) {
         later(options.loseInterrupt, () => { reply(id, {}); complete(thread, turn, 'interrupted', null); });
       } else {
@@ -552,7 +567,7 @@ function makeClient(t, options = {}, clientOptions = {}, store) {
   const dir = mkdtempSync(join(tmpdir(), 'codex-bridge-test-'));
   writeFileSync(join(dir, 'options.json'), JSON.stringify(options));
   if (store) writeFileSync(join(dir, 'store.json'), JSON.stringify(store));
-  const client = new CodexNativeClient({
+  const client = new CodexAppServerClient({
     command: [process.execPath, fileURLToPath(import.meta.url), FAKE_FLAG],
     timeoutMs: 3000,
     ...clientOptions,
@@ -937,6 +952,7 @@ it('opts out of message deltas and keeps the final message with bounded meaningf
   const done = await untilSnapshot(client, admitted.threadId, completed);
   const [initialize] = sent(dir, 'initialize');
   assert.equal(initialize.clientInfo.name, 'omp_codex_bridge');
+  assert.equal(initialize.clientInfo.version, JSON.parse(readFileSync(new URL('../package.json', import.meta.url), 'utf8')).version);
   assert.ok(initialize.capabilities.optOutNotificationMethods.includes('item/agentMessage/delta'));
   assert.equal(done.text, BIG_TEXT);
   assert.equal(done.textTruncated, false);
@@ -1136,7 +1152,7 @@ it('bounds JSONL messages at 64 MiB using UTF-8 bytes', async (t) => {
   assert.ok(accepted.text.length > 0 && /^a+$/.test(accepted.text));
   const active = await client.run({ prompt: 'hold', cwd });
   // 23 million Hangul characters: under 64 Mi UTF-16 units, above 64 MiB of UTF-8.
-  client._consume('가'.repeat(23_000_000));
+  client._transport.consume('가'.repeat(23_000_000));
   const failed = await untilSnapshot(client, active.threadId, ({ status }) => status === 'disconnected');
   assert.match(String(failed.error), /64 MiB/);
 });
@@ -1310,7 +1326,7 @@ it('declines every approval variant with exact schemas and refuses unsupported a
   const state = await client.run({ prompt: 'hold', cwd });
   const methods = ['item/fileChange/requestApproval', 'item/permissions/requestApproval', 'execCommandApproval',
     'applyPatchApproval', 'account/chatgptAuthTokens/refresh'];
-  methods.forEach((method, index) => client._receive({ id: 950 + index, method,
+  methods.forEach((method, index) => client._transport.receive({ id: 950 + index, method,
     params: { threadId: state.threadId, turnId: state.turnId } }));
   await until(() => trace(dir).filter(({ message }) => message?.id >= 950 && message.method === undefined).length === methods.length);
   const replies = trace(dir).filter(({ message }) => message?.id >= 950 && message.method === undefined).map(({ message }) => message);
@@ -1336,7 +1352,7 @@ it('forks through the selected completed native turn with fixed guards and no in
   assert.equal(request.excludeTurns, true);
   assert.equal(request.sandbox, 'workspace-write');
   assert.equal(request.approvalPolicy, 'never');
-  assert.equal((await client._lastTurn(fork.threadId)).id, first.turnId);
+  assert.equal((await client._readLastTurn(fork.threadId)).id, first.turnId);
   await client.run({ threadId: fork.threadId, prompt: 'branch only', cwd });
   assert.equal(sent(dir, 'thread/resume').length, 0);
 });
@@ -1412,7 +1428,7 @@ it('steers accepted live async questions with official reply envelope and never 
   assert.equal(steer.expectedTurnId, admitted.turnId);
   assert.equal(steer.input[0].text,
     `<send_user_message_question_reply>\n${JSON.stringify([{ answer: 'Staging', question: 'Which environment?', questionItemId: questionId }])}\n</send_user_message_question_reply>`);
-  await client._lastTurn(admitted.threadId);
+  await client._readLastTurn(admitted.threadId);
   assert.equal(asked, 1);
   assert.equal(trace(dir).filter(({ message }) => typeof message?.id === 'string' && message.id.startsWith('async:')).length, 0);
 });
@@ -1443,7 +1459,7 @@ it('allows owned standalone MCP forms without requiring an active native turn', 
   } });
   const admitted = await client.run({ prompt: 'done', cwd });
   await untilSnapshot(client, admitted.threadId, completed);
-  client._receive({ id: 990, method: 'mcpServer/elicitation/request',
+  client._transport.receive({ id: 990, method: 'mcpServer/elicitation/request',
     params: { threadId: admitted.threadId, turnId: null, serverName: 'fixture', mode: 'form',
       message: 'Standalone form', requestedSchema: { type: 'object', properties: {} } } });
   await until(() => seen);
@@ -1550,6 +1566,115 @@ it('coalesces concurrent and admitted interrupts until the same native turn ends
   await client.cancel(active.threadId);
   assert.deepEqual(sent(dir, 'turn/interrupt').map(({ turnId }) => turnId), [active.turnId, next.turnId]);
   await untilSnapshot(client, active.threadId, value => value.status === 'interrupted' && value.turnId === next.turnId);
+});
+
+it('negotiates extended MCP forms before forwarding them to the host', async (t) => {
+  for (const mode of ['openai/form', 'openaiForm']) {
+    let seen;
+    const { client, dir } = makeClient(t, { elicitationMode: mode }, { onRequest: async request => {
+      seen = request.params.mode;
+      return { action: 'accept', content: { environment: 'Staging' } };
+    } });
+    const admitted = await client.run({ prompt: 'elicitation', cwd });
+    assert.equal(sent(dir, 'initialize')[0].capabilities.mcpServerOpenaiFormElicitation, true);
+    const done = await untilSnapshot(client, admitted.threadId, completed);
+    assert.equal(seen, mode);
+    assert.equal(done.text, 'elicitation answered');
+    assert.deepEqual(trace(dir).find(({ message }) => message?.id === 902 && message.result).message.result,
+      { action: 'accept', content: { environment: 'Staging' } });
+  }
+});
+
+it('keeps malformed successful mutation replies unknown without replaying native input', async (t) => {
+  for (const method of ['turn/start', 'turn/steer']) {
+    const { client, dir } = makeClient(t, {
+      staleTurns: true, malformedTurnReply: method === 'turn/start', malformedSteerReply: method === 'turn/steer',
+    });
+    let threadId;
+    if (method === 'turn/steer') ({ threadId } = await client.run({ prompt: 'hold', cwd }));
+    await assert.rejects(client.run({ threadId, prompt: method === 'turn/start' ? 'hold' : 'follow-up', cwd }), error => {
+      threadId = error.threadId;
+      assert.equal(typeof threadId, 'string');
+      return unknownOutcome(threadId)(error);
+    });
+    const lost = client.snapshot(threadId);
+    assert.equal(lost.status, 'disconnected');
+    assert.equal(lost.outcomeUnknown, true);
+    await assert.rejects(client.run({ threadId, prompt: 'must not replay', cwd }), unknownOutcome(threadId));
+    assert.deepEqual(prompts(dir), ['hold']);
+    assert.equal(sent(dir, 'turn/steer').length, method === 'turn/steer' ? 1 : 0);
+  }
+});
+
+
+it('releases an unsent cancel after reconciliation fails and the late steer is confirmed', async (t) => {
+  const { client, dir } = makeClient(t, { steerHolds: true }, { timeoutMs: 600 });
+  const active = await client.run({ prompt: 'hold', cwd });
+  await assert.rejects(client.steer({ threadId: active.threadId, turnId: active.turnId, prompt: 'steer-lost' }),
+    unknownOutcome(active.threadId));
+  await assert.rejects(client.cancel(active.threadId), unknownOutcome(active.threadId));
+  assert.equal(sent(dir, 'turn/interrupt').length, 0);
+  await untilSnapshot(client, active.threadId, value => value.status === 'inProgress' && !value.outcomeUnknown);
+  await client.steer({ threadId: active.threadId, turnId: active.turnId, prompt: 'after late confirmation' });
+  await client.cancel(active.threadId);
+  await untilSnapshot(client, active.threadId, value => value.status === 'interrupted');
+  assert.deepEqual(prompts(dir), ['hold']);
+  assert.equal(sent(dir, 'turn/steer').length, 2);
+  assert.equal(sent(dir, 'turn/interrupt').length, 1);
+});
+
+it('releases a timed-out interrupt after its late native rejection', async (t) => {
+  const { client, dir } = makeClient(t, { steerHolds: true, rejectFirstInterruptAfter: 1500 }, { timeoutMs: 600 });
+  const active = await client.run({ prompt: 'hold', cwd });
+  await assert.rejects(client.cancel(active.threadId), unknownOutcome(active.threadId));
+  await untilSnapshot(client, active.threadId, value => value.status === 'inProgress' && !value.outcomeUnknown);
+  await client.steer({ threadId: active.threadId, turnId: active.turnId, prompt: 'after late rejection' });
+  await client.cancel(active.threadId);
+  await untilSnapshot(client, active.threadId, value => value.status === 'interrupted');
+  assert.deepEqual(prompts(dir), ['hold']);
+  assert.equal(sent(dir, 'turn/interrupt').length, 2);
+});
+
+it('preserves unknown mutation identity when reconciliation history fails', async (t) => {
+  for (const history of [{ failTurnsList: true }, { hangTurnsList: true }]) {
+    const { client, dir } = makeClient(t, { ...history, dropTurnReply: 10000 }, { timeoutMs: 600 });
+    let threadId;
+    await assert.rejects(client.run({ prompt: 'hold', cwd }), error => {
+      threadId = error.threadId;
+      return unknownOutcome(threadId)(error);
+    });
+    await assert.rejects(client.run({ threadId, prompt: 'must not replay', cwd }), error => {
+      assert.equal(error.code, history.failTurnsList ? -32600 : 'RPC_TIMEOUT');
+      assert.notEqual(error.cause?.outcomeUnknown, true, 'the original read error stays definitive');
+      return unknownOutcome(threadId)(error);
+    });
+    assert.equal(client.snapshot(threadId).outcomeUnknown, true);
+    assert.deepEqual(prompts(dir), ['hold']);
+    assert.equal(sent(dir, 'turn/steer').length, 0);
+  }
+});
+
+it('preserves unknown compaction identity on disconnect before and after admission', async (t) => {
+  for (const compactDropReply of [false, true]) {
+    const { client, dir } = makeClient(t, { compactDisconnect: true, compactDropReply, compactDelay: 1000 });
+    const first = await client.run({ prompt: 'first', cwd });
+    await untilSnapshot(client, first.threadId, completed);
+    await assert.rejects(client.compact(first.threadId), unknownOutcome(first.threadId));
+    assert.equal(client.snapshot(first.threadId).outcomeUnknown, true);
+    assert.equal(sent(dir, 'thread/compact/start').length, 1);
+    assert.deepEqual(prompts(dir), ['first']);
+  }
+  const { client, dir } = makeClient(t, { compactError: 'compaction refused by native validation' });
+  const first = await client.run({ prompt: 'first', cwd });
+  await untilSnapshot(client, first.threadId, completed);
+  await assert.rejects(client.compact(first.threadId), error => {
+    assert.equal(error.threadId, first.threadId);
+    assert.equal(error.code, -32603);
+    assert.notEqual(error.outcomeUnknown, true);
+    return true;
+  });
+  assert.equal(client.snapshot(first.threadId).outcomeUnknown, false);
+  assert.equal(sent(dir, 'thread/compact/start').length, 1);
 });
 
 if (FAKE_MODE) fakeServer();

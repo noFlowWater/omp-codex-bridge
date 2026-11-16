@@ -1,161 +1,11 @@
-import { spawn } from 'node:child_process';
-import { isAbsolute, resolve } from 'node:path';
+import { isAbsolute } from 'node:path';
 import { realpath, stat } from 'node:fs/promises';
-
-const ENV_KEYS = ['HOME', 'PATH', 'LANG', 'LC_ALL', 'TERM', 'TMPDIR', 'CODEX_HOME', 'SSL_CERT_FILE', 'SSL_CERT_DIR'];
-const TERMINAL = new Set(['completed', 'failed', 'interrupted']);
-// Refusals of one thread's effective settings; the transport stays usable.
-const REFUSED_CODES = new Set(['PERMISSION_UNSAFE', 'PERMISSION_STRICTER', 'MODEL_MISMATCH']);
-const MODEL_PAGE_SIZE = 100;
-const MODEL_PAGES = 20;
-// Native userMessage items can echo attached data URLs. Bound each JSONL message, including those echoes.
-const MAX_LINE = 64 * 1024 * 1024;
-const MAX_TEXT = 1024 * 1024;
-const MAX_EVENT_TEXT = 8192;
-const LINE_TOO_LONG = 'Codex stdout JSONL line exceeded 64 MiB';
-const USAGE_KEYS = ['inputTokens', 'cachedInputTokens', 'cacheWriteInputTokens', 'outputTokens', 'reasoningOutputTokens', 'totalTokens'];
-const OPT_OUT = [
-  'item/agentMessage/delta', 'item/reasoning/textDelta', 'item/reasoning/summaryTextDelta',
-  'item/reasoning/summaryPartAdded', 'item/commandExecution/outputDelta', 'item/fileChange/outputDelta',
-  'item/fileChange/patchUpdated', 'turn/diff/updated',
-];
-
-
-function bounded(value, budget = { left: MAX_EVENT_TEXT }, depth = 0) {
-  if (typeof value === 'string') {
-    const text = value.slice(0, Math.max(0, budget.left));
-    budget.left -= text.length;
-    return text.length < value.length ? `${text}…` : text;
-  }
-  if (value === null || typeof value !== 'object') {
-    budget.left -= 8;
-    return budget.left >= 0 ? value : '[truncated]';
-  }
-  if (depth >= 6 || budget.left <= 0) return '[truncated]';
-  if (Array.isArray(value)) return value.slice(0, 50).map(entry => bounded(entry, budget, depth + 1));
-  const result = {};
-  for (const [key, entry] of Object.entries(value).slice(0, 50)) {
-    if (budget.left <= 0) break;
-    budget.left -= Math.min(key.length, 128) + 4;
-    Object.defineProperty(result, key.slice(0, 128), {
-      value: bounded(entry, budget, depth + 1), enumerable: true, configurable: true, writable: true,
-    });
-  }
-  return result;
-}
-
-function nonempty(value, name) {
-  if (typeof value !== 'string' || !value.trim() || value.includes('\0')) {
-    throw new TypeError(`${name} must be a nonempty string without NUL characters`);
-  }
-  return value;
-}
-function jsonValue(value, name) {
-  const text = JSON.stringify(value, (_key, entry) => {
-    if (entry === undefined || typeof entry === 'function' || typeof entry === 'symbol'
-      || (typeof entry === 'number' && !Number.isFinite(entry))) throw new TypeError(`${name} must contain only JSON values`);
-    return entry;
-  });
-  if (text === undefined) throw new TypeError(`${name} must be a JSON value`);
-  return JSON.parse(text);
-}
-
-function userInput(prompt, input) {
-  if (input === undefined) return [{ type: 'text', text: nonempty(prompt, 'prompt') }];
-  if (prompt !== undefined) throw new TypeError('Supply prompt or input, not both');
-  if (!Array.isArray(input) || !input.length) throw new TypeError('input must be a nonempty native UserInput array');
-  for (const entry of input) {
-    if (!entry || typeof entry !== 'object' || Array.isArray(entry)) throw new TypeError('input entries must be native UserInput objects');
-    if (entry.type === 'text') {
-      if (typeof entry.text !== 'string' || entry.text.includes('\0')) throw new TypeError('input text must be a string without NUL characters');
-      if (entry.text_elements !== undefined) {
-        if (!Array.isArray(entry.text_elements)) throw new TypeError('text_elements must be an array');
-        for (const element of entry.text_elements) {
-          const range = element?.byteRange;
-          if (!Number.isSafeInteger(range?.start) || !Number.isSafeInteger(range?.end)
-            || range.start < 0 || range.end < range.start || range.end > Buffer.byteLength(entry.text)
-            || (element.placeholder != null && typeof element.placeholder !== 'string')) {
-            throw new TypeError('text_elements require valid UTF-8 byte ranges and optional string placeholders');
-          }
-        }
-      }
-    } else if (entry.type === 'image') {
-      if ((entry.url === undefined) === (entry.fileId === undefined)) throw new TypeError('image requires exactly one url or fileId');
-      nonempty(entry.url ?? entry.fileId, 'image source');
-    } else if (entry.type === 'localImage') nonempty(entry.path, 'localImage.path');
-    else throw new TypeError(`Unsupported native input type: ${entry.type}`);
-    if (entry.detail != null && !['auto', 'low', 'high', 'original'].includes(entry.detail)) {
-      throw new TypeError('image detail must be auto, low, high or original');
-    }
-  }
-  return jsonValue(input, 'input');
-}
-
-function usageBreakdown(value) {
-  if (!value || typeof value !== 'object' || Array.isArray(value)) throw new TypeError('Invalid native token usage');
-  for (const key of USAGE_KEYS) {
-    if (key === 'cacheWriteInputTokens' && value[key] === undefined) continue;
-    if (!Number.isSafeInteger(value[key]) || value[key] < 0) throw new TypeError(`Invalid native token usage ${key}`);
-  }
-  return { ...value };
-}
-
-function aborted() {
-  return Object.assign(new Error('Codex operation aborted'), { name: 'AbortError' });
-}
-
-function checkSignal(signal) {
-  if (signal !== undefined && (!signal || typeof signal.addEventListener !== 'function'
-    || typeof signal.removeEventListener !== 'function' || typeof signal.aborted !== 'boolean')) {
-    throw new TypeError('signal must be an AbortSignal');
-  }
-  if (signal?.aborted) throw aborted();
-}
-
-
-function validateThreadOptions({ threadId, cwd, model, onThread, sandbox, developerInstructions }) {
-  if (threadId !== undefined) nonempty(threadId, 'threadId');
-  if (cwd !== undefined) nonempty(cwd, 'cwd');
-  if (model !== undefined) nonempty(model, 'model');
-  if (developerInstructions !== undefined && typeof developerInstructions !== 'string') throw new TypeError('developerInstructions must be a string');
-  if (onThread !== undefined && typeof onThread !== 'function') throw new TypeError('onThread must be a function');
-  if (sandbox !== undefined) throw new TypeError('sandbox is not configurable; every Codex thread runs workspace-write in its cwd');
-}
-
-function rpcError(payload) {
-  const error = new Error(typeof payload?.message === 'string' ? payload.message.slice(0, MAX_EVENT_TEXT) : 'Codex RPC failed');
-  error.code = payload?.code;
-  if (payload?.data !== undefined) error.data = bounded(payload.data);
-  return error;
-}
-
-// Names the thread without mutating an error object shared by coalesced callers.
-function withThread(error, threadId) {
-  if (error?.threadId === threadId) return error;
-  return Object.assign(new Error(error?.message ?? String(error), { cause: error }), {
-    code: error?.code, outcomeUnknown: error?.outcomeUnknown, threadId,
-  });
-}
-
-// Every thread requests workspace-write at cwd, networkAccess:false and approvals never. The guard
-// checks native effective settings; it does not override Codex trusted rules, MCP servers or hooks.
-// thread/start, resume and fork accept a sandbox mode; turn/start also excludes temporary roots.
-// Effective read-only is refused rather than silently accepting fewer rights than requested.
-const SANDBOX = 'workspace-write';
-function permissionError(result, cwd) {
-  const policy = result?.sandbox;
-  const roots = policy?.writableRoots;
-  const base = result?.approvalPolicy === 'never' && typeof result.cwd === 'string' && resolve(result.cwd) === cwd
-    && policy?.networkAccess === false;
-  if (base && policy.type === 'workspaceWrite' && Array.isArray(roots)
-    && roots.every(root => typeof root === 'string' && resolve(root) === cwd)) return null;
-  const stricter = base && policy.type === 'readOnly';
-  const error = new Error(stricter
-    ? 'Codex enforces a read-only sandbox for this workspace-write request; no turn started'
-    : 'Codex reported an effective cwd, approval policy or sandbox wider than requested or unclear; no turn started');
-  error.code = stricter ? 'PERMISSION_STRICTER' : 'PERMISSION_UNSAFE';
-  return error;
-}
+import { AppServerTransport } from './transport.mjs';
+import {
+  TERMINAL, REFUSED_CODES, MODEL_PAGE_SIZE, MODEL_PAGES, MAX_TEXT, MAX_EVENT_TEXT, USAGE_KEYS,
+  bounded, nonempty, jsonValue, userInput, usageBreakdown, aborted, checkSignal,
+  validateThreadOptions, withThread, SANDBOX, permissionError,
+} from './protocol.mjs';
 
 function blankState(threadId) {
   return {
@@ -168,87 +18,31 @@ function blankState(threadId) {
   };
 }
 
-export class CodexNativeClient {
+export class CodexAppServerClient {
   // onNotification(method, boundedParams) observes owned-thread notifications (item progress for
   // provider streaming); the default subscriber API stays the lightweight {threadId, turnId, status}.
-  constructor({ command = ['codex', 'app-server', '--stdio'], timeoutMs = 30000, env, onNotification, onRequest } = {}) {
+  constructor({ command, timeoutMs, env, onNotification, onRequest } = {}) {
     if (onNotification !== undefined && typeof onNotification !== 'function') throw new TypeError('onNotification must be a function');
     if (onRequest !== undefined && typeof onRequest !== 'function') throw new TypeError('onRequest must be a function');
-    if (!Array.isArray(command) || !command.length) throw new TypeError('command must be a nonempty string array');
-    command.forEach((part, index) => nonempty(part, `command[${index}]`));
-    if (!Number.isFinite(timeoutMs) || timeoutMs <= 0 || timeoutMs > 2147483647) {
-      throw new TypeError('timeoutMs must be positive and at most 2147483647');
-    }
-    if (env !== undefined && (env === null || typeof env !== 'object' || Array.isArray(env))) {
-      throw new TypeError('env must be an object');
-    }
-    this.command = [...command];
-    this.timeoutMs = timeoutMs;
-    this.env = {};
-    for (const key of ENV_KEYS) {
-      const value = env && Object.hasOwn(env, key) ? env[key] : process.env[key];
-      if (value === undefined || value === null) continue;
-      if (typeof value !== 'string' || value.includes('\0')) throw new TypeError(`env.${key} must be a string without NUL characters`);
-      this.env[key] = value;
-    }
-    this._process = null;
-    this._connectPromise = null;
-    this._closePromise = null;
-    this._closed = false;
-    this._failure = null;
-    this._nextId = 1;
-    this._pending = new Map();
     this._threads = new Map();
     this._queues = new Map();
     this._listeners = new Set();
-    this._stdout = '';
-    this._stdoutBytes = 0;
     this._onNotification = onNotification;
     this._onRequest = onRequest;
     this._serverRequests = new Map();
     this._compactions = new Map();
+    this._transport = new AppServerTransport({ command, timeoutMs, env,
+      onNotification: (method, params) => this._handleNotification(method, params),
+      onRequest: message => this._handleServerRequest(message),
+      onDisconnect: error => {
+        // Threads stay owned; explicit calls reconnect and settle them only from native history.
+        for (const state of this._threads.values()) this._detachThread(state, error.message);
+      },
+    });
   }
 
   connect() {
-    if (this._closed) return Promise.reject(new Error('Codex client is closed'));
-    // A failed transport is replaced once per call, coalesced across callers. Thread ownership and
-    // uncertain outcomes survive the replacement; nothing is resubmitted.
-    if (!this._connectPromise || this._failure) this._connectPromise = this._initialize();
-    return this._connectPromise;
-  }
-
-  async _initialize() {
-    let child;
-    try {
-      child = spawn(this.command[0], this.command.slice(1), {
-        stdio: ['pipe', 'pipe', 'pipe'], env: this.env, windowsHide: true,
-      });
-      Object.assign(this, { _process: child, _failure: null, _stdout: '', _stdoutBytes: 0 });
-      // Late events from a replaced process must never fail its successor.
-      const fail = error => { if (this._process === child) this._fail(error); };
-      child.stdout.setEncoding('utf8');
-      child.stdout.on('data', chunk => { if (this._process === child) this._consume(chunk); });
-      // Drained, never retained or echoed: stderr may contain credentials.
-      child.stderr.resume();
-      child.stdin.on('error', error => fail(new Error(`Codex stdin failed: ${error.message}`)));
-      child.stdout.on('error', error => fail(new Error(`Codex stdout failed: ${error.message}`)));
-      child.stderr.on('error', error => fail(new Error(`Codex stderr failed: ${error.message}`)));
-      child.on('error', error => fail(new Error(`Codex app-server failed: ${error.message}`)));
-      child.on('close', (code, signal) => {
-        if (this._process !== child) return;
-        if (this._stdout.trim()) this._consume('\n');
-        this._fail(new Error(`Codex app-server disconnected (code ${code}, signal ${signal ?? 'none'})`));
-      });
-      await this._rpc('initialize', {
-        clientInfo: { name: 'omp_codex_bridge', version: '1.0.0' },
-        // Final agent text arrives with item/completed; partial text is not streamed.
-        capabilities: { optOutNotificationMethods: OPT_OUT },
-      });
-      this._send({ method: 'initialized', params: {} });
-    } catch (error) {
-      if (!child || this._process === child) this._fail(error);
-      throw error;
-    }
+    return this._transport.connect();
   }
 
   // Listeners receive { threadId, turnId, status } whenever that pair changes; read snapshot() for details.
@@ -265,7 +59,7 @@ export class CodexNativeClient {
     const cursors = new Set();
     let cursor;
     for (let page = 0; page < MODEL_PAGES; page++) {
-      const result = await this._rpc('model/list', { limit: MODEL_PAGE_SIZE, ...(cursor === undefined ? {} : { cursor }) });
+      const result = await this._request('model/list', { limit: MODEL_PAGE_SIZE, ...(cursor === undefined ? {} : { cursor }) });
       if (!Array.isArray(result?.data)) throw new Error('Codex model/list returned no model list');
       for (const entry of result.data) {
         const model = entry?.model;
@@ -289,9 +83,9 @@ export class CodexNativeClient {
   snapshot(threadId) {
     if (threadId !== undefined) {
       const state = this._threads.get(threadId);
-      return state ? this._snapshot(state) : undefined;
+      return state ? this._threadSnapshot(state) : undefined;
     }
-    return [...this._threads.values()].map(state => this._snapshot(state));
+    return [...this._threads.values()].map(state => this._threadSnapshot(state));
   }
 
   // Read-only: never resumes, starts, steers or interrupts.
@@ -306,17 +100,17 @@ export class CodexNativeClient {
           await this._reconcile(state);
         } catch { /* The snapshot keeps reporting the unconfirmed outcome. */ }
       }
-      return this._snapshot(state);
+      return this._threadSnapshot(state);
     }
     await this.connect();
     // Persisted last turn of a thread this client does not own; it is neither resumed nor registered.
     const view = blankState(threadId);
-    const turn = await this._lastTurn(threadId);
-    if (turn) this._turn(view, turn);
-    return this._snapshot(view);
+    const turn = await this._readLastTurn(threadId);
+    if (turn) this._applyTurn(view, turn);
+    return this._threadSnapshot(view);
   }
 
-  _snapshot(state) {
+  _threadSnapshot(state) {
     const messages = [...state.messages.values()];
     const answers = messages.filter(message => message.phase == null || message.phase === 'partial_answer' || message.phase === 'final_answer');
     const final = messages.filter(message => message.phase === 'final_answer');
@@ -346,7 +140,7 @@ export class CodexNativeClient {
     }
   }
 
-  _state(threadId) {
+  _getThread(threadId) {
     let state = this._threads.get(threadId);
     if (!state) this._threads.set(threadId, state = blankState(threadId));
     return state;
@@ -360,7 +154,7 @@ export class CodexNativeClient {
     return task;
   }
   // Shared native metadata admission. Starting/resuming a thread never submits user input.
-  async _load({ threadId, cwd, model, developerInstructions }) {
+  async _loadThread({ threadId, cwd, model, developerInstructions }) {
     let state = threadId ? this._threads.get(threadId) : undefined;
     try {
       if (cwd !== undefined && !isAbsolute(cwd)) throw new TypeError('cwd must be an absolute existing directory');
@@ -377,9 +171,9 @@ export class CodexNativeClient {
       if (!state?.attached) {
         const created = threadId !== undefined && !state;
         // A resumed thread is owned before the request, so no early notification is lost.
-        if (threadId) state = this._state(threadId);
+        if (threadId) state = this._getThread(threadId);
         try {
-          await this._rpc(threadId ? 'thread/resume' : 'thread/start', {
+          await this._request(threadId ? 'thread/resume' : 'thread/start', {
             cwd: directory, sandbox: SANDBOX, approvalPolicy: 'never', ...(model === undefined ? {} : { model }),
             ...(developerInstructions === undefined ? {} : { developerInstructions }),
             ...(threadId ? { threadId, excludeTurns: true } : {}),
@@ -388,7 +182,7 @@ export class CodexNativeClient {
             onResult: (result, request) => {
               const id = nonempty(result?.thread?.id, 'response.thread.id');
               if (threadId && id !== threadId) throw new Error('Codex resumed an unexpected thread');
-              state = this._state(id);
+              state = this._getThread(id);
               const denied = permissionError(result, directory)
                 // An explicit model is the thread's model; Codex silently using another one gets no turn.
                 ?? (model !== undefined && typeof result.model === 'string' && result.model !== model
@@ -401,8 +195,8 @@ export class CodexNativeClient {
               }
               Object.assign(state, { cwd: directory, model: model ?? result.model ?? null, developerInstructions, attached: true });
               if (!threadId) state.usageBaseline = Object.fromEntries(USAGE_KEYS.map(key => [key, 0]));
-              this._known(state, request.id);
-              this._threadState(state, result.thread);
+              this._confirmOutcome(state, request.id);
+              this._applyThread(state, result.thread);
               // Nobody awaits a timed-out start; mark the orphan so status listings identify it.
               if (request.timedOut && !threadId) state.error = 'Codex thread/start response arrived after its timeout; no turn was started';
               this._publish(state);
@@ -429,10 +223,10 @@ export class CodexNativeClient {
     if (Object.keys(unsupported).length) throw new TypeError('resume accepts thread metadata only');
     validateThreadOptions({ threadId, cwd, model, developerInstructions, onThread, sandbox });
     return this._serialize(threadId, async () => {
-      const state = await this._load({ threadId, cwd, model, developerInstructions });
+      const state = await this._loadThread({ threadId, cwd, model, developerInstructions });
       try {
         if (onThread) await onThread(state.threadId);
-        return this._snapshot(state);
+        return this._threadSnapshot(state);
       } catch (error) {
         throw withThread(error, state.threadId);
       }
@@ -455,7 +249,7 @@ export class CodexNativeClient {
       let state = threadId ? this._threads.get(threadId) : undefined;
       if (threadId && this._compactions.has(threadId)) throw new Error('Native compaction is still in progress; no input sent');
       try {
-        state = await this._load({ threadId, cwd, model, developerInstructions });
+        state = await this._loadThread({ threadId, cwd, model, developerInstructions });
         const directory = state.cwd;
         if (onThread) await onThread(state.threadId);
         if (state.status === 'inProgress' && (effort !== undefined || outputSchema !== undefined)) {
@@ -463,13 +257,13 @@ export class CodexNativeClient {
         }
         if (state.status === 'inProgress' && !state.turnId) await this._reconcile(state);
         if (state.status === 'inProgress') {
-          await this._steer(state, input);
+          await this._steerTurn(state, input);
         } else {
           this._resetTurn(state);
           state.status = 'inProgress';
           this._publish(state);
           try {
-            await this._rpc('turn/start', {
+            await this._request('turn/start', {
               threadId: state.threadId, input, cwd: directory, approvalPolicy: 'never',
               sandboxPolicy: {
                 type: 'workspaceWrite', writableRoots: [directory], networkAccess: false,
@@ -482,8 +276,8 @@ export class CodexNativeClient {
               state, mutation: true,
               onResult: (result, request) => {
                 if (!result?.turn?.id) throw new Error('Codex turn/start response has no turn ID');
-                this._turn(state, result.turn);
-                this._known(state, request.id);
+                this._applyTurn(state, result.turn);
+                this._confirmOutcome(state, request.id);
                 this._publish(state);
               },
             });
@@ -497,7 +291,7 @@ export class CodexNativeClient {
             throw error;
           }
         }
-        return this._snapshot(state);
+        return this._threadSnapshot(state);
       } catch (error) {
         throw state ? withThread(error, state.threadId) : error;
       }
@@ -524,7 +318,7 @@ export class CodexNativeClient {
       await this.connect();
       let forked;
       try {
-        await this._rpc('thread/fork', {
+        await this._request('thread/fork', {
           threadId, ...(lastTurnId === undefined ? {} : { lastTurnId }),
           cwd: directory, sandbox: SANDBOX, approvalPolicy: 'never', excludeTurns: true,
           ...(model === undefined ? {} : { model }),
@@ -534,7 +328,7 @@ export class CodexNativeClient {
           onResult: (result, request) => {
             const id = nonempty(result?.thread?.id, 'response.thread.id');
             if (id === threadId || this._threads.has(id)) throw new Error('Codex fork returned an existing thread ID');
-            forked = this._state(id);
+            forked = this._getThread(id);
             const denied = permissionError(result, directory)
               ?? (model !== undefined && typeof result.model === 'string' && result.model !== model
                 ? Object.assign(new Error('Codex fork reported a different model; no turn started'), { code: 'MODEL_MISMATCH' }) : null);
@@ -543,13 +337,13 @@ export class CodexNativeClient {
               throw withThread(denied, id);
             }
             Object.assign(forked, { cwd: directory, model: model ?? result.model ?? null, developerInstructions, attached: true });
-            this._threadState(forked, result.thread);
+            this._applyThread(forked, result.thread);
             if (request.timedOut) forked.error = 'Codex thread/fork response arrived after its timeout; no turn was started';
             this._publish(forked);
           },
         });
         if (onThread) await onThread(forked.threadId);
-        return this._snapshot(forked);
+        return this._threadSnapshot(forked);
       } catch (error) {
         throw forked ? withThread(error, forked.threadId) : error;
       }
@@ -578,8 +372,8 @@ export class CodexNativeClient {
       this._resetTurn(state);
       state.status = 'inProgress';
       this._publish(state);
-      operation.admission = this._rpc('thread/compact/start', { threadId }, { state, mutation: true,
-        onResult: (_result, request) => this._known(state, request.id) }).catch(error => {
+      operation.admission = this._request('thread/compact/start', { threadId }, { state, mutation: true,
+        onResult: (_result, request) => this._confirmOutcome(state, request.id) }).catch(error => {
         if (this._compactions.get(threadId) === operation) this._compactions.delete(threadId);
         if (!error.outcomeUnknown && !state.turnId) {
           state.status = 'failed';
@@ -619,21 +413,27 @@ export class CodexNativeClient {
     const task = this._serialize(threadId, async () => {
       const state = this._threads.get(threadId);
       if (!state) throw new Error(`Unknown local thread: ${threadId}`);
-      await this.connect();
-      if (state.outcomeUnknown || (state.status === 'inProgress' && !state.turnId)) await this._reconcile(state);
-      if (requested?.turnId && state.turnId !== requested.turnId) return this._snapshot(state);
-      if (state.status !== 'inProgress') return this._snapshot(state);
+      try {
+        await this.connect();
+        if (state.outcomeUnknown || (state.status === 'inProgress' && !state.turnId)) await this._reconcile(state);
+      } catch (error) {
+        // No interrupt was sent. Its coalescing slot must not block a later confirmed active turn.
+        if (state.interruptRequested === requested) state.interruptRequested = null;
+        throw error;
+      }
+      if (requested?.turnId && state.turnId !== requested.turnId) return this._threadSnapshot(state);
+      if (state.status !== 'inProgress') return this._threadSnapshot(state);
       const request = state.interruptRequested ??= { turnId: state.turnId };
       try {
-        await this._rpc('turn/interrupt', { threadId, turnId: state.turnId }, {
-          state, mutation: true, onResult: (_result, pending) => this._known(state, pending.id),
+        await this._request('turn/interrupt', { threadId, turnId: state.turnId }, {
+          state, mutation: true, onResult: (_result, pending) => this._confirmOutcome(state, pending.id),
         });
       } catch (error) {
         if (error.outcomeUnknown !== true && state.interruptRequested === request) state.interruptRequested = null;
         throw error;
       }
       // Admission is not completion; only turn/completed confirms interruption.
-      return this._snapshot(state);
+      return this._threadSnapshot(state);
     });
     if (requested) requested.promise = task;
     return task;
@@ -650,32 +450,32 @@ export class CodexNativeClient {
       if (state.outcomeUnknown || !state.attached || state.status !== 'inProgress' || state.turnId !== turnId) {
         throw new Error(`Turn ${turnId} is not the active turn of thread ${threadId}; not steered`);
       }
-      await this._steer(state, input);
-      return this._snapshot(state);
+      await this._steerTurn(state, input);
+      return this._threadSnapshot(state);
     });
   }
 
-  _steer(state, input) {
+  _steerTurn(state, input) {
     if (state.interruptRequested) return Promise.reject(new Error('Native turn interruption is pending; no input sent'));
     const expectedTurnId = state.turnId;
-    return this._rpc('turn/steer', { threadId: state.threadId, expectedTurnId, input }, {
+    return this._request('turn/steer', { threadId: state.threadId, expectedTurnId, input }, {
       state, mutation: true,
       onResult: (result, request) => {
         if (result?.turnId !== expectedTurnId) throw new Error('Codex steered an unexpected turn');
-        this._known(state, request.id);
+        this._confirmOutcome(state, request.id);
       },
     });
   }
 
-  _known(state, requestId) {
+  _confirmOutcome(state, requestId) {
     if (requestId !== undefined && state.uncertain && state.uncertain.id !== requestId) return;
     state.outcomeUnknown = false;
     state.uncertain = null;
     if (!TERMINAL.has(state.status)) state.error = null;
   }
 
-  async _lastTurn(threadId) {
-    const result = await this._rpc('thread/turns/list', { threadId, limit: 1, sortDirection: 'desc', itemsView: 'notLoaded' });
+  async _readLastTurn(threadId) {
+    const result = await this._request('thread/turns/list', { threadId, limit: 1, sortDirection: 'desc', itemsView: 'notLoaded' });
     if (!Array.isArray(result?.data)) throw new Error('Codex thread/turns/list returned no turn list');
     const turn = result.data[0];
     if (!turn) return undefined;
@@ -685,7 +485,7 @@ export class CodexNativeClient {
     let cursor;
     for (let page = 0; page < 1000; page++) {
       // One item per page prevents unrelated command output from making a whole-turn JSONL payload.
-      const result = await this._rpc('thread/items/list', {
+      const result = await this._request('thread/items/list', {
         threadId, turnId: turn.id, limit: 1, sortDirection: 'asc', ...(cursor === undefined ? {} : { cursor }),
       });
       if (!Array.isArray(result?.data)) throw new Error('Codex thread/items/list returned no item list');
@@ -702,7 +502,15 @@ export class CodexNativeClient {
   }
 
   async _reconcile(state) {
-    const turn = await this._lastTurn(state.threadId);
+    let turn;
+    try {
+      turn = await this._readLastTurn(state.threadId);
+    } catch (error) {
+      if (!state.outcomeUnknown) throw error;
+      throw Object.assign(new Error(error.message, { cause: error }), {
+        code: error.code, outcomeUnknown: true, threadId: state.threadId,
+      });
+    }
     if (!state.outcomeUnknown && !(state.status === 'inProgress' && !state.turnId)) return;
     // Only a native turn this client has not retired settles the outcome. A read cannot prove a timed-out
     // resume applied its permission overrides, and an in-progress turn proves nothing about a timed-out
@@ -710,8 +518,8 @@ export class CodexNativeClient {
     const unproven = turn?.status === 'inProgress' && (state.status === 'disconnected'
       || (turn.id === state.turnId && ['turn/steer', 'turn/interrupt'].includes(state.uncertain?.method)));
     if (turn && !state.retired.has(turn.id) && state.uncertain?.method !== 'thread/resume' && !unproven) {
-      this._turn(state, turn);
-      this._known(state);
+      this._applyTurn(state, turn);
+      this._confirmOutcome(state);
       this._publish(state);
       return;
     }
@@ -721,10 +529,10 @@ export class CodexNativeClient {
     throw error;
   }
 
-  _threadState(state, thread) {
+  _applyThread(state, thread) {
     const turns = Array.isArray(thread.turns) ? thread.turns : [];
     const turn = turns.findLast(entry => entry.status === 'inProgress') ?? turns.at(-1);
-    if (turn) this._turn(state, turn);
+    if (turn) this._applyTurn(state, turn);
     else if (thread.status?.type === 'active' && !TERMINAL.has(state.status)) state.status = 'inProgress';
     else if (thread.status?.type === 'systemError') {
       state.status = 'failed';
@@ -755,7 +563,7 @@ export class CodexNativeClient {
     state.uncertain = null;
   }
 
-  _turn(state, turn) {
+  _applyTurn(state, turn) {
     const id = nonempty(turn.id, 'turn.id');
     if (state.retired.has(id)) return;
     if (state.turnId !== id) this._resetTurn(state, id);
@@ -763,17 +571,17 @@ export class CodexNativeClient {
     if (!(TERMINAL.has(state.status) && status === 'inProgress')) {
       state.status = TERMINAL.has(status) ? status : 'inProgress';
     }
-    for (const item of turn.items ?? []) if (item.type === 'agentMessage') this._message(state, item.id, item.text ?? '', item.phase);
+    for (const item of turn.items ?? []) if (item.type === 'agentMessage') this._recordMessage(state, item.id, item.text ?? '', item.phase);
     if (turn.error) state.error = typeof turn.error.message === 'string' ? turn.error.message.slice(0, MAX_EVENT_TEXT) : JSON.stringify(bounded(turn.error));
     else if (TERMINAL.has(status)) state.error = null;
     if (TERMINAL.has(state.status)) {
       state.interruptRequested = null;
-      this._known(state);
+      this._confirmOutcome(state);
       this._abortRequests(state.threadId, state.turnId);
     }
   }
 
-  _message(state, id, text, phase) {
+  _recordMessage(state, id, text, phase) {
     if (typeof text !== 'string') return;
     const key = typeof id === 'string' ? id : 'agent-message';
     const old = state.messages.get(key);
@@ -785,23 +593,23 @@ export class CodexNativeClient {
   }
 
   // The server no longer holds the thread. An active turn stays unknown until native history shows its end.
-  _detach(state, reason) {
+  _detachThread(state, reason) {
     this._abortRequests(state.threadId);
     const compaction = this._compactions.get(state.threadId);
     if (compaction) {
       this._compactions.delete(state.threadId);
-      compaction.reject(new Error(reason));
+      compaction.reject(Object.assign(new Error(reason), { outcomeUnknown: true, threadId: state.threadId }));
     }
     state.attached = false;
     // Permission overrides of a timed-out resume cannot outlive the server that held them.
-    if (state.uncertain?.method === 'thread/resume') this._known(state);
+    if (state.uncertain?.method === 'thread/resume') this._confirmOutcome(state);
     if (state.status === 'inProgress' || state.outcomeUnknown) {
       Object.assign(state, { status: 'disconnected', outcomeUnknown: true, uncertain: null, error: reason });
     }
     this._publish(state);
   }
 
-  _notification(method, params) {
+  _handleNotification(method, params) {
     // Only threads this client started or resumed; a notification never confers ownership.
     const state = this._threads.get(params?.threadId ?? params?.thread?.id);
     if (!state) return;
@@ -829,20 +637,20 @@ export class CodexNativeClient {
       state.turnUsage = baseline && USAGE_KEYS.every(key => (total[key] ?? 0) >= (baseline[key] ?? 0))
         ? Object.fromEntries(USAGE_KEYS.map(key => [key, (total[key] ?? 0) - (baseline[key] ?? 0)])) : null;
     }
-    if (method === 'thread/started' && params.thread) this._threadState(state, params.thread);
+    if (method === 'thread/started' && params.thread) this._applyThread(state, params.thread);
     else if (method === 'turn/started' || method === 'turn/completed') {
-      if (params.turn?.id) this._turn(state, params.turn);
+      if (params.turn?.id) this._applyTurn(state, params.turn);
     } else if (method === 'item/completed' || method === 'item/started') {
       if (turnId && state.turnId !== turnId) {
         this._resetTurn(state, turnId);
         state.status = 'inProgress';
       }
-      if (params.item?.type === 'agentMessage') this._message(state, params.item.id, params.item.text ?? '', params.item.phase);
+      if (params.item?.type === 'agentMessage') this._recordMessage(state, params.item.id, params.item.text ?? '', params.item.phase);
       if (method === 'item/completed' && params.item?.type === 'agentMessage'
-        && params.item.delivery === 'async') this._asyncQuestions(state, params.item, turnId);
+        && params.item.delivery === 'async') this._askAsyncQuestions(state, params.item, turnId);
     } else if (method === 'error' && params.error) {
       state.error = String(params.error.message ?? 'Codex reported an error').slice(0, MAX_EVENT_TEXT);
-    } else if (method === 'thread/closed') this._detach(state, 'Codex thread closed');
+    } else if (method === 'thread/closed') this._detachThread(state, 'Codex thread closed');
     const compaction = this._compactions.get(state.threadId);
     if (compaction?.cancelled && !compaction.interruptSent && state.status === 'inProgress'
       && state.turnId && state.turnId !== compaction.previousTurnId) {
@@ -851,7 +659,7 @@ export class CodexNativeClient {
     }
     if (compaction && state.turnId !== compaction.previousTurnId && TERMINAL.has(state.status)) {
       this._compactions.delete(state.threadId);
-      compaction.resolve(this._snapshot(state));
+      compaction.resolve(this._threadSnapshot(state));
     }
     this._publish(state);
     if (this._onNotification) {
@@ -859,30 +667,6 @@ export class CodexNativeClient {
     }
   }
 
-  _consume(chunk) {
-    if (this._failure) return;
-    const end = chunk.lastIndexOf('\n');
-    if (end === -1) {
-      // Only new bytes are measured; a partial line is never re-measured.
-      this._stdoutBytes += Buffer.byteLength(chunk);
-      if (this._stdoutBytes > MAX_LINE) this._fail(new Error(LINE_TOO_LONG));
-      else this._stdout += chunk;
-      return;
-    }
-    const lines = (this._stdout + chunk.slice(0, end)).split('\n');
-    this._stdout = chunk.slice(end + 1);
-    this._stdoutBytes = Buffer.byteLength(this._stdout);
-    for (const line of lines) {
-      if (Buffer.byteLength(line) > MAX_LINE) { this._fail(new Error(LINE_TOO_LONG)); return; }
-      if (!line.trim()) continue;
-      let message;
-      try { message = JSON.parse(line); }
-      catch { this._fail(new Error('Codex emitted invalid JSONL')); return; }
-      this._receive(message);
-      if (this._failure) return;
-    }
-    if (this._stdoutBytes > MAX_LINE) this._fail(new Error(LINE_TOO_LONG));
-  }
 
   _abortRequest(id, threadId) {
     const request = this._serverRequests.get(id);
@@ -897,7 +681,7 @@ export class CodexNativeClient {
     }
   }
 
-  _asyncQuestions(state, item, turnId) {
+  _askAsyncQuestions(state, item, turnId) {
     if (state.status !== 'inProgress' || state.interruptRequested || state.turnId !== turnId || state.asyncQuestions.has(item.id)) return;
     if (!Array.isArray(item.questions) || !item.questions.length) return;
     nonempty(item.id, 'async question item.id');
@@ -913,7 +697,7 @@ export class CodexNativeClient {
       };
     });
     state.asyncQuestions.add(item.id);
-    this._serverRequest({
+    this._handleServerRequest({
       id: `async:${state.threadId}:${turnId}:${item.id}`, method: 'item/tool/requestUserInput',
       params: { threadId: state.threadId, turnId, itemId: item.id, isBlocking: false, delivery: 'async', questions },
     }, ({ result, error }) => {
@@ -935,11 +719,11 @@ export class CodexNativeClient {
     });
   }
 
-  _serverRequest({ id, method, params }, respond) {
+  _handleServerRequest({ id, method, params }, respond) {
     const reply = payload => {
       if (respond) { respond(payload); return; }
-      try { this._send({ id, ...payload }); }
-      catch (error) { this._fail(error); }
+      try { this._transport.send({ id, ...payload }); }
+      catch (error) { this._transport.fail(error); }
     };
     if (method === 'item/commandExecution/requestApproval' || method === 'item/fileChange/requestApproval') {
       reply({ result: { decision: 'decline' } });
@@ -1003,129 +787,29 @@ export class CodexNativeClient {
     });
   }
 
-  _receive(message) {
-    if (!message || typeof message !== 'object' || Array.isArray(message)) {
-      this._fail(new Error('Codex emitted an invalid RPC message'));
-      return;
-    }
-    if (typeof message.method === 'string') {
-      if (Object.hasOwn(message, 'id')) {
-        this._serverRequest(message);
-      } else {
-        try { this._notification(message.method, message.params); }
-        catch { this._fail(new Error('Codex emitted an invalid notification')); }
-      }
-      return;
-    }
-    const pending = this._pending.get(message.id);
-    if (!pending) return;
-    this._pending.delete(message.id);
-    clearTimeout(pending.timer);
-    const { state } = pending;
-    if (Object.hasOwn(message, 'error')) {
-      const error = rpcError(message.error);
-      if (state && (!pending.timedOut || state.uncertain?.id === pending.id)) {
-        this._known(state, pending.id);
+  _request(method, params, { state, mutation = false, onResult } = {}) {
+    const interruption = method === 'turn/interrupt' ? state?.interruptRequested : null;
+    return this._transport.request(method, params, { mutation, onResult, threadId: state?.threadId,
+      onError: (error, pending) => {
+        if (!state || (pending.timedOut && state.uncertain?.id !== pending.id)) return;
+        this._confirmOutcome(state, pending.id);
+        if (interruption && state.interruptRequested === interruption) state.interruptRequested = null;
         // A late steer or interrupt rejection must not overwrite a finished turn's result.
         if (!TERMINAL.has(state.status)) state.error = error.message;
-        if (pending.timedOut && pending.method === 'turn/start' && !state.turnId) state.status = 'failed';
+        if (pending.timedOut && method === 'turn/start' && !state.turnId) state.status = 'failed';
         this._publish(state);
-      }
-      pending.reject(error);
-      return;
-    }
-    try {
-      if (!Object.hasOwn(message, 'result')) throw new Error('Codex RPC response has neither result nor error');
-      pending.onResult?.(message.result, pending);
-      pending.resolve(message.result);
-    } catch (error) {
-      pending.reject(error);
-      // A permission or model mismatch refuses one thread; the transport stays usable.
-      if (!REFUSED_CODES.has(error.code)) this._fail(error);
-    }
-  }
-
-  _send(message) {
-    const child = this._process;
-    if (this._closed || this._failure || !child?.stdin.writable) throw this._failure ?? new Error('Codex transport is not writable');
-    child.stdin.write(`${JSON.stringify(message)}\n`, error => {
-      if (error && this._process === child) this._fail(new Error(`Codex write failed: ${error.message}`));
+      },
+      onTimeout: (error, pending) => {
+        if (!state || !mutation) return;
+        state.outcomeUnknown = true;
+        state.uncertain = { id: pending.id, method };
+        if (!TERMINAL.has(state.status)) state.error = error.message;
+      },
     });
   }
 
-  _rpc(method, params, { state, mutation = false, onResult } = {}) {
-    if (this._pending.size >= 128) return Promise.reject(new Error('Too many unresolved Codex RPC requests'));
-    if (this._closed || this._failure) return Promise.reject(this._failure ?? new Error('Codex client is closed'));
-    const id = this._nextId++;
-    return new Promise((resolveResult, reject) => {
-      const pending = { id, method, state, mutation, onResult, resolve: resolveResult, reject, timer: null, timedOut: false };
-      pending.timer = setTimeout(() => {
-        pending.timedOut = true;
-        pending.timer = null;
-        const error = new Error(`Codex ${method} timed out${mutation ? '; outcome unknown; no mutation retried' : ''}`);
-        error.code = 'RPC_TIMEOUT';
-        error.outcomeUnknown = mutation;
-        if (state) {
-          error.threadId = state.threadId;
-          if (mutation) {
-            state.outcomeUnknown = true;
-            state.uncertain = { id, method };
-            if (!TERMINAL.has(state.status)) state.error = error.message;
-          }
-        }
-        // Retain mutation response handlers: a late reply can reveal the admitted turn or thread.
-        if (!mutation) this._pending.delete(id);
-        reject(error);
-      }, this.timeoutMs);
-      this._pending.set(id, pending);
-      try { this._send({ id, method, params }); }
-      catch (error) {
-        clearTimeout(pending.timer);
-        this._pending.delete(id);
-        reject(error);
-      }
-    });
-  }
-
-  _fail(error) {
-    if (this._failure) return;
-    this._failure = error instanceof Error ? error : new Error(String(error));
-    this._stdout = '';
-    for (const pending of this._pending.values()) {
-      clearTimeout(pending.timer);
-      const failure = new Error(`${this._failure.message}${pending.mutation ? '; outcome unknown; no mutation retried' : ''}`);
-      failure.code = 'DISCONNECTED';
-      failure.outcomeUnknown = pending.mutation;
-      if (pending.state) failure.threadId = pending.state.threadId;
-      pending.reject(failure);
-    }
-    this._pending.clear();
-    // Threads stay owned; the next explicit call reconnects and settles them only from native history.
-    for (const state of this._threads.values()) this._detach(state, this._failure.message);
-    const child = this._process;
-    if (child && child.exitCode === null && child.signalCode === null) child.kill('SIGTERM');
-  }
-
-  close() {
-    if (this._closePromise) return this._closePromise;
-    this._closed = true;
-    const child = this._process;
-    const stopped = child && child.exitCode === null && child.signalCode === null
-      ? new Promise(resolveClose => child.once('close', resolveClose)) : Promise.resolve();
-    this._fail(new Error('Codex client closed'));
-    this._closePromise = (async () => {
-      if (child) {
-        child.stdin.destroy();
-        child.stdout.destroy();
-        child.stderr.destroy();
-        let timer;
-        await Promise.race([stopped, new Promise(resolveTimeout => { timer = setTimeout(resolveTimeout, 1000); })]);
-        clearTimeout(timer);
-        if (child.exitCode === null && child.signalCode === null) child.kill('SIGKILL');
-        await stopped;
-      }
-      this._listeners.clear();
-    })();
-    return this._closePromise;
+  async close() {
+    await this._transport.close();
+    this._listeners.clear();
   }
 }

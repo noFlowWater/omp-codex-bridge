@@ -1,0 +1,38 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  compatibility:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7
+        with:
+          node-version: "22"
+      - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6
+        with:
+          bun-version: "1.4.2"
+      - name: Install pinned OMP
+        shell: bash
+        run: |
+          mkdir -p "$RUNNER_TEMP/bin"
+          curl --fail --location --silent --show-error \
+            https://github.com/can1357/oh-my-pi/releases/download/v18.20.3/omp-linux-x64 \
+            --output "$RUNNER_TEMP/bin/omp"
+          echo "f34ec9b0f0c368f1937701e2fe111b3c29a7cf53314a642448b3c6cf2925d85a  $RUNNER_TEMP/bin/omp" | sha256sum --check
+          chmod 755 "$RUNNER_TEMP/bin/omp"
+          echo "$RUNNER_TEMP/bin" >> "$GITHUB_PATH"
+      - run: bun install --frozen-lockfile
+      - name: Protocol and provider unit tests
+        run: bun run test
+      - name: Isolated native package and Agent Hub checks
+        run: bun run test:hub

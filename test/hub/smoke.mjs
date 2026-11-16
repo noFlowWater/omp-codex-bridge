@@ -1,11 +1,11 @@
 // TEST-ONLY real-OMP smoke for the codex-bridge task agent: no model inference, no real Codex.
-// `bun hub-smoke.mjs <mode>`: TUI steering/revival, RPC questions/cancellation, rich output and lifecycle.
+// `bun test/hub/smoke.mjs <mode>`: TUI steering/revival, RPC questions/cancellation, rich output and lifecycle.
 // test-only orchestrator provider makes the parent emit one real `task` call spawning `codex-bridge`;
 // the child runs the production provider against the fake app-server. Assertions read the fake
 // server's protocol trace (what Codex would have received) plus OMP's own TUI paint (OMP_TUI_DEBUG
 // socket) or RPC responses. Painted frames are printed for review; their wording is not asserted
 // beyond the agent id. Exit 0 = all assertions held. OMP runs with HOME/XDG directories inside the
-// fixture directory (see hub-fixture.sh), which is removed on success and kept (path printed) on failure.
+// fixture directory (see fixture.sh), which is removed on success and kept (path printed) on failure.
 import assert from "node:assert/strict";
 import { existsSync, mkdtempSync, readdirSync, readFileSync, realpathSync, rmSync } from "node:fs";
 import { createConnection } from "node:net";
@@ -15,7 +15,7 @@ import { createInterface } from "node:readline";
 
 const mode = process.argv[2] ?? "tui-steer";
 const QUESTION_MODES = ["rpc-question", "rpc-question-ask", "rpc-question-cancel", "rpc-question-headless", "rpc-elicitation", "rpc-async-question"];
-if (!["tui-steer", "tui-followup", "tui-kill", "tui-revive", "tui-question", "tui-clear", "rpc", "rpc-queued", "rpc-model", "rpc-removed-sandbox", "rpc-rich", "rpc-direct-rich", "rpc-lifecycle", ...QUESTION_MODES].includes(mode)) throw new Error(`unknown mode ${mode}`);
+if (!["tui-steer", "tui-followup", "tui-kill", "tui-revive", "tui-question", "tui-clear", "rpc", "rpc-queued", "rpc-model", "rpc-removed-sandbox", "rpc-rich", "rpc-direct-rich", "rpc-lifecycle", "rpc-branches", ...QUESTION_MODES].includes(mode)) throw new Error(`unknown mode ${mode}`);
 const AGENT = "codex-bridge";
 // rpc-model: the task item picks one concrete native model with OMP's per-call `model` selector. The fake
 // native model/list serves the real slug list in pages of 3; the grant comes from the production agent
@@ -24,7 +24,7 @@ const NATIVE_MODEL = mode === "rpc-model" ? "gpt-6-astra" : undefined;
 const SELECTOR = NATIVE_MODEL && `codex-bridge/${NATIVE_MODEL}`;
 const NATIVE_MODELS = ["gpt-6.1-sol", "gpt-6-astra", "gpt-6.1-terra", "gpt-6-sol", "gpt-6-luna", "gpt-5.6-sol", "gpt-5.6-terra", "gpt-5.6-luna"];
 const FIX = mkdtempSync(join(tmpdir(), "codex-hub-smoke-"));
-const SCRIPT = join(import.meta.dir, "hub-fixture.sh");
+const SCRIPT = join(import.meta.dir, "fixture.sh");
 const CHILD = "CodexChild";
 const STEER = "fixture steer: also list hidden files";
 // Short unique marker: the follow-up is typed into the idle focused child after its first native turn ended.
@@ -320,7 +320,7 @@ async function tui() {
 }
 
 async function rpc() {
-  const needsUI = mode === "rpc-lifecycle" || QUESTION_MODES.includes(mode) && mode !== "rpc-question-headless";
+  const needsUI = ["rpc-lifecycle", "rpc-branches"].includes(mode) || QUESTION_MODES.includes(mode) && mode !== "rpc-question-headless";
   const proc = Bun.spawn([SCRIPT, "--mode", "rpc", ...(needsUI ? [] : ["--no-ui"])], {
     env: {
       ...process.env, CODEX_HUB_FIXTURE_DIR: FIX, CODEX_HUB_FIXTURE_CONTEXT: CONTEXT,
@@ -333,6 +333,7 @@ async function rpc() {
       ...(mode === "rpc-rich" ? { CODEX_HUB_FIXTURE_OPTIONS: '{"turns":["rich-output"]}', CODEX_HUB_FIXTURE_STRUCTURED: "true", CODEX_HUB_FIXTURE_SCHEMA: JSON.stringify(OUTPUT_SCHEMA), CODEX_HUB_FIXTURE_ENABLE_EFFORT: "true", CODEX_HUB_FIXTURE_EFFORT: "hi" } : {}),
       ...(mode === "rpc-direct-rich" ? { CODEX_HUB_FIXTURE_OPTIONS: '{"turns":["rich-output"]}', CODEX_HUB_FIXTURE_DIRECT_JSON: JSON.stringify(DIRECT_RICH) } : {}),
       ...(mode === "rpc-lifecycle" ? { CODEX_HUB_FIXTURE_OPTIONS: '{"turns":["finish-later","rich-output","finish-later","finish-later","finish-later"]}', CODEX_HUB_FIXTURE_KEEP_RECENT_TOKENS: "1" } : {}),
+      ...(mode === "rpc-branches" ? { CODEX_HUB_FIXTURE_OPTIONS: JSON.stringify({ turns: Array(5).fill("finish-later") }) } : {}),
     },
     stdin: "pipe", stdout: "pipe", stderr: "inherit",
   });
@@ -388,7 +389,7 @@ async function rpc() {
       proc.stdin.flush();
     };
     const idle = async () => (await call({ type: "get_state" })).data?.isStreaming === false;
-    if (mode === "rpc-lifecycle") {
+    if (mode === "rpc-lifecycle" || mode === "rpc-branches") {
       await until("discovered native image and reasoning capabilities", async () => {
         const models = (await call({ type: "get_available_models" }, 30000)).data?.models ?? [];
         return models.find(model => model.provider === "codex-bridge" && model.id === "default" && model.input?.includes("image") && model.reasoning);
@@ -404,6 +405,68 @@ async function rpc() {
         const result = await call({ type: "get_entries" });
         return result.data.entries.filter(entry => entry.type === "message" && entry.message?.role === "assistant" && entry.message.responseId?.startsWith("codex-bridge:"));
       };
+      if (mode === "rpc-branches") {
+        const baseline = "fixture branch source baseline 6af1";
+        const future = "fixture branch source future 982b";
+        const first = (await promptNative(baseline, 1)).at(-1);
+        const second = (await promptNative(future, 2)).at(-1);
+        assert.ok(first?.id && second?.id, "real native answers expose journal entry anchors");
+        const sourceState = (await call({ type: "get_state" })).data;
+        assert.ok(sourceState.sessionFile && sourceState.sessionId, "RPC exposes the actual source session identity");
+        const sourceEntries = (await call({ type: "get_entries" })).data.entries;
+        const futureEntry = sourceEntries.find(entry => entry.type === "message" && entry.message?.role === "user" && JSON.stringify(entry.message).includes(future));
+        assert.ok(futureEntry?.id);
+        const originalThreadId = sent("turn/start")[0].threadId;
+        const nativeStore = () => JSON.parse(readFileSync(join(FIX, "store.json"), "utf8"));
+        const originalThread = nativeStore().threads[originalThreadId];
+        const branches = [
+          { command: { type: "fork", entryId: first.id }, anchor: first, discardsFuture: true },
+          { command: { type: "branch", entryId: futureEntry.id }, anchor: first, discardsFuture: true },
+          { command: { type: "fork" }, anchor: second, discardsFuture: false },
+        ];
+        const threadIds = new Set([originalThreadId]);
+        for (let index = 0; index < branches.length; index++) {
+          if (index) {
+            const resumed = await call({ type: "switch_session", sessionPath: sourceState.sessionFile });
+            assert.equal(resumed.success, true, JSON.stringify(resumed));
+            assert.equal(resumed.data?.cancelled, false);
+            assert.equal((await call({ type: "get_state" })).data.sessionId, sourceState.sessionId);
+          }
+          const { command, anchor, discardsFuture } = branches[index];
+          const before = sent("turn/start").length;
+          const changed = await call(command, 30000);
+          assert.equal(changed.success, true, JSON.stringify({
+            response: changed,
+            notifications: frames.filter(frame => frame.type === "extension_ui_request" && frame.method === "notify").slice(-3),
+          }));
+          assert.equal(changed.data?.cancelled, false);
+          assert.notEqual((await call({ type: "get_state" })).data.sessionId, sourceState.sessionId, "real OMP transition creates a new journal");
+          assert.equal(sent("thread/fork").length, index, "transition defers native fork until new input");
+          assert.equal(sent("turn/start").length, before, "transition never replays transcript input");
+          const prompt = `fixture branch fresh input ${index} 34e9`;
+          const answer = (await promptNative(prompt, index + 3)).at(-1);
+          assert.ok(answer?.message.responseId);
+          const fork = sent("thread/fork").at(-1);
+          assert.equal(sent("thread/fork").length, index + 1, "one native fork per actual OMP transition");
+          assert.equal(fork.threadId, originalThreadId);
+          assert.equal(fork.lastTurnId, anchor.message.responseId.split(":").at(-1));
+          const turn = sent("turn/start").at(-1);
+          assert.ok(!threadIds.has(turn.threadId), "each branch gets its own native thread");
+          threadIds.add(turn.threadId);
+          const input = JSON.stringify(turn.input);
+          assert.equal(input.split(prompt).length - 1, 1);
+          assert.ok(!input.includes(baseline) && !input.includes(future), "no earlier prompt is replayed");
+          assert.equal(sent("thread/start").length, 1, "branches fork native history instead of starting empty replacement threads");
+          assert.equal(sent("turn/steer").length, 0);
+          assert.deepEqual(nativeStore().threads[originalThreadId], originalThread, "source native history remains unchanged");
+          if (discardsFuture) {
+            assert.ok(!nativeStore().threads[turn.threadId].turns.some(item => item.id === originalThread.turns[1].id), "selected checkpoint excludes the discarded future");
+          }
+        }
+        assert.equal(sent("turn/start").length, 5, "only two source inputs and three fresh branch inputs run");
+        assert.equal(threadIds.size, 4);
+        return;
+      }
       // Keep a short genuine baseline before A, so OMP has older local history to summarize
       // after /tree returns to A even though native hidden context is not in its token estimate.
       await promptNative("fixture lifecycle baseline", 1);
@@ -593,7 +656,7 @@ async function rpc() {
     const child = await until("registered child", async () =>
       (await call({ type: "get_subagents" })).data?.subagents?.find((agent) => agent.id === CHILD || agent.agent === AGENT));
     console.log("subagent:", JSON.stringify({ id: child.id, agent: child.agent, agentSource: child.agentSource, status: child.status }));
-    // Only user-level (or bundled) agent frontmatter grants a per-call model; the fixture installs it there.
+    // Native package install discovers agents/ as user scope and preserves its exact per-call model grants.
     assert.equal(child.agentSource, "user");
     assert.equal(child.agent, AGENT);
 

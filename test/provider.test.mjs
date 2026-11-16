@@ -1,4 +1,4 @@
-// Bun only (imports the TypeScript extension): `bun test ./extension.test.mjs` from this directory.
+// Bun only (imports the TypeScript extension): `bun test ./test/provider.test.mjs` from the repository root.
 // The extension's default `codex app-server --stdio` command resolves to a temporary `codex` executable
 // that runs the protocol double in client.test.mjs; no Codex process or inference is involved.
 import assert from 'node:assert/strict';
@@ -75,7 +75,7 @@ afterAll(() => {
   if (previousStateDir === undefined) delete process.env.OMP_CODEX_BRIDGE_STATE_DIR;
   else process.env.OMP_CODEX_BRIDGE_STATE_DIR = previousStateDir;
 });
-const { default: extension } = await import('../../extensions/codex-bridge.ts');
+const { default: extension } = await import('../extensions/codex-bridge.ts');
 
 const cwd = realpathSync(process.cwd());
 const FAKE = fileURLToPath(new URL('./client.test.mjs', import.meta.url));
@@ -209,6 +209,7 @@ test('delivers a large result once as a bounded UTF-8 preview without events', a
     assert.equal(summary.events, undefined);
     assert.doesNotMatch(message.content, /ooooo|commandExecution/);
     assert.ok(summary.full.includes(summary.threadId));
+    assert.match(summary.full, /^codex_bridge /, 'status hint uses the registered public tool name');
     const full = await call({ action: 'status', threadId: summary.threadId });
     assert.equal(full.json.text, BIG_TEXT);
     assert.ok(full.json.events.length > 0);
@@ -623,7 +624,7 @@ test('provider and the direct codex_bridge tool coexist without crossing results
 // The models a task agent definition names (frontmatter `model:` as a YAML list or comma list, OMP's
 // parseModelList), in order: OMP runs the first by default, the rest are what a per-call selector may pick.
 function agentModels(name) {
-  const file = join(fileURLToPath(new URL('../../agents/', import.meta.url)), `${name}.md`);
+  const file = join(fileURLToPath(new URL('../agents/', import.meta.url)), `${name}.md`);
   assert.ok(existsSync(file), `agent definition ${file}`);
   const [, frontmatter = ''] = readFileSync(file, 'utf8').match(/^---\n([\s\S]*?)\n---/) ?? [];
   const [, inline = '', block = ''] = frontmatter.match(/^model:[ \t]*(.*)\n((?:[ \t]+-.*\n?)*)/m) ?? [];
@@ -859,17 +860,17 @@ test('a definitely rejected submission retains thread instructions and sends onl
 
 // ---------------------------------------------------------------------------------------------------
 // Restarts: OMP (and with it the app-server) dies, a new process loads the same provider module with the
-// same state directory and drives the same session again. Each restart is a NEW createCodexNativeStream
+// same state directory and drives the same session again. Each restart is a NEW createCodexBridgeProvider
 // with its own client; nothing is aborted or interrupted. Records are written in the provider's
 // documented format and the fake's persisted store says what native history shows.
-const { createCodexNativeStream, inputId, CODEX_NATIVE_MODELS } = await import('./provider.mjs');
-const { CodexNativeClient } = await import('./client.mjs');
+const { createCodexBridgeProvider, inputId, CODEX_BRIDGE_MODELS } = await import('../src/omp/provider.mjs');
+const { CodexAppServerClient } = await import('../src/codex/client.mjs');
 const { createHash } = await import('node:crypto');
 const DEFAULT_MODEL = { id: 'default', provider: PROVIDER, api: 'codex-bridge-app-server' };
 const restartClients = [];
 
 async function afterRestart(context, options, createClient, model = DEFAULT_MODEL) {
-  const streamSimple = createCodexNativeStream({ EventStream: AssistantMessageEventStream, stateDir: STATE_DIR, ...(createClient ? { createClient } : {}) });
+  const streamSimple = createCodexBridgeProvider({ EventStream: AssistantMessageEventStream, stateDir: STATE_DIR, ...(createClient ? { createClient } : {}) });
   const providerSessionState = new Map();
   restartClients.push(providerSessionState);
   const events = [];
@@ -1022,7 +1023,7 @@ test('R9: an unknown first turn/start followed by a restart with no native turn 
 }, TIMEOUT);
 
 test('R4: a native history read that times out stops without any mutation', async () => {
-  const createClient = (options) => new CodexNativeClient({ ...options, timeoutMs: 500 });
+  const createClient = (options) => new CodexAppServerClient({ ...options, timeoutMs: 500 });
   await withRestart({ hangTurnsList: true }, restartStore([nativeTurn('U1', 'completed')]), async ({ dir }) => {
     writeRecord('crash-4t', { threadId: 'T1', turnId: 'U1', admitted: true, sent: [inputId(TASK)] });
     const result = await afterRestart({ messages: [TASK, NEW_INPUT] }, { sessionId: 'crash-4t' }, createClient);
@@ -1066,7 +1067,7 @@ test('R5: after the app-server dies mid-turn, new input waits for native history
 }, TIMEOUT);
 
 test('R6: a turn/start whose outcome is unknown (timeout) is never resent with the next message', async () => {
-  const createClient = (options) => new CodexNativeClient({ ...options, timeoutMs: 500 });
+  const createClient = (options) => new CodexAppServerClient({ ...options, timeoutMs: 500 });
   // dropTurnReply: Codex runs the turn but its turn/start reply never arrives in time.
   await withRestart({ dropTurnReply: 1500 }, undefined, async ({ dir }) => {
     const task = at('timed out task 3e9a', 1000);
@@ -1080,7 +1081,7 @@ test('R6: a turn/start whose outcome is unknown (timeout) is never resent with t
 }, TIMEOUT);
 
 test('a thread/start timeout leaves nothing delivered: the next message starts a new thread with prompt, task and new text', async () => {
-  const createClient = (options) => new CodexNativeClient({ ...options, timeoutMs: 500 });
+  const createClient = (options) => new CodexAppServerClient({ ...options, timeoutMs: 500 });
   await withRestart({ startDelay: 1500, turns: ['finish-later'] }, undefined, async ({ dir }) => {
     const task = at('unstarted task 3e9a', 1000);
     const lost = await afterRestart({ messages: [task] }, { sessionId: 'start-7' }, createClient);
@@ -1100,7 +1101,7 @@ test('a thread/start timeout leaves nothing delivered: the next message starts a
 }, TIMEOUT);
 
 test('R7: provider labels unknown subscription cost and native usage availability', () => {
-  for (const model of CODEX_NATIVE_MODELS) assert.match(model.name, /native usage when available; cost unknown/);
+  for (const model of CODEX_BRIDGE_MODELS) assert.match(model.name, /native usage when available; cost unknown/);
 });
 
 
@@ -1440,9 +1441,9 @@ test('explicit reasoning off becomes native none only when the catalog advertise
 }, TIMEOUT);
 
 test('native catalog capabilities and measured context window become model metadata', async () => {
-  const { fetchCodexNativeModels } = await import('./provider.mjs');
+  const { fetchCodexModels } = await import('../src/omp/provider.mjs');
   let closed = false;
-  const models = await fetchCodexNativeModels({ createClient: () => ({
+  const models = await fetchCodexModels({ createClient: () => ({
     listModels: async () => [{
       model: 'catalog-model', isDefault: true, contextWindow: 200000,
       inputModalities: ['text', 'image'], supportedReasoningEfforts: [{ reasoningEffort: 'high' }],
@@ -2036,8 +2037,8 @@ test('native Other-enabled option questions use rich root askDialog and preserve
 }, TIMEOUT);
 
 test('static default advertises image and effort support before background native discovery', async () => {
-  assert.equal(CODEX_NATIVE_MODELS[0].reasoning, true);
-  assert.deepEqual(CODEX_NATIVE_MODELS[0].input, ['text', 'image']);
+  assert.equal(CODEX_BRIDGE_MODELS[0].reasoning, true);
+  assert.deepEqual(CODEX_BRIDGE_MODELS[0].input, ['text', 'image']);
   await withHost({}, undefined, async ({ providers, dir }) => {
     const [registered] = providers.get(PROVIDER).models;
     assert.equal(registered.reasoning, true);
@@ -2047,8 +2048,8 @@ test('static default advertises image and effort support before background nativ
 }, TIMEOUT);
 
 test('discovered model restrictions remain authoritative for default and explicit native profiles', async () => {
-  const { fetchCodexNativeModels } = await import('./provider.mjs');
-  const models = await fetchCodexNativeModels({ createClient: () => ({
+  const { fetchCodexModels } = await import('../src/omp/provider.mjs');
+  const models = await fetchCodexModels({ createClient: () => ({
     listModels: async () => [{
       model: 'text-only-native', isDefault: true, inputModalities: ['text'], supportedReasoningEfforts: [],
     }],
@@ -2364,3 +2365,172 @@ test('schema metadata comes from the active branch rather than unrelated session
     assert.deepEqual(sentParams(dir, 'turn/start')[0].outputSchema, RESULT_SCHEMA);
   });
 }, TIMEOUT);
+
+test('forceReasoningOff overrides requested effort only when native none is advertised', async () => {
+  await withHost({ reasoningEfforts: ['none', 'high'], turns: ['finish-later'] }, undefined, async ({ providers, dir }) => {
+    const result = await stream(providers, { messages: [at('forced reasoning off', 67000)] }, {
+      sessionId: 'forced-reasoning-off', reasoning: 'high', forceReasoningOff: true,
+    });
+    assert.equal(result.final.type, 'done', result.message.errorMessage);
+    assert.equal(sentParams(dir, 'turn/start')[0].effort, 'none');
+  });
+  await withHost({}, undefined, async ({ providers, dir }) => {
+    const result = await stream(providers, { messages: [at('unsupported forced reasoning off', 67001)] }, {
+      sessionId: 'unsupported-forced-off', reasoning: 'high', forceReasoningOff: true,
+    });
+    assert.equal(result.final.type, 'error');
+    assert.match(result.message.errorMessage, /reasoning effort none/);
+    assert.deepEqual(mutations(dir), []);
+  });
+}, TIMEOUT);
+
+for (const mode of ['openai/form', 'openaiForm']) {
+  test(`native ${mode} elicitation validates flat fields before explicit submission`, async () => {
+    const elicitationSchema = {
+      type: 'object', properties: { environment: { type: 'string', enum: ['Production'] } }, required: ['environment'],
+    };
+    await withHost({ elicitationMode: mode, elicitationSchema, turns: ['elicitation'] }, undefined, async ({ providers, ctx, dir }) => {
+      ctx.hasUI = true;
+      let submissions = 0;
+      ctx.ui.select = async title => {
+        if (title.includes('Submit these answers?')) { submissions++; return 'Submit answers'; }
+        return 'Production';
+      };
+      const result = await stream(providers, { messages: [at(`native ${mode} flat form`, 68000)] }, { sessionId: `native-form-${mode}` });
+      assert.equal(result.final.type, 'done', result.message.errorMessage);
+      const answer = trace(dir).find(({ message }) => message?.id === 902 && !message.method)?.message;
+      assert.deepEqual(answer.result, { action: 'accept', content: { environment: 'Production' } });
+      assert.equal(submissions, 1);
+    });
+  }, TIMEOUT);
+
+  test(`native ${mode} elicitation declines unrenderable nested schemas before UI`, async () => {
+    const elicitationSchema = { type: 'object', properties: { nested: { type: 'object', properties: { value: { type: 'string' } } } } };
+    await withHost({ elicitationMode: mode, elicitationSchema, turns: ['elicitation'] }, undefined, async ({ providers, ctx, dir }) => {
+      ctx.hasUI = true;
+      let dialogs = 0;
+      ctx.ui.select = ctx.ui.input = async () => { dialogs++; return 'must not be used'; };
+      const result = await stream(providers, { messages: [at(`unsupported ${mode} form`, 69000)] }, { sessionId: `unsupported-form-${mode}` });
+      assert.equal(result.final.type, 'done', result.message.errorMessage);
+      const answer = trace(dir).find(({ message }) => message?.id === 902 && !message.method)?.message;
+      assert.deepEqual(answer.result, { action: 'decline' });
+      assert.equal(dialogs, 0);
+    });
+  }, TIMEOUT);
+}
+
+for (const transition of ['branch', 'fork', 'whole-fork']) {
+  test(`official ${transition} lifecycle forks native history without replaying source receipts`, async () => {
+    await withHost({ turns: Array(3).fill('finish-later') }, undefined, async ({ providers, ctx, handlers, dir }) => {
+      const { config, model } = providerModel(providers);
+      const setup = { id: 'init', parentId: null, type: 'session_init' };
+      const source = Object.assign(lifecycleContext('source-journal', model, [setup]), { agent: ctx.agent });
+      sessionContexts.set('source-provider', source);
+      const task = at('original branch task', 70000);
+      const first = await stream(providers, { messages: [task] }, { sessionId: 'source-provider' });
+      const followUp = at('source follow-up', 71000);
+      const second = await stream(providers, { messages: [task, first.message, followUp] }, { sessionId: 'source-provider' });
+      assert.equal(second.final.type, 'done', second.message.errorMessage);
+      const entries = [
+        setup, messageEntry('user1', 'init', task), messageEntry('answer1', 'user1', first.message),
+        messageEntry('user2', 'answer1', followUp), messageEntry('answer2', 'user2', second.message),
+      ];
+      source.setEntries(entries);
+      const originalRecord = readFileSync(recordFile('source-provider'), 'utf8');
+      const before = mutations(dir).length;
+      const whole = transition === 'whole-fork';
+      const beforeEvent = whole ? 'session_before_switch' : 'session_before_branch';
+      const result = await handlers.get(beforeEvent)({
+        type: beforeEvent, reason: whole ? 'fork' : transition,
+        ...(whole ? {} : { entryId: transition === 'branch' ? 'user2' : 'answer1' }),
+      }, source);
+      assert.equal(result, undefined);
+      assert.equal(mutations(dir).length, before, 'preflight never forks native history');
+      const kept = whole ? entries : entries.slice(0, 3);
+      const target = Object.assign(lifecycleContext('branch-journal', model, kept), { agent: ctx.agent });
+      sessionContexts.set('branch-provider', target);
+      const afterEvent = whole ? 'session_switch' : 'session_branch';
+      await handlers.get(afterEvent)({ type: afterEvent, reason: whole ? 'fork' : transition }, target);
+      assert.equal(mutations(dir).length, before, 'journal adoption only copies durable receipts');
+      const history = whole ? [task, first.message, followUp, second.message] : [task, first.message];
+      const next = await stream(providers, { messages: [...history, at('new branch input', 72000)] }, { sessionId: 'branch-provider' });
+      assert.equal(next.final.type, 'done', next.message.errorMessage);
+      const [fork] = sentParams(dir, 'thread/fork');
+      assert.ok(fork, 'first new input forks the native checkpoint');
+      assert.equal(fork.threadId, readRecord('source-provider').threadId);
+      assert.equal(fork.lastTurnId, (whole ? second : first).message.responseId.split(':').at(-1));
+      assert.equal(sentParams(dir, 'turn/start').length, 3);
+      assert.equal(deliveries(dir, 'original branch task'), 1);
+      assert.equal(deliveries(dir, 'source follow-up'), 1);
+      assert.equal(deliveries(dir, 'new branch input'), 1);
+      assert.equal(readFileSync(recordFile('source-provider'), 'utf8'), originalRecord, 'source ledger remains unchanged');
+      const branchRecord = readRecord('branch-provider');
+      assert.notEqual(branchRecord.threadId, readRecord('source-provider').threadId);
+      assert.ok(branchRecord.sent.includes(inputId(task)), 'inherited input identity remains delivered');
+      await config.streamSimple.close('branch-journal');
+    });
+  }, TIMEOUT);
+}
+
+test('official entry fork refuses incomplete native answers before changing history', async () => {
+  await withHost({}, undefined, async ({ providers, ctx, handlers, dir }) => {
+    const { model } = providerModel(providers);
+    const partial = { role: 'assistant', provider: PROVIDER, content: [{ type: 'text', text: 'partial' }], stopReason: 'aborted' };
+    const source = Object.assign(lifecycleContext('partial-fork', model, [messageEntry('partial', null, partial)]), { agent: ctx.agent });
+    const result = await handlers.get('session_before_branch')({ type: 'session_before_branch', reason: 'fork', entryId: 'partial' }, source);
+    assert.deepEqual(result, { cancel: true });
+    assert.match(source.notices[0].message, /not a completed native turn/);
+    assert.deepEqual(mutations(dir), []);
+  });
+}, TIMEOUT);
+
+test('invalid live steering rejects its official OMP claim exactly once before native delivery', async () => {
+  await withHost({ turns: ['work-then-finish'] }, undefined, async ({ providers, dir }) => {
+    let offered = false;
+    const settlements = [];
+    const invalid = user('', {
+      timestamp: 73000, content: [{ type: 'image', mimeType: 'text/plain', data: 'not-an-image' }],
+    });
+    const liveSteering = {
+      wait: signal => offered ? new Promise(resolve => signal.addEventListener('abort', resolve, { once: true })) : Promise.resolve(),
+      claim: async () => {
+        if (offered) return undefined;
+        offered = true;
+        return { messages: [invalid], accept: () => settlements.push('accept'), reject: () => settlements.push('reject') };
+      },
+    };
+    const result = await stream(providers, { messages: [at('valid active input', 72999)] }, {
+      sessionId: 'invalid-live-input', liveSteering,
+    });
+    assert.equal(result.final.type, 'done', result.message.errorMessage);
+    assert.deepEqual(settlements, ['reject']);
+    assert.equal(sentParams(dir, 'turn/steer').length, 0);
+    assert.equal(sentParams(dir, 'turn/start').length, 1);
+    assert.ok(!readRecord('invalid-live-input').sent.includes(inputId(invalid)));
+  });
+}, TIMEOUT);
+
+test('extracted storage retains legacy session filenames, serialized fields and text input identities', async () => {
+  const { loadSession, saveSession, sessionFile } = await import('../src/omp/session-store.mjs');
+  const dir = mkdtempSync(join(tmpdir(), 'codex-ledger-compat-'));
+  try {
+    const sessionId = 'ledger/한글:stable';
+    const message = { role: 'user', timestamp: 1234, content: 'legacy text receipt' };
+    assert.equal(inputId(message), `1234:${createHash('sha256').update(message.content).digest('hex').slice(0, 32)}`);
+    const expectedFile = join(dir, `${createHash('sha256').update(sessionId).digest('hex')}.json`);
+    assert.equal(sessionFile(dir, sessionId), expectedFile);
+    const opaque = { version: 1, threadId: 'T1', turnId: 'U2', providerSessionId: sessionId, opaqueExtension: { retained: true } };
+    const record = {
+      sandbox: 'workspace-write', cwd, model: 'legacy-model', threadId: 'T1', turnId: 'U2',
+      admitted: true, sent: [inputId(message)], latestResponseId: 'codex-bridge:T1:U1',
+      opaque, rewrite: null, threads: ['T1', 'older-thread'],
+    };
+    writeFileSync(expectedFile, JSON.stringify(record));
+    const loaded = loadSession(dir, sessionId, 'ignored-selection', 'ignored-cwd');
+    assert.equal(loaded.model, record.model);
+    saveSession(dir, loaded);
+    assert.deepEqual(JSON.parse(readFileSync(expectedFile, 'utf8')), record);
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});

@@ -1,12 +1,12 @@
 #!/bin/sh
 # TEST-ONLY: real OMP with the hub-fixture orchestrator and the fake Codex app-server; no model inference.
-# Extra arguments go to omp, e.g. `hub-fixture.sh --mode rpc --no-ui` or no arguments for the TUI.
+# Extra arguments go to omp, e.g. `fixture.sh --mode rpc --no-ui` or no arguments for the TUI.
 #
 # No real account can be reached: OMP runs under `env -i` with an allowlisted environment (no API keys,
 # auth-broker or cloud variables) and HOME/XDG directories that are new and inside the fixture
 # directory, so it sees no stored login, settings, profiles or broker configuration. Both fixture
 # providers run without inference; `codex` on PATH is the protocol double. Extension and agent
-# sources come only from this checkout, before the switch.
+# sources come only from this checkout's native package install, before the switch.
 # CODEX_HUB_FIXTURE_OPTIONS replaces the fake server's options.json (default: the first native turn
 # shows a command item and stays active until steered or interrupted).
 # Cleanup afterwards: the printed fixture directory (it also holds the isolated OMP home).
@@ -15,21 +15,17 @@ HERE=$(cd "$(dirname "$0")" && pwd)
 REPO=$(cd "$HERE/../.." && pwd)
 OMP=$(command -v omp)
 NODE=$(command -v node)
-# CODEX_HUB_FIXTURE_DIR (an existing empty directory) replaces the mktemp directory; hub-smoke.mjs uses it.
+# CODEX_HUB_FIXTURE_DIR (an existing empty directory) replaces the mktemp directory; smoke.mjs uses it.
 FIX=${CODEX_HUB_FIXTURE_DIR:-$(mktemp -d "${TMPDIR:-/tmp}/codex-hub-fixture.XXXXXX")}
-USER_AGENTS="$FIX/home/.omp/agent/agents"
-mkdir -p "$FIX/bin" "$FIX/work" "$USER_AGENTS" "$FIX/xdg/config" "$FIX/xdg/data" "$FIX/xdg/state" "$FIX/xdg/cache" "$FIX/tmp"
-printf '#!/bin/sh\nexec "%s" "%s" --fake-app-server\n' "$NODE" "$HERE/client.test.mjs" > "$FIX/bin/codex"
+mkdir -p "$FIX/bin" "$FIX/work" "$FIX/home" "$FIX/xdg/config" "$FIX/xdg/data" "$FIX/xdg/state" "$FIX/xdg/cache" "$FIX/tmp"
+printf '#!/bin/sh\nexec "%s" "%s" --fake-app-server\n' "$NODE" "$REPO/test/client.test.mjs" > "$FIX/bin/codex"
 chmod 755 "$FIX/bin/codex"
 DEFAULT_OPTIONS='{"turns":["work"]}'
 printf '%s\n' "${CODEX_HUB_FIXTURE_OPTIONS:-$DEFAULT_OPTIONS}" > "$FIX/options.json"
-# The production agent file goes to the isolated home's user agent directory: OMP only lets bundled or
-# user-level agent frontmatter grant a per-call model (project agents never do).
-cp "$REPO/agents/codex-bridge.md" "$USER_AGENTS/"
 # CODEX_HUB_FIXTURE_MODEL (an exact selector, e.g. codex-bridge/gpt-6-astra) makes the orchestrator
 # pass it as the task item's `model`. Only for that run the fixture config turns the per-call gate on
-# (OMP default: off) and allowlists exactly that selector; the grant itself must come from the agent
-# frontmatter copied above. The model must also be in options.json `models` (the fake native model/list).
+# (OMP default: off) and allowlists exactly that selector. The installed user-scope package supplies the
+# agent's model grant; no user agent copy/link is needed. options.json must list the native model too.
 PER_CALL_MODEL=""
 [ -z "${CODEX_HUB_FIXTURE_MODEL:-}" ] || PER_CALL_MODEL=$(printf '  perCallModel: "on"\n  perCallModelAllow:\n    - "%s"' "$CODEX_HUB_FIXTURE_MODEL")
 # Fixture-only settings: no startup dialogs, the shipped default unstructured task results, and no idle
@@ -73,6 +69,12 @@ exec env -i \
   ${CODEX_HUB_FIXTURE_DIRECT_JSON:+CODEX_HUB_FIXTURE_DIRECT_JSON="$CODEX_HUB_FIXTURE_DIRECT_JSON"} \
   ${CODEX_HUB_FIXTURE_SCHEMA:+CODEX_HUB_FIXTURE_SCHEMA="$CODEX_HUB_FIXTURE_SCHEMA"} \
   ${CODEX_HUB_FIXTURE_EFFORT:+CODEX_HUB_FIXTURE_EFFORT="$CODEX_HUB_FIXTURE_EFFORT"} \
-  "$OMP" --config "$FIX/config.yml" \
-  -e "$REPO/extensions/codex-bridge.ts" -e "$HERE/hub-fixture.ts" \
-  --model "$ROOT_MODEL" --tools "$TOOLS" --no-title "$@"
+  sh -c '
+    set -eu
+    omp=$1
+    repo=$2
+    shift 2
+    "$omp" plugin install "$repo" >&2
+    exec "$omp" "$@"
+  ' sh "$OMP" "$REPO" --config "$FIX/config.yml" \
+  -e "$HERE/fixture.ts" --model "$ROOT_MODEL" --tools "$TOOLS" --no-title "$@"

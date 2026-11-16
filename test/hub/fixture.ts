@@ -1,5 +1,5 @@
 // TEST-ONLY orchestrator for a real-OMP Agent Hub smoke of the codex-bridge task agent. Load it only
-// through hub-fixture.sh (or an explicit `-e`); it is not in extensions/ and never auto-loads.
+// through fixture.sh (or an explicit `-e`); it is not in extensions/ and never auto-loads.
 //
 // It is an official command-backed provider that runs no model: on the first request that offers the
 // `task` tool it emits exactly one real `task` tool call spawning the `codex-bridge` agent, and answers
@@ -43,7 +43,7 @@ export default function (pi: ExtensionAPI) {
         id: `codex-hub-fixture-${tool}`,
         name: tool,
         arguments: direct ? directArgs ?? { action: "run", prompt: "fixture: removed sandbox argument must be refused", sandbox: retiredSandbox } : {
-          // hub-smoke.mjs passes a rich context (markdown, code, quoted headings) to check it reaches Codex whole.
+          // smoke.mjs passes a rich context (markdown, code, quoted headings) to check it reaches Codex whole.
           context: process.env.CODEX_HUB_FIXTURE_CONTEXT || "Codex bridge Hub fixture (test-only; fake app-server, no model inference).",
           tasks: [{
             name: "CodexChild",
@@ -52,7 +52,7 @@ export default function (pi: ExtensionAPI) {
             solutionSpace: "fixture: fixed inspection",
             ...(process.env.CODEX_HUB_FIXTURE_SCHEMA ? { outputSchema: JSON.parse(process.env.CODEX_HUB_FIXTURE_SCHEMA), schemaMode: "strict" } : {}),
             ...(process.env.CODEX_HUB_FIXTURE_EFFORT ? { effort: process.env.CODEX_HUB_FIXTURE_EFFORT } : {}),
-            // CODEX_HUB_FIXTURE_MODEL: an exact per-call selector (hub-fixture.sh enables the gate for it).
+            // CODEX_HUB_FIXTURE_MODEL: an exact per-call selector (fixture.sh enables the gate for it).
             ...(process.env.CODEX_HUB_FIXTURE_MODEL ? { model: process.env.CODEX_HUB_FIXTURE_MODEL } : {}),
           }],
         },
