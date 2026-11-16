@@ -37,6 +37,7 @@ export function bounded(value, budget = { left: MAX_EVENT_TEXT }, depth = 0) {
   return result;
 }
 
+
 export function nonempty(value, name) {
   if (typeof value !== 'string' || !value.trim() || value.includes('\0')) {
     throw new TypeError(`${name} must be a nonempty string without NUL characters`);

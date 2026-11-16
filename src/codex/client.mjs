@@ -2,21 +2,27 @@ import { isAbsolute } from 'node:path';
 import { realpath, stat } from 'node:fs/promises';
 import { AppServerTransport } from './transport.mjs';
 import {
-  TERMINAL, REFUSED_CODES, MODEL_PAGE_SIZE, MODEL_PAGES, MAX_TEXT, MAX_EVENT_TEXT, USAGE_KEYS,
+  TERMINAL, REFUSED_CODES, MAX_EVENT_TEXT, USAGE_KEYS,
   bounded, nonempty, jsonValue, userInput, usageBreakdown, aborted, checkSignal,
   validateThreadOptions, withThread, SANDBOX, permissionError,
 } from './protocol.mjs';
+import {
+  listModels, inspectConnection, listThreads, getThreadDetails, inspectThreadStatus, readLastTurn,
+  projectItem, recordItem, threadSnapshot,
+} from './inspection.mjs';
 
 function blankState(threadId) {
   return {
     threadId, turnId: null, status: 'idle', error: null, outcomeUnknown: false,
-    cwd: null, model: null, developerInstructions: undefined,
+    cwd: null, model: null, requestedReasoningEffort: null, developerInstructions: undefined,
+    latestActivity: null, latestPlan: null, fileChanges: [], commandFailure: null, inspection: 'live',
     tokenUsage: null, tokenUsageTurnId: null, usageBaseline: null, turnUsage: null,
     events: [], messages: new Map(), textSize: 0, textTruncated: false,
     asyncQuestions: new Set(),
     retired: new Set(), uncertain: null, interruptRequested: null, attached: false, published: null,
   };
 }
+
 
 export class CodexAppServerClient {
   // onNotification(method, boundedParams) observes owned-thread notifications (item progress for
@@ -52,32 +58,21 @@ export class CodexAppServerClient {
     return () => this._listeners.delete(listener);
   }
 
-  // Read-only native model/list catalog (default picker list), every page; never touches a thread.
-  async listModels() {
-    await this.connect();
-    const models = new Map();
-    const cursors = new Set();
-    let cursor;
-    for (let page = 0; page < MODEL_PAGES; page++) {
-      const result = await this._request('model/list', { limit: MODEL_PAGE_SIZE, ...(cursor === undefined ? {} : { cursor }) });
-      if (!Array.isArray(result?.data)) throw new Error('Codex model/list returned no model list');
-      for (const entry of result.data) {
-        const model = entry?.model;
-        if (typeof model !== 'string' || !model.trim() || model.includes('\0') || models.has(model)) continue;
-        models.set(model, {
-          model, displayName: typeof entry.displayName === 'string' ? entry.displayName : model,
-          isDefault: entry.isDefault === true, hidden: entry.hidden === true,
-          ...(entry.supportedReasoningEfforts === undefined ? {} : { supportedReasoningEfforts: structuredClone(entry.supportedReasoningEfforts) }),
-          ...(entry.inputModalities === undefined ? {} : { inputModalities: structuredClone(entry.inputModalities) }),
-          ...(entry.contextWindow === undefined ? {} : { contextWindow: entry.contextWindow }),
-        });
-      }
-      cursor = result.nextCursor;
-      if (cursor === undefined || cursor === null) return [...models.values()];
-      if (typeof cursor !== 'string' || cursors.has(cursor)) throw new Error('Codex model/list returned an invalid or repeated cursor');
-      cursors.add(cursor);
-    }
-    throw new Error(`Codex model/list exceeded ${MODEL_PAGES} pages`);
+  // Native diagnostics and history reads never register local ownership.
+  listModels() {
+    return listModels(this);
+  }
+
+  inspectConnection() {
+    return inspectConnection(this);
+  }
+
+  listThreads(options) {
+    return listThreads(this, options);
+  }
+
+  getThreadDetails(threadId, options) {
+    return getThreadDetails(this, threadId, options);
   }
 
   snapshot(threadId) {
@@ -102,29 +97,11 @@ export class CodexAppServerClient {
       }
       return this._threadSnapshot(state);
     }
-    await this.connect();
-    // Persisted last turn of a thread this client does not own; it is neither resumed nor registered.
-    const view = blankState(threadId);
-    const turn = await this._readLastTurn(threadId);
-    if (turn) this._applyTurn(view, turn);
-    return this._threadSnapshot(view);
+    return inspectThreadStatus(this, threadId);
   }
 
   _threadSnapshot(state) {
-    const messages = [...state.messages.values()];
-    const answers = messages.filter(message => message.phase == null || message.phase === 'partial_answer' || message.phase === 'final_answer');
-    const final = messages.filter(message => message.phase === 'final_answer');
-    return {
-      threadId: state.threadId, turnId: state.turnId, status: state.status,
-      text: (answers.length ? answers : messages).map(message => message.text).join('\n\n').slice(0, MAX_TEXT),
-      finalText: final.length ? final.map(message => message.text).join('\n\n').slice(0, MAX_TEXT)
-        : messages.findLast(message => message.phase == null)?.text ?? '',
-      textTruncated: state.textTruncated, events: structuredClone(state.events),
-      error: state.error, outcomeUnknown: state.outcomeUnknown,
-      cwd: state.cwd, model: state.model,
-      tokenUsage: structuredClone(state.tokenUsage), tokenUsageTurnId: state.tokenUsageTurnId,
-      turnUsage: structuredClone(state.turnUsage),
-    };
+    return threadSnapshot(state);
   }
 
   _publish(state, quiet = false) {
@@ -193,7 +170,7 @@ export class CodexAppServerClient {
                 state.error = denied.message;
                 throw denied;
               }
-              Object.assign(state, { cwd: directory, model: model ?? result.model ?? null, developerInstructions, attached: true });
+              Object.assign(state, { cwd: result.cwd ?? directory, model: result.model ?? model ?? null, developerInstructions, attached: true });
               if (!threadId) state.usageBaseline = Object.fromEntries(USAGE_KEYS.map(key => [key, 0]));
               this._confirmOutcome(state, request.id);
               this._applyThread(state, result.thread);
@@ -261,6 +238,7 @@ export class CodexAppServerClient {
         } else {
           this._resetTurn(state);
           state.status = 'inProgress';
+          state.requestedReasoningEffort = effort ?? null;
           this._publish(state);
           try {
             await this._request('turn/start', {
@@ -336,7 +314,7 @@ export class CodexAppServerClient {
               forked.error = denied.message;
               throw withThread(denied, id);
             }
-            Object.assign(forked, { cwd: directory, model: model ?? result.model ?? null, developerInstructions, attached: true });
+            Object.assign(forked, { cwd: result.cwd ?? directory, model: result.model ?? model ?? null, developerInstructions, attached: true });
             this._applyThread(forked, result.thread);
             if (request.timedOut) forked.error = 'Codex thread/fork response arrived after its timeout; no turn was started';
             this._publish(forked);
@@ -474,31 +452,8 @@ export class CodexAppServerClient {
     if (!TERMINAL.has(state.status)) state.error = null;
   }
 
-  async _readLastTurn(threadId) {
-    const result = await this._request('thread/turns/list', { threadId, limit: 1, sortDirection: 'desc', itemsView: 'notLoaded' });
-    if (!Array.isArray(result?.data)) throw new Error('Codex thread/turns/list returned no turn list');
-    const turn = result.data[0];
-    if (!turn) return undefined;
-    nonempty(turn.id, 'turn.id');
-    const items = [];
-    const cursors = new Set();
-    let cursor;
-    for (let page = 0; page < 1000; page++) {
-      // One item per page prevents unrelated command output from making a whole-turn JSONL payload.
-      const result = await this._request('thread/items/list', {
-        threadId, turnId: turn.id, limit: 1, sortDirection: 'asc', ...(cursor === undefined ? {} : { cursor }),
-      });
-      if (!Array.isArray(result?.data)) throw new Error('Codex thread/items/list returned no item list');
-      for (const entry of result.data) {
-        if (entry?.turnId !== turn.id || !entry.item) throw new Error('Codex thread/items/list returned an invalid item');
-        if (entry.item.type === 'agentMessage') items.push(entry.item);
-      }
-      cursor = result.nextCursor;
-      if (cursor == null) return { ...turn, items };
-      if (typeof cursor !== 'string' || cursors.has(cursor)) throw new Error('Codex thread/items/list returned an invalid or repeated cursor');
-      cursors.add(cursor);
-    }
-    throw new Error('Codex thread/items/list exceeded 1000 pages');
+  _readLastTurn(threadId) {
+    return readLastTurn(this, threadId);
   }
 
   async _reconcile(state) {
@@ -517,7 +472,8 @@ export class CodexAppServerClient {
     // steer/interrupt of that same turn or about work left by a dead server.
     const unproven = turn?.status === 'inProgress' && (state.status === 'disconnected'
       || (turn.id === state.turnId && ['turn/steer', 'turn/interrupt'].includes(state.uncertain?.method)));
-    if (turn && !state.retired.has(turn.id) && state.uncertain?.method !== 'thread/resume' && !unproven) {
+    if (turn && (turn.status === 'inProgress' || TERMINAL.has(turn.status))
+      && !state.retired.has(turn.id) && state.uncertain?.method !== 'thread/resume' && !unproven) {
       this._applyTurn(state, turn);
       this._confirmOutcome(state);
       this._publish(state);
@@ -530,6 +486,8 @@ export class CodexAppServerClient {
   }
 
   _applyThread(state, thread) {
+    if (typeof thread.cwd === 'string') state.cwd = thread.cwd;
+    if (typeof thread.model === 'string') state.model = thread.model;
     const turns = Array.isArray(thread.turns) ? thread.turns : [];
     const turn = turns.findLast(entry => entry.status === 'inProgress') ?? turns.at(-1);
     if (turn) this._applyTurn(state, turn);
@@ -541,6 +499,7 @@ export class CodexAppServerClient {
   }
 
   _resetTurn(state, id = null) {
+    if (state.turnId !== id && state.turnId !== null) state.requestedReasoningEffort = null;
     if (state.turnId && state.turnId !== id) {
       state.retired.add(state.turnId);
       if (state.retired.size > 100) state.retired.delete(state.retired.values().next().value);
@@ -558,6 +517,10 @@ export class CodexAppServerClient {
     state.messages.clear();
     state.textSize = 0;
     state.textTruncated = false;
+    state.latestActivity = null;
+    state.latestPlan = null;
+    state.fileChanges = [];
+    state.commandFailure = null;
     state.error = null;
     state.outcomeUnknown = false;
     state.uncertain = null;
@@ -571,7 +534,7 @@ export class CodexAppServerClient {
     if (!(TERMINAL.has(state.status) && status === 'inProgress')) {
       state.status = TERMINAL.has(status) ? status : 'inProgress';
     }
-    for (const item of turn.items ?? []) if (item.type === 'agentMessage') this._recordMessage(state, item.id, item.text ?? '', item.phase);
+    for (const item of turn.items ?? []) this._recordItem(state, item);
     if (turn.error) state.error = typeof turn.error.message === 'string' ? turn.error.message.slice(0, MAX_EVENT_TEXT) : JSON.stringify(bounded(turn.error));
     else if (TERMINAL.has(status)) state.error = null;
     if (TERMINAL.has(state.status)) {
@@ -581,15 +544,8 @@ export class CodexAppServerClient {
     }
   }
 
-  _recordMessage(state, id, text, phase) {
-    if (typeof text !== 'string') return;
-    const key = typeof id === 'string' ? id : 'agent-message';
-    const old = state.messages.get(key);
-    if (!old && state.messages.size >= 128) { state.textTruncated = true; return; }
-    const kept = text.slice(0, MAX_TEXT - state.textSize + (old?.text.length ?? 0));
-    if (kept.length < text.length) state.textTruncated = true;
-    state.textSize += kept.length - (old?.text.length ?? 0);
-    state.messages.set(key, { text: kept, phase: phase === undefined ? old?.phase : phase });
+  _recordItem(state, item) {
+    recordItem(state, item);
   }
 
   // The server no longer holds the thread. An active turn stays unknown until native history shows its end.
@@ -614,12 +570,14 @@ export class CodexAppServerClient {
     const state = this._threads.get(params?.threadId ?? params?.thread?.id);
     if (!state) return;
     if (method === 'serverRequest/resolved') this._abortRequest(params.requestId, params.threadId);
-    if (!/delta$|tokenUsage/i.test(method)) {
-      state.events.push({ method, params: bounded(params) });
-      if (state.events.length > 50) state.events.shift();
-    }
     const turnId = params.turnId ?? params.turn?.id;
     if (turnId && state.retired.has(turnId)) return;
+    const projected = params.item ? bounded({ item: projectItem(params.item),
+      threadId: params.threadId, turnId: params.turnId }) : bounded(params);
+    if (!/delta$|tokenUsage/i.test(method)) {
+      state.events.push({ method, params: projected });
+      if (state.events.length > 50) state.events.shift();
+    }
     if (method === 'thread/tokenUsage/updated') {
       const usage = params.tokenUsage;
       const total = usageBreakdown(usage?.total);
@@ -645,12 +603,35 @@ export class CodexAppServerClient {
         this._resetTurn(state, turnId);
         state.status = 'inProgress';
       }
-      if (params.item?.type === 'agentMessage') this._recordMessage(state, params.item.id, params.item.text ?? '', params.item.phase);
+      this._recordItem(state, params.item);
       if (method === 'item/completed' && params.item?.type === 'agentMessage'
         && params.item.delivery === 'async') this._askAsyncQuestions(state, params.item, turnId);
     } else if (method === 'error' && params.error) {
       state.error = String(params.error.message ?? 'Codex reported an error').slice(0, MAX_EVENT_TEXT);
     } else if (method === 'thread/closed') this._detachThread(state, 'Codex thread closed');
+    if (method === 'turn/plan/updated') {
+      if (turnId && state.turnId !== turnId) {
+        this._resetTurn(state, turnId);
+        state.status = 'inProgress';
+      }
+      const plan = Array.isArray(params.plan) ? params.plan : [];
+      let left = 4096;
+      state.latestPlan = {
+        turnId: turnId ?? state.turnId,
+        explanation: typeof params.explanation === 'string' ? params.explanation.slice(0, 1024) : null,
+        plan: plan.slice(0, 50).map(entry => {
+          const step = typeof entry?.step === 'string' ? entry.step.slice(0, Math.min(512, left)) : '';
+          left -= step.length;
+          return { step, status: typeof entry?.status === 'string' ? entry.status.slice(0, 64) : 'unknown' };
+        }),
+        truncated: plan.length > 50,
+      };
+      state.latestPlan.truncated = plan.length > 50 || plan.some((entry, index) => entry?.step !== state.latestPlan.plan[index]?.step);
+    }
+    if (method === 'item/started' || method === 'item/completed' || method === 'turn/plan/updated'
+      || method === 'model/rerouted' || method === 'error') {
+      state.latestActivity = { method, params: projected, at: Date.now() };
+    }
     const compaction = this._compactions.get(state.threadId);
     if (compaction?.cancelled && !compaction.interruptSent && state.status === 'inProgress'
       && state.turnId && state.turnId !== compaction.previousTurnId) {
@@ -663,7 +644,7 @@ export class CodexAppServerClient {
     }
     this._publish(state);
     if (this._onNotification) {
-      try { this._onNotification(method, bounded(params)); } catch { /* An observer must never break the transport. */ }
+      try { this._onNotification(method, projected); } catch { /* An observer must never break the transport. */ }
     }
   }
 

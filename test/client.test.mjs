@@ -1,6 +1,7 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
-import { appendFileSync, existsSync, mkdtempSync, readFileSync, realpathSync, rmSync, writeFileSync } from 'node:fs';
+import { createHash } from 'node:crypto';
+import { appendFileSync, existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, realpathSync, renameSync, rmdirSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { createInterface } from 'node:readline';
@@ -38,17 +39,36 @@ export function fakeServer() {
       for (const turn of thread.turns) if (turn.status === 'inProgress') turn.status = 'interrupted';
     }
   }
-  const save = () => writeFileSync(file('store.json'), JSON.stringify(store));
-  // Several app-server processes may share one CODEX_HOME (one per OMP child client): merge their
-  // counters and threads before allocating IDs, so IDs and the `turns` script stay global.
+  const loaded = new Set();
+  // Each process owns its loaded threads; refresh foreign rows rather than overwriting newer work.
   const sync = () => {
     if (!existsSync(file('store.json'))) return;
     const disk = JSON.parse(readFileSync(file('store.json'), 'utf8'));
     for (const key of ['nextThread', 'nextTurn', 'attempts']) store[key] = Math.max(store[key] ?? 0, disk[key] ?? 0);
-    for (const [id, thread] of Object.entries(disk.threads ?? {})) store.threads[id] ??= thread;
+    for (const [id, thread] of Object.entries(disk.threads ?? {})) {
+      if (!loaded.has(id)) store.threads[id] = thread;
+    }
+  };
+  const lockWait = new Int32Array(new SharedArrayBuffer(4));
+  const save = (change = () => {}) => {
+    const lock = file('store.lock');
+    const deadline = Date.now() + 5000;
+    for (;;) {
+      try { mkdirSync(lock); break; }
+      catch (error) {
+        if (error.code !== 'EEXIST' || Date.now() >= deadline) throw error;
+        Atomics.wait(lockWait, 0, 0, 5);
+      }
+    }
+    try {
+      sync();
+      change();
+      const temporary = file(`store.${process.pid}.tmp`);
+      writeFileSync(temporary, JSON.stringify(store));
+      renameSync(temporary, file('store.json'));
+    } finally { rmdirSync(lock); }
   };
   const record = (entry) => appendFileSync(file('trace.jsonl'), `${JSON.stringify({ pid: process.pid, ...entry })}\n`);
-  const loaded = new Set();
   const running = new Map();
   const serverRequests = new Map();
   let optOut = new Set();
@@ -66,7 +86,8 @@ export function fakeServer() {
 
   const threadView = (thread) => ({
     id: thread.id, sessionId: thread.id, forkedFromId: null, parentThreadId: thread.parentThreadId ?? null,
-    preview: '', ephemeral: false, modelProvider: 'openai', model: 'fake-model', createdAt: 1, updatedAt: 1,
+    preview: thread.preview ?? '', name: thread.name ?? null, ephemeral: false, modelProvider: 'openai',
+    model: thread.model ?? 'fake-model', createdAt: 1, updatedAt: 1,
     status: running.has(thread.id) ? { type: 'active', activeFlags: [] } : { type: 'idle' },
     path: null, cwd: thread.cwd, cliVersion: '0.167.2', source: 'appServer', turns: [],
   });
@@ -130,7 +151,7 @@ export function fakeServer() {
     } : {
       threadId: thread.id, turnId: turn.id, itemId: `${turn.id}-question`, isBlocking: true,
       questions: [{
-        id: 'environment', header: 'Environment', question: 'Which environment?', isOther: options.questionIsOther ?? false, isSecret: false,
+        id: 'environment', header: 'Environment', question: 'Which environment?', isOther: options.questionIsOther ?? false, isSecret: options.questionIsSecret ?? false,
         options: [{ label: 'Staging', description: 'Test environment' }, { label: 'Production', description: 'Live environment' }],
       }],
     };
@@ -190,6 +211,7 @@ export function fakeServer() {
     }
     if (method === 'thread/start' || method === 'thread/fork') {
       sync();
+      thread = store.threads[params.threadId];
       let turns = [];
       if (method === 'thread/fork') {
         if (!thread) { refuse(id, 'source thread not found'); return; }
@@ -200,9 +222,11 @@ export function fakeServer() {
         }
         turns = structuredClone(thread.turns.slice(0, end));
       }
-      thread = { id: `thread-${++store.nextThread}`, cwd: params.cwd ?? process.cwd(), turns };
-      store.threads[thread.id] = thread;
-      save();
+      save(() => {
+        thread = { id: `thread-${++store.nextThread}`, cwd: params.cwd ?? process.cwd(), turns };
+        store.threads[thread.id] = thread;
+        loaded.add(thread.id);
+      });
     }
     // A persisted inProgress record alone is stale; this option models a live native resume.
     if (method === 'thread/resume' && options.liveResume) {
@@ -210,6 +234,8 @@ export function fakeServer() {
       if (active) running.set(thread.id, active);
     }
     loaded.add(thread.id);
+    thread.model = params.model ?? thread.model ?? 'fake-model';
+    save();
     const mode = params.sandbox ?? 'workspace-write';
     const result = {
       thread: threadView(thread), model: params.model ?? 'fake-model', modelProvider: 'openai', serviceTier: null,
@@ -236,7 +262,7 @@ export function fakeServer() {
       notify('turn/completed', { threadId: foreign.id, turn: turnView({ id: 'foreign-turn', status: 'completed', items: [] }) });
     }
     // Delays (and drops, below) apply to the first request of their kind only, so a later retry is answered.
-    later(method === 'thread/start' && store.nextThread === 1 ? options.startDelay ?? 0 : 0, () => {
+    later(method === 'thread/start' && thread.id === 'thread-1' ? options.startDelay ?? 0 : 0, () => {
       reply(id, result);
       if (!options.earlyThread) started();
     });
@@ -254,10 +280,9 @@ export function fakeServer() {
     }
     // `turns` scripts the n-th turn/start of this CODEX_HOME by behaviour name, whatever the prompt text:
     // the provider forwards wrapped OMP prompts, so its tests cannot select behaviour by exact text.
-    sync();
-    store.attempts = (store.attempts ?? 0) + 1;
-    save();
-    const mode = options.turns?.[store.attempts - 1] ?? prompt;
+    let attempt;
+    save(() => { attempt = store.attempts = (store.attempts ?? 0) + 1; });
+    const mode = options.turns?.[attempt - 1] ?? prompt;
     if (mode === 'reject') {
       refuse(id, `turn rejected by native validation: ${'detail '.repeat(20000)}`, -32602);
       return;
@@ -266,10 +291,12 @@ export function fakeServer() {
       process.stderr.write('STDERR-SECRET crash\n');
       process.exit(17);
     }
-    const turn = { id: `turn-${++store.nextTurn}`, prompt, status: 'inProgress', items: [], error: null };
-    thread.turns.push(turn);
-    running.set(thread.id, turn);
-    save();
+    let turn;
+    save(() => {
+      turn = { id: `turn-${++store.nextTurn}`, prompt, status: 'inProgress', items: [], error: null };
+      thread.turns.push(turn);
+      running.set(thread.id, turn);
+    });
     // The admission view is taken before any completion, as a racing server would send it.
     const admission = turnView(turn);
     const admit = () => reply(id, options.malformedTurnReply ? {} : { turn: admission });
@@ -289,12 +316,62 @@ export function fakeServer() {
       later(800, () => { admit(); later(50, () => complete(thread, turn)); });
       return;
     }
-    if (options.dropTurnReply && store.attempts === 1) {
+    if (options.dropTurnReply && attempt === 1) {
       later(options.dropTurnReply, () => complete(thread, turn));
       return;
     }
     admit();
     switch (mode) {
+      case 'usability':
+      case 'usability-reroute':
+        later(50, () => {
+          notify('turn/plan/updated', { threadId: thread.id, turnId: turn.id, explanation: 'Native structured plan',
+            plan: [{ step: 'Inspect native output', status: 'completed' }, { step: 'Fix failing command', status: 'inProgress' }] });
+          item(thread, turn, { type: 'fileChange', id: `${turn.id}-rename`, status: 'completed',
+            changes: [{ path: 'old.txt', kind: { type: 'update', move_path: 'new.txt' },
+              diff: `NATIVE RENAME DIFF\n-old\n+new\n${'d'.repeat(20000)}` }] });
+          item(thread, turn, { ...commandItem(`${turn.id}-failure`, `${'prefix '.repeat(4000)}\nFAILURE TAIL\nsecond failure line`),
+            command: 'native-usability-command', status: 'failed', exitCode: 17 });
+          for (let index = 0; index < 200; index++) {
+            const padding = Array.from({ length: 7 }, (_, chunk) => createHash('sha256')
+              .update(`${index}:${chunk}`).digest('hex')).join('').slice(0, 400);
+            item(thread, turn, { ...commandItem(`${turn.id}-progress-${index}`, `progress ${index} ${'p'.repeat(1000)}`),
+              command: index === 199 ? 'LATEST NATIVE ACTIVITY' : `progress ${index} ${padding}` });
+          }
+          save();
+          if (mode === 'usability-reroute') notify('model/rerouted', {
+            threadId: thread.id, turnId: turn.id, fromModel: thread.model ?? 'fake-model',
+            toModel: 'native-rerouted-model', reason: 'highRiskCyberActivity',
+          });
+          later(3000, () => complete(thread, turn, 'failed', null, 'command failed'));
+        });
+        return;
+      case 'usability-many': {
+        later(50, () => {
+          item(thread, turn, { ...commandItem(`${turn.id}-initial`, `session ${thread.id} initial`),
+            command: `INITIAL ACTIVITY ${thread.id}` });
+          const marker = `usability-many-${thread.id}`;
+          writeFileSync(file(marker), turn.id);
+          let attempts = 0;
+          const ready = () => {
+            if (turn.status !== 'inProgress') return;
+            const markers = readdirSync(home).filter(name => name.startsWith('usability-many-thread-'))
+              .sort((left, right) => Number(left.split('-').at(-1)) - Number(right.split('-').at(-1)));
+            if (markers.length < 3) {
+              if (++attempts < 400) later(25, ready);
+              return;
+            }
+            if (markers[0] === marker) later(300, () => {
+              if (turn.status === 'inProgress') item(thread, turn, {
+                ...commandItem(`${turn.id}-latest`, 'oldest session receives newest native activity'),
+                command: 'OLDEST SESSION LATEST ACTIVITY',
+              });
+            });
+          };
+          ready();
+        });
+        return;
+      }
       case 'hold': return;
       case 'question':
       case 'question-resolved':
@@ -437,6 +514,47 @@ export function fakeServer() {
       refuse(id, 'Not initialized');
       return;
     }
+    if (Object.hasOwn(options.nativeErrors ?? {}, method)) {
+      const error = options.nativeErrors[method];
+      refuse(id, typeof error === 'object' ? error.message : 'native method unavailable',
+        typeof error === 'object' ? error.code : error);
+      return;
+    }
+    if (Object.hasOwn(options.nativeResponses ?? {}, method)) {
+      reply(id, options.nativeResponses[method]);
+      return;
+    }
+    if (method === 'account/read') {
+      reply(id, { account: Object.hasOwn(options, 'account') ? options.account
+        : { type: 'chatgpt', email: 'PRIVATE-EMAIL', planType: 'plus', workspaceName: 'PRIVATE-WORKSPACE' },
+        requiresOpenaiAuth: true });
+      return;
+    }
+    if (method === 'account/rateLimits/read') {
+      reply(id, { accountId: 'PRIVATE-ACCOUNT', rateLimits: {
+        limitId: 'codex', primary: { usedPercent: 20, windowDurationMins: 300, resetsAt: 12345 }, secondary: null,
+      }, ordinaryUsageAllowed: true });
+      return;
+    }
+    if (method === 'config/read') {
+      reply(id, { config: { model: 'fake-model', model_reasoning_effort: 'medium', sandbox_mode: 'workspace-write',
+        approval_policy: 'never', developer_instructions: 'PRIVATE-INSTRUCTIONS',
+        model_providers: { private: { api_key: 'PRIVATE-KEY' } } }, origins: {} });
+      return;
+    }
+    if (method === 'configRequirements/read') {
+      reply(id, { requirements: { allowedApprovalPolicies: ['never'], allowedSandboxModes: ['workspace-write'],
+        modelProviders: { private: { api_key: 'PRIVATE-REQUIREMENTS-KEY' } } } });
+      return;
+    }
+    if (method === 'thread/list') {
+      const threads = Object.values(store.threads).filter(thread => (!params.cwd || thread.cwd === params.cwd)
+        && (!params.searchTerm || (thread.name ?? '').includes(params.searchTerm)));
+      const offset = Number(params.cursor ?? 0);
+      const end = offset + (params.limit ?? 25);
+      reply(id, { data: threads.slice(offset, end).map(threadView), nextCursor: end < threads.length ? String(end) : null });
+      return;
+    }
     if (method === 'model/list') {
       listModels(message);
       return;
@@ -479,10 +597,12 @@ export function fakeServer() {
     if (method === 'thread/compact/start') {
       if (options.compactError) { refuse(id, String(options.compactError), -32603); return; }
       if (running.has(thread.id)) { refuse(id, 'thread already has an active turn'); return; }
-      const compactTurn = { id: `turn-${++store.nextTurn}`, status: 'inProgress', items: [], error: null };
-      thread.turns.push(compactTurn);
-      running.set(thread.id, compactTurn);
-      save();
+      let compactTurn;
+      save(() => {
+        compactTurn = { id: `turn-${++store.nextTurn}`, status: 'inProgress', items: [], error: null };
+        thread.turns.push(compactTurn);
+        running.set(thread.id, compactTurn);
+      });
       if (!options.compactDropReply) reply(id, {});
       if (options.compactDisconnect) later(20, () => process.exit(18));
       later(options.compactStartDelay ?? 0, () => notify('turn/started', { threadId: thread.id, turn: turnView(compactTurn) }));
@@ -1675,6 +1795,379 @@ it('preserves unknown compaction identity on disconnect before and after admissi
   });
   assert.equal(client.snapshot(first.threadId).outcomeUnknown, false);
   assert.equal(sent(dir, 'thread/compact/start').length, 1);
+});
+
+it('reports readonly native diagnostics without exposing account or configuration secrets', async (t) => {
+  const { client, dir } = makeClient(t, { modelPageSize: 1 });
+  const result = await client.inspectConnection();
+  assert.equal(result.connection.status, 'available');
+  assert.equal(result.connection.userAgent, 'fake-codex/0.167.2');
+  assert.equal(result.connection.platformOs, 'linux');
+  assert.deepEqual(result.auth, { status: 'available', value: {
+    authenticated: true, mode: 'chatgpt', requiresOpenaiAuth: true,
+  } });
+  assert.equal(result.models.value.length, 2);
+  assert.equal(result.rateLimits.value.rateLimits.primary.usedPercent, 20);
+  assert.equal(result.permissions.value.config.value.approvalPolicy, 'never');
+  assert.deepEqual(result.permissions.value.requirements.value.allowedSandboxModes, ['workspace-write']);
+  assert.doesNotMatch(JSON.stringify(result), /PRIVATE-|codexHome|api_key|developer_instructions/);
+  assert.deepEqual(sent(dir, 'account/read'), [{ refreshToken: false }]);
+  assert.deepEqual(sent(dir, 'config/read'), [{ includeLayers: false }]);
+  assert.equal(spawnedPids(dir).length, 1);
+  assert.deepEqual(mutations(dir), []);
+  assert.deepEqual(client.snapshot(), []);
+});
+
+it('keeps unsupported diagnostics partial and preserves numeric codes without raw error dumps', async (t) => {
+  const { client, dir } = makeClient(t, { account: null, nativeErrors: {
+    'account/rateLimits/read': { code: -32601, message: 'PRIVATE-TOKEN diagnostic unavailable' },
+    'configRequirements/read': -32000,
+  } });
+  const result = await client.inspectConnection();
+  assert.equal(result.auth.value.authenticated, false);
+  assert.equal(result.auth.value.mode, null);
+  assert.equal(result.models.status, 'available');
+  assert.equal(result.rateLimits.status, 'unavailable');
+  assert.equal(result.rateLimits.error.code, -32601);
+  assert.equal(result.permissions.value.config.status, 'available');
+  assert.equal(result.permissions.value.requirements.error.code, -32000);
+  assert.doesNotMatch(JSON.stringify(result), /PRIVATE-TOKEN/);
+  assert.equal(sent(dir, 'account/rateLimits/read').length, 1);
+  assert.deepEqual(mutations(dir), []);
+});
+
+it('reports malformed diagnostic responses unavailable and never infers quota recovery', async (t) => {
+  const { client } = makeClient(t, { nativeResponses: {
+    'account/read': {},
+    'account/rateLimits/read': { rateLimits: { primary: { usedPercent: 0, resetsAt: 1 } } },
+    'config/read': null,
+    'model/list': { data: Array.from({ length: 101 }, (_, index) => ({ model: `model-${index}` })), nextCursor: null },
+  } });
+  const result = await client.inspectConnection();
+  assert.equal(result.auth.error.code, 'INVALID_RESPONSE');
+  assert.equal(result.models.status, 'unavailable');
+  assert.equal(result.permissions.value.config.error.code, 'INVALID_RESPONSE');
+  assert.equal(result.rateLimits.value.ordinaryUsageAllowed, null);
+  assert.equal(result.rateLimits.value.rateLimits.primary.usedPercent, 0);
+});
+
+it('reports a failed connection once without retrying diagnostics or adopting threads', async (t) => {
+  const { client, dir } = makeClient(t, {}, { command: ['/nonexistent/codex-bridge-native-test'] });
+  const result = await client.inspectConnection();
+  for (const key of ['connection', 'auth', 'models', 'rateLimits', 'permissions']) {
+    assert.equal(result[key].status, 'unavailable');
+  }
+  assert.doesNotMatch(JSON.stringify(result), /nonexistent/);
+  assert.deepEqual(trace(dir), []);
+  assert.deepEqual(client.snapshot(), []);
+});
+
+it('paginates native thread search and explicit typed history without loading or owning it', async (t) => {
+  const turn = savedTurn('latest', 'failed', 'saved answer', { message: 'native failure' });
+  turn.items.unshift(
+    { type: 'commandExecution', id: 'failed-command', command: 'check', status: 'failed', exitCode: 17,
+      aggregatedOutput: `${'prefix'.repeat(5000)}\nFAILURE TAIL\nsecond failure line` },
+    { type: 'fileChange', id: 'rename', status: 'completed', changes: [
+      { path: 'old.txt', kind: { type: 'update', move_path: 'new.txt' }, diff: `NATIVE RENAME DIFF\n${'d'.repeat(10000)}` },
+    ] },
+    { type: 'agentMessage', id: 'question', text: 'Archived question', phase: 'commentary',
+      delivery: 'async', questions: [{ title: 'Do not re-ask history?' }] },
+  );
+  const store = savedStore([['history-a', [turn]], ['history-b', [savedTurn('other', 'completed', 'other answer')]]]);
+  store.threads['history-a'].name = 'native task';
+  store.threads['history-b'].name = 'native second task';
+  store.threads['history-a'].model = 'saved-native-model';
+  const { client, dir } = makeClient(t, {}, { onRequest: () => assert.fail('history must not re-ask questions') }, store);
+  const first = await client.listThreads({ limit: 1, searchTerm: 'native', cwd });
+  assert.equal(first.data[0].id, 'history-a');
+  assert.equal(first.nextCursor, '1');
+  const second = await client.listThreads({ limit: 1, cursor: first.nextCursor, searchTerm: 'native', cwd });
+  assert.equal(second.data[0].id, 'history-b');
+  assert.equal(second.nextCursor, null);
+  const metadata = await client.getThreadDetails('history-a');
+  assert.equal(metadata.snapshot.inspection, 'history');
+  assert.equal(metadata.snapshot.execution.model, 'saved-native-model');
+  assert.equal(metadata.snapshot.execution.cwd, cwd);
+  assert.equal(metadata.snapshot.execution.requestedReasoningEffort, null);
+  assert.equal(sent(dir, 'thread/items/list').length, 0, 'metadata inspection must not fetch item history');
+  const page = await client.getThreadDetails('history-a', { includeItems: true, limit: 2 });
+  assert.equal(page.items.data[0].item.exitCode, 17);
+  assert.match(page.items.data[0].item.aggregatedOutput, /FAILURE TAIL\nsecond failure line$/);
+  assert.equal(page.items.data[0].item.outputTruncated, true);
+  assert.equal(page.snapshot.commandFailure.outputTruncated, true);
+  assert.equal(page.items.data[1].item.changes[0].movePath, 'new.txt');
+  assert.equal(page.items.data[1].item.changes[0].kind.move_path, 'new.txt');
+  assert.equal(page.items.data[1].item.changes[0].diff, undefined);
+  const detail = await client.getThreadDetails('history-a', { includeDiff: true, limit: 2 });
+  assert.match(detail.items.data[1].item.changes[0].diff, /^NATIVE RENAME DIFF/);
+  assert.equal(detail.items.data[1].item.changes[0].diff.length, 4096);
+  assert.equal(detail.items.data[1].item.changes[0].diffTruncated, true);
+  const rest = await client.getThreadDetails('history-a', { includeItems: true, limit: 2, cursor: page.items.nextCursor });
+  assert.equal(rest.items.data[0].item.delivery, 'async');
+  assert.equal(rest.items.nextCursor, null);
+  assert.equal(client.snapshot('history-a'), undefined);
+  assert.deepEqual(client.snapshot(), []);
+  assert.deepEqual(mutations(dir), []);
+  assert.ok(sent(dir, 'thread/read').every(params => params.includeTurns === false));
+  assert.ok(sent(dir, 'thread/turns/list').every(params => params.itemsView === 'notLoaded'));
+  await assert.rejects(client.getThreadDetails('missing-thread'), error => error.code === -32600);
+});
+
+it('rejects invalid native pagination and wrong-thread item pages without mutation', async (t) => {
+  const { client, dir } = makeClient(t, { nativeResponses: {
+    'thread/list': { data: [], nextCursor: 'same' },
+    'thread/items/list': { data: [{ turnId: 'wrong', item: { type: 'contextCompaction', id: 'wrong' } }], nextCursor: null },
+  } }, {}, savedStore([['saved', [savedTurn('correct', 'completed', 'answer')]]]));
+  await assert.rejects(client.listThreads({ cursor: 'same' }), /invalid page/);
+  await assert.rejects(client.listThreads({ limit: 101 }), /from 1 to 100/);
+  await assert.rejects(client.getThreadDetails('saved', { includeItems: true }), /invalid item/);
+  assert.deepEqual(mutations(dir), []);
+  assert.deepEqual(client.snapshot(), []);
+});
+
+it('retains structured plan, file metadata and failed command tail after event eviction', async (t) => {
+  const seen = [];
+  let client;
+  ({ client } = makeClient(t, { turns: ['usability'] }, { onNotification(method, params) {
+    if (method === 'item/completed' && params.item?.exitCode === 17) {
+      seen.push({ params, snapshot: client.snapshot(params.threadId) });
+    }
+  } }));
+  const admitted = await client.run({ prompt: 'native diagnostics', cwd, model: 'fake-model', effort: 'high' });
+  const done = await untilSnapshot(client, admitted.threadId, ({ status }) => status === 'failed');
+  assert.equal(seen.length, 1);
+  assert.match(seen[0].params.item.aggregatedOutput, /FAILURE TAIL\nsecond failure line$/);
+  assert.equal(seen[0].snapshot.commandFailure.exitCode, 17, 'semantic state must update before callback');
+  assert.equal(done.events.length, 50);
+  assert.equal(done.events.some(event => event.params.item?.id?.endsWith('-failure')), false);
+  assert.equal(done.commandFailure.command, 'native-usability-command');
+  assert.equal(done.commandFailure.outputTruncated, true);
+  assert.match(done.commandFailure.outputTail, /FAILURE TAIL\nsecond failure line$/);
+  assert.equal(done.latestPlan.plan[1].step, 'Fix failing command');
+  assert.equal(done.fileChanges[0].changes[0].movePath, 'new.txt');
+  assert.equal(done.fileChanges[0].changes[0].diff, undefined);
+  assert.equal(done.latestActivity.params.item.command, 'LATEST NATIVE ACTIVITY');
+  assert.deepEqual(done.execution, { model: 'fake-model', cwd, requestedReasoningEffort: 'high' });
+  const before = client.snapshot(admitted.threadId);
+  const history = await client.getThreadDetails(admitted.threadId, { includeItems: true, includeDiff: true, limit: 2 });
+  assert.equal(history.snapshot.inspection, 'history');
+  assert.equal(history.snapshot.requestedReasoningEffort, null);
+  assert.equal(history.snapshot.latestPlan, null, 'native history does not retain structured plan notifications');
+  assert.deepEqual(client.snapshot(admitted.threadId), before, 'inspection cannot replace live semantic state');
+  done.latestPlan.plan[0].step = 'caller mutation';
+  done.commandFailure.outputTail = 'caller mutation';
+  assert.equal(client.snapshot(admitted.threadId).latestPlan.plan[0].step, 'Inspect native output');
+  await client.run({ threadId: admitted.threadId, prompt: 'next', cwd });
+  const next = client.snapshot(admitted.threadId);
+  assert.equal(next.requestedReasoningEffort, null);
+  assert.equal(next.latestPlan, null);
+  assert.equal(next.commandFailure, null);
+  assert.deepEqual(next.fileChanges, []);
+});
+
+it('bounds explicit native file metadata and diff budgets with visible truncation', async (t) => {
+  const turn = savedTurn('files-turn', 'completed', 'answer');
+  turn.items.unshift({ type: 'fileChange', id: 'large-file-change', status: 'completed',
+    changes: Array.from({ length: 120 }, (_, index) => ({
+      path: `source-${index}-${'s'.repeat(1000)}`,
+      kind: { type: 'update', move_path: `destination-${index}-${'t'.repeat(1000)}` },
+      diff: 'd'.repeat(10000),
+    })) });
+  const { client } = makeClient(t, {}, {}, savedStore([['files', [turn]]]));
+  const result = await client.getThreadDetails('files', { includeItems: true, includeDiff: true, limit: 1 });
+  const item = result.items.data[0].item;
+  assert.equal(item.changes.length, 50);
+  assert.equal(item.changesTruncated, true);
+  assert.equal(item.changes[0].metadataTruncated, true);
+  assert.equal(item.changes[0].diffTruncated, true);
+  assert.equal(item.changes.reduce((sum, change) => sum + change.diff.length, 0), 4096);
+  assert.ok(JSON.stringify(item).length < 30000);
+  assert.equal(result.snapshot.fileChanges[0].changesTruncated, true);
+  assert.equal(result.snapshot.fileChanges[0].changes[0].metadataTruncated, true);
+  assert.equal(result.snapshot.fileChanges[0].changes[0].diff, undefined);
+});
+
+it('refuses native thread identity mismatches during readonly inspection', async (t) => {
+  const { client, dir } = makeClient(t, { nativeResponses: {
+    'thread/read': { thread: { id: 'unexpected-thread', cwd, model: 'fake-model', turns: [] } },
+  } });
+  await assert.rejects(client.getThreadDetails('requested-thread'), /unexpected thread/);
+  assert.deepEqual(mutations(dir), []);
+  assert.deepEqual(client.snapshot(), []);
+});
+
+it('keeps a live secret question pending throughout readonly history inspection', async (t) => {
+  let answer;
+  let request;
+  const { client, dir } = makeClient(t, { questionIsSecret: true }, { onRequest: value => {
+    request = value;
+    return new Promise(resolve => { answer = resolve; });
+  } });
+  const admitted = await client.run({ prompt: 'question', cwd });
+  await until(() => request);
+  assert.equal(request.params.questions[0].isSecret, true);
+  const before = client.snapshot(admitted.threadId);
+  for (const includeItems of [false, true]) {
+    const history = await client.getThreadDetails(admitted.threadId, { includeItems });
+    assert.equal(history.snapshot.inspection, 'history');
+    assert.equal(history.snapshot.status, 'inProgress');
+    assert.equal(request.signal.aborted, false, 'readonly history cannot abort a live question');
+    assert.deepEqual(client.snapshot(admitted.threadId), before);
+  }
+  answer({ answers: { environment: { answers: ['Staging'] } } });
+  const done = await untilSnapshot(client, admitted.threadId, completed);
+  assert.equal(done.text, 'question answered');
+  assert.deepEqual(trace(dir).find(({ message }) => message?.id === 901 && message.result).message.result,
+    { answers: { environment: { answers: ['Staging'] } } });
+  assert.deepEqual(mutations(dir).map(({ method }) => method), ['thread/start', 'turn/start']);
+});
+
+it('keeps missing and unknown native history turn states unknown', async (t) => {
+  for (const status of [undefined, 'native-future-state', { invalid: 'native-state' }]) {
+    const { client, dir } = makeClient(t, { nativeResponses: {
+      'thread/turns/list': { data: [{ id: 'unknown-turn', ...(status === undefined ? {} : { status }), items: [] }], nextCursor: null },
+    } }, {}, savedStore([['unknown-history', []]]));
+    const details = await client.getThreadDetails('unknown-history', { includeItems: true });
+    assert.equal(details.snapshot.status, 'unknown');
+    assert.equal(details.turns.data[0].status, 'unknown');
+    assert.equal((await client.status('unknown-history')).status, 'unknown');
+    assert.deepEqual(client.snapshot(), []);
+    assert.deepEqual(mutations(dir), []);
+  }
+});
+
+it('does not settle an uncertain mutation from an unknown native history turn state', async (t) => {
+  const { client, dir } = makeClient(t, { dropTurnReply: 5000, nativeResponses: {
+    'thread/turns/list': { data: [{ id: 'turn-1', status: 'native-future-state', items: [] }], nextCursor: null },
+  } }, { timeoutMs: 250 });
+  let threadId;
+  await assert.rejects(client.run({ prompt: 'hold', cwd }), error => {
+    threadId = error.threadId;
+    return error.outcomeUnknown === true;
+  });
+  assert.equal((await client.status(threadId)).outcomeUnknown, true);
+  await assert.rejects(client.run({ threadId, prompt: 'must not replay', cwd }), error => error.outcomeUnknown === true);
+  assert.equal(sent(dir, 'turn/start').length, 1);
+});
+
+it('marks truncated typed history agent messages and preserves their native phase', async (t) => {
+  const answer = 'long native answer '.repeat(2000);
+  const { client, dir } = makeClient(t, {}, {}, savedStore([
+    ['long-answer', [savedTurn('answer-turn', 'completed', answer)]],
+  ]));
+  const details = await client.getThreadDetails('long-answer', { includeItems: true });
+  const item = details.items.data[0].item;
+  assert.equal(item.phase, 'final_answer');
+  assert.equal(item.text.length, 8192);
+  assert.equal(item.textTruncated, true);
+  assert.equal(details.snapshot.textTruncated, true);
+  assert.equal(details.snapshot.finalText, item.text);
+  const status = await client.status('long-answer');
+  assert.equal(status.text, answer, 'last-turn text uses the separate bounded retained-answer budget');
+  assert.equal(status.textTruncated, false);
+  assert.deepEqual(mutations(dir), []);
+});
+
+it('rejects oversized and nonstring native pagination cursors without trimming them', async (t) => {
+  for (const invalid of [
+    { nextCursor: 'c'.repeat(4097) },
+    { nextCursor: { raw: 'UNBOUNDED-CURSOR' } },
+    { backwardsCursor: 'c'.repeat(4097) },
+    { backwardsCursor: { raw: 'UNBOUNDED-CURSOR' } },
+  ]) {
+    const { client, dir } = makeClient(t, { nativeResponses: {
+      'thread/list': { data: [], nextCursor: null, ...invalid },
+    } });
+    await assert.rejects(client.listThreads(), /invalid page/);
+    await assert.rejects(client.listThreads({ cursor: 'c'.repeat(4097) }), /at most 4096/);
+    assert.deepEqual(mutations(dir), []);
+    assert.equal(sent(dir, 'thread/list').length, 1);
+  }
+});
+
+it('projects malformed native item enums and timestamps into bounded typed fields', async (t) => {
+  const invalid = 'UNBOUNDED-NATIVE-FIELD '.repeat(2000);
+  const { client, dir } = makeClient(t, { nativeResponses: {
+    'thread/items/list': { data: [
+      { turnId: 'typed-turn', item: { type: 'fileChange', id: 'typed-files', status: { invalid },
+        changes: [{ path: 'file.txt', kind: invalid }] }, startedAtMs: { invalid }, completedAtMs: invalid },
+      { turnId: 'typed-turn', item: { type: 'commandExecution', id: 'typed-command', status: invalid,
+        command: 'check', aggregatedOutput: 'last line', exitCode: 17 }, startedAtMs: invalid, completedAtMs: { invalid } },
+    ], nextCursor: null, backwardsCursor: 'native-backwards-cursor' },
+  } }, {}, savedStore([['typed-history', [savedTurn('typed-turn', 'completed', 'answer')]]]));
+  const details = await client.getThreadDetails('typed-history', { includeItems: true });
+  assert.equal(details.items.data[0].item.status, 'unknown');
+  assert.equal(details.items.data[0].item.changes[0].kind, 'unknown');
+  assert.equal(details.items.data[1].item.status, 'unknown');
+  for (const entry of details.items.data) {
+    assert.equal(entry.startedAtMs, null);
+    assert.equal(entry.completedAtMs, null);
+  }
+  assert.equal(details.items.backwardsCursor, 'native-backwards-cursor');
+  assert.equal(details.snapshot.commandFailure.exitCode, 17);
+  assert.doesNotMatch(JSON.stringify(details), /UNBOUNDED-NATIVE-FIELD/);
+  assert.ok(JSON.stringify(details).length < 10000);
+  assert.deepEqual(mutations(dir), []);
+});
+
+it('retains native reroute activity beyond the progress cap without changing the bound model', async (t) => {
+  const { client, dir } = makeClient(t, { turns: ['usability-reroute'] });
+  const admitted = await client.run({ prompt: 'native reroute', cwd, model: 'fake-model' });
+  await until(() => client.snapshot(admitted.threadId).latestActivity?.method === 'model/rerouted');
+  const snapshot = client.snapshot(admitted.threadId);
+  assert.equal(snapshot.events.length, 50);
+  assert.equal(snapshot.latestActivity.params.toModel, 'native-rerouted-model');
+  assert.equal(snapshot.latestActivity.params.reason, 'highRiskCyberActivity');
+  assert.equal(snapshot.execution.model, 'fake-model');
+  assert.equal(snapshot.model, 'fake-model');
+  assert.equal(sent(dir, 'turn/start').length, 1);
+  await client.cancel(admitted.threadId);
+});
+
+it('keeps three native sessions live while the oldest receives the newest activity', async (t) => {
+  const { client, dir } = makeClient(t, { turns: ['usability-many', 'usability-many', 'usability-many'] });
+  const admitted = await Promise.all(Array.from({ length: 3 }, (_, index) => client.run({ prompt: `session ${index}`, cwd })));
+  await until(() => client.snapshot().some(snapshot => snapshot.latestActivity?.params.item?.command === 'OLDEST SESSION LATEST ACTIVITY'));
+  const snapshots = client.snapshot();
+  assert.equal(snapshots.length, 3);
+  assert.ok(snapshots.every(snapshot => snapshot.status === 'inProgress'));
+  const oldest = snapshots.find(snapshot => snapshot.threadId === 'thread-1');
+  assert.equal(oldest.latestActivity.params.item.command, 'OLDEST SESSION LATEST ACTIVITY');
+  assert.ok(snapshots.every(snapshot => snapshot.latestActivity.at <= oldest.latestActivity.at));
+  assert.equal(sent(dir, 'turn/start').length, 3);
+  await Promise.all(admitted.map(({ threadId }) => client.cancel(threadId)));
+});
+
+it('allocates unique native identities and merges history across concurrent fake processes', async (t) => {
+  const dir = mkdtempSync(join(tmpdir(), 'codex-bridge-shared-native-'));
+  writeFileSync(join(dir, 'options.json'), JSON.stringify({ turns: ['hold', 'hold', 'hold'] }));
+  const clients = Array.from({ length: 3 }, () => new CodexAppServerClient({
+    command: [process.execPath, fileURLToPath(import.meta.url), FAKE_FLAG],
+    timeoutMs: 3000, env: { CODEX_HOME: dir },
+  }));
+  t.after(async () => {
+    await Promise.all(clients.map(client => client.close()));
+    rmSync(dir, { recursive: true, force: true });
+  });
+  const admitted = await Promise.all(clients.map((client, index) => client.run({ prompt: `concurrent ${index}`, cwd })));
+  assert.equal(new Set(admitted.map(snapshot => snapshot.threadId)).size, 3);
+  assert.equal(new Set(admitted.map(snapshot => snapshot.turnId)).size, 3);
+  const saved = JSON.parse(readFileSync(join(dir, 'store.json'), 'utf8'));
+  assert.equal(Object.keys(saved.threads).length, 3);
+  assert.equal(saved.nextThread, 3);
+  assert.equal(saved.nextTurn, 3);
+  assert.equal(saved.attempts, 3);
+  for (const snapshot of admitted) {
+    assert.equal(snapshot.status, 'inProgress');
+    assert.equal(saved.threads[snapshot.threadId].turns[0].id, snapshot.turnId);
+    assert.equal(saved.threads[snapshot.threadId].turns[0].status, 'inProgress');
+  }
+  await Promise.all(clients.map((client, index) => client.cancel(admitted[index].threadId)));
+  await until(() => clients.every((client, index) => client.snapshot(admitted[index].threadId).status === 'interrupted'));
+  const completed = JSON.parse(readFileSync(join(dir, 'store.json'), 'utf8'));
+  assert.ok(Object.values(completed.threads).every(thread => thread.turns[0].status === 'interrupted'));
+  assert.equal(sent(dir, 'thread/start').length, 3);
+  assert.equal(sent(dir, 'turn/start').length, 3);
 });
 
 if (FAKE_MODE) fakeServer();

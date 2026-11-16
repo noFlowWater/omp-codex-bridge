@@ -74,11 +74,18 @@ export class AppServerTransport {
         if (this._stdout.trim()) this.consume('\n');
         this.fail(new Error(`Codex app-server disconnected (code ${code}, signal ${signal ?? 'none'})`));
       });
-      await this.request('initialize', {
+      const initialized = await this.request('initialize', {
         clientInfo: { name: 'omp_codex_bridge', version: VERSION },
         // Final agent text arrives with item/completed; partial text is not streamed.
         capabilities: { mcpServerOpenaiFormElicitation: true, optOutNotificationMethods: OPT_OUT },
       });
+      // Never retain codexHome or arbitrary initialize fields in public diagnostics.
+      this.connectionInfo = {
+        bridgeVersion: VERSION,
+        userAgent: typeof initialized?.userAgent === 'string' ? initialized.userAgent.slice(0, 256) : null,
+        platformFamily: typeof initialized?.platformFamily === 'string' ? initialized.platformFamily.slice(0, 64) : null,
+        platformOs: typeof initialized?.platformOs === 'string' ? initialized.platformOs.slice(0, 64) : null,
+      };
       this.send({ method: 'initialized', params: {} });
     } catch (error) {
       if (!child || this._process === child) this.fail(error);

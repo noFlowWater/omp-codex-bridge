@@ -69,6 +69,35 @@ Continue or cancel a thread owned by the current direct-tool server:
 
 `status` can inspect saved native history after restart without adopting it. Direct `run` cannot continue threads from another server lifecycle; task agents use their saved lineage for revival.
 
+## Inspect and diagnose
+
+Use OMP's `/codex` command without starting model work:
+
+```text
+/codex doctor
+/codex status
+/codex history {"limit":10,"searchTerm":"parser"}
+/codex show THREAD_ID
+/codex show THREAD_ID {"includeDiff":true,"limit":10}
+```
+
+`doctor` reports native connection, authentication availability, model catalog, supported quota information and readable OMP routing settings. Unavailable checks are labelled; credentials and account identifiers are not displayed. It never logs in, changes settings or consumes credits.
+
+`history` supports `cursor`, `limit`, `searchTerm` and `cwd`. `show` supports `includeItems`, `turnId`, `cursor`, `limit` and `includeDiff`. When paging items, retain the returned `turnId` alongside its next cursor. Use small item pages for readable diffs. Inspection does not adopt or resume threads. File changes describe native-reported edits, including rename destinations; shell or generator edits may be absent. Diff content is bounded and returned only when requested. ID-free `status` lists locally loaded direct-tool threads; use history or an explicit thread ID for other saved work.
+
+The direct tool exposes the same operations:
+
+```json
+{"action":"diagnose"}
+{"action":"history","limit":10,"searchTerm":"parser"}
+{"action":"details","threadId":"THREAD_ID","includeDiff":true,"limit":10}
+```
+
+Live execution context, current activity and structured plans appear in the progress view. A bounded latest-state widget continues updating when the transcript log is full. Failed-command output tails can contain sensitive application output; longer command output and file diffs are not automatically dumped.
+
+Versioned changes are recorded in [CHANGELOG.md](CHANGELOG.md). Install a reviewed release tag to pin deployment, and restart OMP after changing revisions.
+
+
 ## Inputs and lifecycle
 
 - Text, images, model-supported reasoning effort and object-valued JSON Schema output are forwarded to native APIs. Structured task output is validated before delivery. OMP's `forceReasoningOff` takes precedence over a requested effort.
@@ -101,7 +130,7 @@ bun run test:hub # native install, agent grants, branch/fork, dialogs, reload an
 
 Unit tests and Hub smoke tests use a protocol double, isolated homes and temporary state. They do not run model inference or use stored credentials. Each Hub fixture installs this checkout with the real `omp plugin install` command, then exercises actual RPC/TUI and child-agent behavior without a copied user agent. Hub tests require the supported `omp` executable on `PATH`. Additional modes live in `test/hub/smoke.mjs`; `test/hub/fixture.sh` opens an isolated manual fixture.
 
-Runtime responsibilities live under `src/codex/` (native app-server transport and thread/turn state) and `src/omp/` (OMP provider, tools, delivery receipts and lifecycle). Codex owns durable native history outside this package. `extensions/codex-bridge.ts` is the package entrypoint; tests stay under `test/` and are excluded from the package file list.
+Runtime responsibilities live under `src/codex/` (native transport, thread/turn ownership and side-effect-free `inspection.mjs`) and `src/omp/` (provider, receipts, operator commands and `presentation.ts` for cards/widgets). Byte budgets and screen-line limits stay separate. Codex owns durable native history outside this package. `extensions/codex-bridge.ts` is the package entrypoint; tests stay under `test/` and are excluded from the package file list.
 
 CI pins OMP 18.20.3 and runs the unit and isolated package/Hub checks without credentials. Release delivery is the reviewed source commit/tag plus the native local install above. No publishing workflow, registry token, generated bundle or preview channel is required. Re-run these gates before changing the compatibility target.
 

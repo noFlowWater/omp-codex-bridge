@@ -1,12 +1,13 @@
-// TEST-ONLY real-OMP smoke for the codex-bridge task agent: no model inference, no real Codex.
-// `bun test/hub/smoke.mjs <mode>`: TUI steering/revival, RPC questions/cancellation, rich output and lifecycle.
-// test-only orchestrator provider makes the parent emit one real `task` call spawning `codex-bridge`;
-// the child runs the production provider against the fake app-server. Assertions read the fake
-// server's protocol trace (what Codex would have received) plus OMP's own TUI paint (OMP_TUI_DEBUG
-// socket) or RPC responses. Painted frames are printed for review; their wording is not asserted
-// beyond the agent id. Exit 0 = all assertions held. OMP runs with HOME/XDG directories inside the
+// TEST-ONLY real-OMP smoke: no model inference, no real Codex.
+// `bun test/hub/smoke.mjs <mode>`: delegation/lifecycle plus operator, live progress and execution-card UX.
+// The orchestrator emits real task/direct-tool calls; native-root modes run the production provider.
+// Both paths use the fake app-server. Assertions read its protocol trace (what Codex would receive)
+// plus OMP's actual TUI document/paint (OMP_TUI_DEBUG socket) or RPC responses. New usability modes
+// assert rendered values, failure tails, structured state and read-only history after process restart.
+// Exit 0 = all assertions held. OMP runs with HOME/XDG directories inside the
 // fixture directory (see fixture.sh), which is removed on success and kept (path printed) on failure.
 import assert from "node:assert/strict";
+import { randomUUID } from "node:crypto";
 import { existsSync, mkdtempSync, readdirSync, readFileSync, realpathSync, rmSync } from "node:fs";
 import { createConnection } from "node:net";
 import { tmpdir } from "node:os";
@@ -14,8 +15,9 @@ import { join } from "node:path";
 import { createInterface } from "node:readline";
 
 const mode = process.argv[2] ?? "tui-steer";
-const QUESTION_MODES = ["rpc-question", "rpc-question-ask", "rpc-question-cancel", "rpc-question-headless", "rpc-elicitation", "rpc-async-question"];
-if (!["tui-steer", "tui-followup", "tui-kill", "tui-revive", "tui-question", "tui-clear", "rpc", "rpc-queued", "rpc-model", "rpc-removed-sandbox", "rpc-rich", "rpc-direct-rich", "rpc-lifecycle", "rpc-branches", ...QUESTION_MODES].includes(mode)) throw new Error(`unknown mode ${mode}`);
+const QUESTION_MODES = ["rpc-question", "rpc-question-secret", "rpc-question-ask", "rpc-question-cancel", "rpc-question-headless", "rpc-elicitation", "rpc-async-question"];
+const USABILITY_MODES = ["tui-operator", "tui-progress", "tui-execution"];
+if (!["tui-steer", "tui-followup", "tui-kill", "tui-revive", "tui-question", "tui-question-secret", "tui-progress-many", "tui-clear", "rpc", "rpc-queued", "rpc-model", "rpc-removed-sandbox", "rpc-rich", "rpc-direct-rich", "rpc-lifecycle", "rpc-branches", ...QUESTION_MODES, ...USABILITY_MODES].includes(mode)) throw new Error(`unknown mode ${mode}`);
 const AGENT = "codex-bridge";
 // rpc-model: the task item picks one concrete native model with OMP's per-call `model` selector. The fake
 // native model/list serves the real slug list in pages of 3; the grant comes from the production agent
@@ -26,6 +28,8 @@ const NATIVE_MODELS = ["gpt-6.1-sol", "gpt-6-astra", "gpt-6.1-terra", "gpt-6-sol
 const FIX = mkdtempSync(join(tmpdir(), "codex-hub-smoke-"));
 const SCRIPT = join(import.meta.dir, "fixture.sh");
 const CHILD = "CodexChild";
+const SECRET = randomUUID();
+const redact = (text) => text.replaceAll(SECRET, "[redacted fixture secret]");
 const STEER = "fixture steer: also list hidden files";
 // Short unique marker: the follow-up is typed into the idle focused child after its first native turn ended.
 const FOLLOWUP = "fixture-followup-42";
@@ -102,29 +106,49 @@ function assertSingleWorkspaceTurn(turns = 1, resumes = 0) {
 async function tui() {
   const socket = join(FIX, "tui.sock");
   const output = [];
-  const proc = Bun.spawn([SCRIPT], {
-    env: { ...process.env, CODEX_HUB_FIXTURE_DIR: FIX, OMP_TUI_DEBUG: socket, CODEX_HUB_FIXTURE_CONTEXT: CONTEXT,
-      ...(mode === "tui-question" ? { CODEX_HUB_FIXTURE_OPTIONS: '{"turns":["question"]}' } : {}),
-      ...(mode === "tui-clear" ? { CODEX_HUB_FIXTURE_ROOT_MODEL: "codex-bridge/default", CODEX_HUB_FIXTURE_OPTIONS: '{"turns":["rich-output","finish-later","finish-later"]}', CODEX_HUB_FIXTURE_KEEP_RECENT_TOKENS: "1" } : {}),
-    },
-    terminal: { cols: 160, rows: 48, data: (_terminal, data) => { output.push(new TextDecoder().decode(data)); } },
-  });
-  try {
+  const env = { ...process.env, CODEX_HUB_FIXTURE_DIR: FIX, OMP_TUI_DEBUG: socket, CODEX_HUB_FIXTURE_CONTEXT: CONTEXT,
+    ...(["tui-question", "tui-question-secret"].includes(mode) ? { CODEX_HUB_FIXTURE_OPTIONS: JSON.stringify({ turns: ["question"], questionIsSecret: mode === "tui-question-secret" }) } : {}),
+    ...(mode === "tui-progress-many" ? { CODEX_HUB_FIXTURE_CHILDREN: "3", CODEX_HUB_FIXTURE_OPTIONS: '{"turns":["usability-many","usability-many","usability-many"]}' } : {}),
+    ...(mode === "tui-clear" ? { CODEX_HUB_FIXTURE_ROOT_MODEL: "codex-bridge/default", CODEX_HUB_FIXTURE_OPTIONS: '{"turns":["rich-output","finish-later","finish-later"]}', CODEX_HUB_FIXTURE_KEEP_RECENT_TOKENS: "1" } : {}),
+    ...(USABILITY_MODES.includes(mode) ? { CODEX_HUB_FIXTURE_OPTIONS: '{"turns":["usability"]}' } : {}),
+    ...(["tui-operator", "tui-progress"].includes(mode) ? { CODEX_HUB_FIXTURE_ROOT_MODEL: "codex-bridge/default" } : {}),
+    ...(mode === "tui-execution" ? { CODEX_HUB_FIXTURE_DIRECT_JSON: JSON.stringify({ action: "run", prompt: "fixture execution card", effort: "high" }) } : {}),
+  };
+  let proc;
+  let connection;
+  let replies;
+  const stop = async () => {
+    connection?.destroy();
+    if (proc) {
+      proc.kill();
+      await proc.exited;
+      proc = undefined;
+    }
+  };
+  const start = async () => {
+    rmSync(socket, { force: true });
+    proc = Bun.spawn([SCRIPT], {
+      env,
+      terminal: { cols: 160, rows: 48, data: (_terminal, data) => { output.push(new TextDecoder().decode(data)); } },
+    });
     await until("TUI debug socket", () => existsSync(socket));
-    const connection = createConnection(socket);
-    const replies = createInterface({ input: connection })[Symbol.asyncIterator]();
-    // Bounded like the RPC calls: a stuck TUI fails the smoke instead of hanging it.
-    const reply = async (request) => {
-      connection.write(`${JSON.stringify(request)}\n`);
-      let timer;
-      const timeout = new Promise((_, reject) => { timer = setTimeout(() => reject(new Error(`tui ${request.op}: no reply in 15000 ms`)), 15000); });
-      try {
-        const { value } = await Promise.race([replies.next(), timeout]);
-        return { value, parsed: JSON.parse(value) };
-      } finally {
-        clearTimeout(timer);
-      }
-    };
+    connection = createConnection(socket);
+    replies = createInterface({ input: connection })[Symbol.asyncIterator]();
+  };
+  // Bounded like the RPC calls: a stuck TUI fails the smoke instead of hanging it.
+  const reply = async (request) => {
+    connection.write(`${JSON.stringify(request)}\n`);
+    let timer;
+    const timeout = new Promise((_, reject) => { timer = setTimeout(() => reject(new Error(`tui ${request.op}: no reply in 15000 ms`)), 15000); });
+    try {
+      const { value } = await Promise.race([replies.next(), timeout]);
+      return { value, parsed: JSON.parse(value) };
+    } finally {
+      clearTimeout(timer);
+    }
+  };
+  try {
+    await start();
     const ask = async (request) => {
       const { value, parsed } = await reply(request);
       assert.equal(parsed.ok, true, `${JSON.stringify(request)} -> ${value}`);
@@ -137,13 +161,175 @@ async function tui() {
     const painted = async () => (await ask({ op: "text" })).lines.join("\n");
     const showPainted = async (label) => console.log(`--- ${label} (painted) ---\n${await painted()}`);
     await until("first paint", async () => (await reply({ op: "text" })).parsed.ok);
+    // Framed Markdown can wrap a visible phrase across rows; keep its words, remove only frame padding.
+    const visibleText = (text) => text.split("\n").map(line => line.replace(/^\s*│ ?/, "").replace(/ ?│\s*$/, "").trim()).join(" ");
+    const enter = async (text) => {
+      await ask({ op: "paste", text });
+      await ask({ op: "keys", keys: "enter" });
+    };
+    const command = async (text, label) => {
+      const marker = label === "error" ? "Codex operator error:" : `Codex ${label} (read-only):`;
+      const before = (await screen()).split(marker).length - 1;
+      await enter(text);
+      return until(`${text} rendered result`, async () => {
+        const document = await screen();
+        return document.split(marker).length - 1 > before ? visibleText(document.slice(document.lastIndexOf(marker))) : undefined;
+      });
+    };
+    const mutationTrace = () => trace().filter(({ message }) =>
+      /^(thread\/(start|resume|fork|compact\/start)|turn\/(start|steer|interrupt))$/.test(message?.method ?? "")).map(({ message }) => message);
+    if (mode === "tui-operator") {
+      const doctor = await command("/codex doctor", "doctor");
+      assert.match(doctor, /codex-cli 0\.167\.2 \(test fixture\)/);
+      for (const section of ["connection", "auth", "models", "permissions", "steering", "requestedPermissions"]) assert.ok(doctor.includes(`"${section}"`), `doctor omitted ${section}`);
+      assert.match(doctor, /"readOnly"\s*:\s*true/);
+      assert.match(doctor, /"authenticated"\s*:\s*true/);
+      assert.ok(doctor.includes("fake-model") && doctor.includes("workspace-write"));
+      for (const secret of ["PRIVATE-EMAIL", "PRIVATE-WORKSPACE", "PRIVATE-INSTRUCTIONS", "PRIVATE-KEY", "PRIVATE-REQUIREMENTS-KEY"]) assert.ok(!doctor.includes(secret), `doctor exposed ${secret}`);
+      assert.ok(sent("account/read").every(params => params.refreshToken === false), "doctor must not refresh native authentication");
+      assert.deepEqual(mutationTrace(), [], "doctor cannot create, attach, fork, steer or interrupt native work");
+      await show("read-only native doctor before any turn");
+    }
 
     const clearBefore = "fixture-native-before-clear-29e5";
     const clearAfter = "fixture-native-after-clear-71a3";
     await ask({ op: "paste", text: mode === "tui-clear" ? clearBefore : "Run the Codex hub fixture." });
     await ask({ op: "keys", keys: "enter" });
     // The child provider reached the fake app-server; the `work` turn stays active.
-    await until("native turn/start", () => sent("turn/start").length === 1);
+    await until("native turn/start", () => sent("turn/start").length === (mode === "tui-progress-many" ? 3 : 1));
+    if (mode === "tui-progress-many") {
+      const turns = sent("turn/start");
+      const ids = turns.map(turn => turn.threadId);
+      assert.equal(new Set(ids).size, 3, "three independent native sessions must actually start");
+      const oldest = ids.reduce((first, id) => Number(id.slice(7)) < Number(first.slice(7)) ? id : first);
+      const live = await until("oldest session's latest update visible among three active sessions", async () => {
+        const text = await painted();
+        return text.includes("OLDEST SESSION LATEST ACTIVITY") && text.includes("1 more active Codex sessions omitted") ? text : undefined;
+      });
+      const headings = live.split("\n").filter(line => line.includes("Codex activity [inProgress]"));
+      assert.equal(headings.length, 2, "the real ten-row widget consumer shows the newest two sessions");
+      assert.ok(headings[0].includes(oldest), "the originally oldest session moves first when it updates last");
+      assert.ok(live.indexOf("OLDEST SESSION LATEST ACTIVITY") < live.indexOf(headings[1]), "latest activity belongs to the first visible session");
+      assert.ok(live.includes("requestedEffort=") && live.includes("effectiveEffort=unknown"));
+      assert.equal(sent("thread/start").length, 3);
+      assert.equal(sent("turn/start").length, 3);
+      assert.equal(sent("thread/resume").length, 0);
+      assert.equal(sent("turn/steer").length, 0);
+      assert.equal(sent("turn/interrupt").length, 0, "all three sessions stay active during the consumer assertion");
+      console.log(`--- newest activity in the official bounded multi-session widget ---\n${live}`);
+      return;
+    }
+    if (USABILITY_MODES.includes(mode)) {
+      const threadId = sent("turn/start")[0].threadId;
+      const nativeTurn = () => {
+        const path = join(FIX, "store.json");
+        return existsSync(path) && JSON.parse(readFileSync(path, "utf8")).threads[threadId]?.turns[0];
+      };
+      if (mode === "tui-progress") {
+        const live = await until("latest native activity painted after append-log cap", async () => {
+          const text = await painted();
+          return text.includes("LATEST NATIVE ACTIVITY") && text.includes("Progress log truncated; latest activity remains here.") ? text : undefined;
+        });
+        assert.match(live, /Codex activity \[inProgress\]/);
+        assert.ok(live.includes(threadId));
+        assert.ok(live.includes("model=fake-model"));
+        assert.ok(live.includes(`cwd=${realpathSync(join(FIX, "work"))}`));
+        assert.ok(live.includes("requestedEffort=") && live.includes("effectiveEffort=unknown"));
+        assert.ok(live.includes("Plan:") && live.includes("Inspect native output") && live.includes("Fix failing command"), "structured plan remains visible beyond the append-log cap");
+        const nativeCommands = nativeTurn().items.filter(item => item.type === "commandExecution").map(item => item.command ?? "").join("");
+        assert.ok(nativeCommands.length > 65536, "fixture command headers actually exceed the append-log capacity");
+        console.log(`--- latest activity beyond append-log cap (painted) ---\n${live}`);
+      }
+      await until("usability turn terminal failure", () => nativeTurn()?.status === "failed");
+      assert.equal(sent("turn/start").length, 1, "failed native work must not silently retry");
+      if (mode === "tui-execution") {
+        const beforeStatus = mutationTrace();
+        await enter(`fixture-execution-status:${threadId}`);
+        const card = await until("completed direct-tool execution card", async () => {
+          const text = await screen();
+          const index = text.lastIndexOf("Codex execution [failed]");
+          return index >= 0 ? text.slice(index) : undefined;
+        });
+        const cardText = visibleText(card);
+        for (const text of ["model=fake-model", `cwd=${realpathSync(join(FIX, "work"))}`, "requestedEffort=high", "effectiveEffort=unknown", threadId,
+          "LATEST NATIVE ACTIVITY", "Fix failing command", "old.txt", "new.txt", "Command failed: exit 17", "FAILURE TAIL", "second failure line"]) {
+          assert.ok(cardText.includes(text), `execution card omitted ${text}`);
+        }
+        assert.deepEqual(mutationTrace(), beforeStatus, "rendering the execution card must not start or resume native work");
+        console.log(`--- completed execution card ---\n${card}`);
+        return;
+      }
+      if (mode === "tui-operator") {
+        const beforeRestart = mutationTrace();
+        const savedStore = readFileSync(join(FIX, "store.json"), "utf8");
+        const spawns = trace().filter(entry => entry.spawn).length;
+        await stop();
+        await start();
+        await until("restarted first paint", async () => (await reply({ op: "text" })).parsed.ok);
+        const doctor = await command("/codex doctor", "doctor");
+        assert.match(doctor, /"readOnly"\s*:\s*true/);
+        const history = await command('/codex history {"limit":1}', "history");
+        assert.ok(history.includes(threadId), "saved native thread is discoverable after an actual OMP restart");
+        assert.match(history, /"readOnly"\s*:\s*true/);
+        assert.ok(trace().filter(entry => entry.spawn).length > spawns, "history is read by a new native process");
+        const details = await command(`/codex show ${threadId} {"includeItems":true,"includeDiff":true,"limit":3}`, "details");
+        for (const text of [threadId, "native-usability-command", "FAILURE TAIL", "second failure line", "old.txt", "new.txt", "NATIVE RENAME DIFF"]) {
+          assert.ok(details.includes(text), `restarted native details omitted ${text}`);
+        }
+        assert.match(details, /"exitCode"\s*:\s*17/);
+        assert.match(details, /"outputTruncated"\s*:\s*true/);
+        assert.match(details, /"diffTruncated"\s*:\s*true/);
+        assert.match(details, /"inspectionOnly"\s*:\s*true/);
+        assert.match(details, /"latestPlan"\s*:\s*null/, "notification-only plan must not be invented from native history");
+        const cursor = /"nextCursor"\s*:\s*"([^"]+)"/.exec(details)?.[1];
+        assert.ok(cursor, "large native item history exposes a continuation cursor");
+        const selectedTurnId = /"turnId"\s*:\s*"([^"]+)"/.exec(details)?.[1];
+        assert.ok(selectedTurnId, "native details expose the selected turn identity for item continuation");
+        let nextCursor = cursor;
+        let latestSeen = false;
+        let pages = 0;
+        while (nextCursor) {
+          assert.ok(++pages <= 5, "native item history pagination must terminate");
+          const next = await command(`/codex show ${threadId} ${JSON.stringify({ includeItems: true, turnId: selectedTurnId, cursor: nextCursor, limit: 100 })}`, "details");
+          latestSeen ||= next.includes("LATEST NATIVE ACTIVITY");
+          const cursorAfter = /"nextCursor"\s*:\s*"([^"]+)"/.exec(next)?.[1];
+          assert.notEqual(cursorAfter, nextCursor, "native history advances its item cursor");
+          if (!cursorAfter) assert.match(next, /"nextCursor"\s*:\s*null/);
+          nextCursor = cursorAfter;
+        }
+        assert.ok(latestSeen, "native history pagination reaches items beyond the progress cap");
+        const error = await command("/codex show missing-thread", "error");
+        assert.match(error, /"code"\s*:\s*-32600/, "native numeric RPC error code remains a JSON number");
+        assert.ok(error.includes("thread not found: missing-thread"));
+        assert.deepEqual(mutationTrace(), beforeRestart, "doctor/history/details after restart must never create, attach, replay, steer, fork or interrupt a thread");
+        assert.equal(readFileSync(join(FIX, "store.json"), "utf8"), savedStore, "read-only inspection leaves native saved history unchanged");
+        await show("read-only history and details after process restart");
+        return;
+      }
+      await until("terminal activity widget cleared", async () => !(await painted()).includes("Codex activity ["));
+      // Ctrl+T is OMP's official thinking display toggle, including retired transcript rows.
+      if (!(await screen()).includes("native execution:")) await ask({ op: "bytes", data: "\x14" });
+      const log = await until("native progress thinking displayed", async () => {
+        const text = await screen();
+        return text.includes("native execution:") ? text : undefined;
+      });
+      const logText = visibleText(log);
+      for (const text of ["model fake-model", "effective reasoning effort unknown", "[completed] Inspect native output",
+        "[inProgress] Fix failing command", "files completed: old.txt", "native-usability-command", "exit 17",
+        "command output tail (truncated); may contain sensitive data:", "FAILURE TAIL", "second failure line",
+        "64K-character append log limit reached"]) assert.ok(logText.includes(text), `native progress log omitted ${text}`);
+      assert.ok(!logText.includes("LATEST NATIVE ACTIVITY"), "append log is capped while the replacement widget showed newer native activity");
+      console.log(`--- bounded native progress and failure log ---\n${log}`);
+      const details = await command(`/codex show ${threadId} {"includeItems":true,"limit":3}`, "details");
+      assert.match(details, /"exitCode"\s*:\s*17/);
+      for (const text of ["FAILURE TAIL", "second failure line", "old.txt", "new.txt"]) assert.ok(details.includes(text), `native details omitted ${text}`);
+      assert.ok(!details.includes("NATIVE RENAME DIFF"), "native diffs remain opt-in");
+      assert.equal(sent("thread/resume").length, 0);
+      assert.equal(sent("turn/steer").length, 0);
+      assert.equal(sent("turn/start").length, 1);
+      await show("native failure output tail and file-change metadata");
+      return;
+    }
     if (mode === "tui-clear") {
       await until("first native root answer painted", async () => (await screen()).includes("final answer"));
       const sessionRoot = join(FIX, "home", ".omp", "agent", "sessions");
@@ -201,9 +387,33 @@ async function tui() {
     }
     await until("child row", async () => (await screen()).includes(CHILD));
     await show("main session with running child");
-    if (mode === "tui-question") {
+    if (mode === "tui-question" || mode === "tui-question-secret") {
       await until("root TUI question painted", async () => (await painted()).includes("Which environment?"));
       await showPainted("native question in main TUI");
+      if (mode === "tui-question-secret") {
+        const pasted = await reply({ op: "paste", text: SECRET });
+        assert.equal(pasted.parsed.ok, true, "secret paste accepted");
+        const masked = await until("secret input visibly masked", async () => {
+          const text = await painted();
+          assert.ok(!text.includes(SECRET), "secret input must not appear in the painted dialog");
+          return text.includes("•".repeat(SECRET.length)) ? text : undefined;
+        });
+        assert.ok(masked.includes("Which environment?"), "masking assertion targets the native question dialog");
+        await ask({ op: "keys", keys: "enter" });
+        const response = await until("secret answer reaches native request", () => trace().find(({ message }) => message?.id === 901 && !message.method)?.message);
+        assert.ok(response.result?.answers?.environment?.answers?.[0] === SECRET, "the native request receives the exact secret");
+        const sessionRoot = join(FIX, "home", ".omp", "agent", "sessions");
+        const journals = await until("root and child transcripts persisted after secret answer", () => {
+          if (!existsSync(sessionRoot)) return;
+          const paths = readdirSync(sessionRoot, { recursive: true }).filter(name => name.endsWith(".jsonl")).map(name => join(sessionRoot, name));
+          return paths.length >= 2 && paths.some(path => readFileSync(path, "utf8").includes("question answered")) ? paths : undefined;
+        });
+        for (const path of journals) assert.ok(!readFileSync(path, "utf8").includes(SECRET), "OMP root and child transcripts must not retain the secret answer");
+        assert.ok(!(await screen()).includes(SECRET), "main transcript must not display the secret answer");
+        assert.ok(!output.join("").includes(SECRET), "raw terminal paint must never emit the secret answer");
+        assertSingleWorkspaceTurn();
+        return;
+      }
       await ask({ op: "keys", keys: "enter" });
       const response = await until("TUI answer reaches native request", () => trace().find(({ message }) => message?.id === 901 && !message.method)?.message);
       assert.deepEqual(response.result, { answers: { environment: { answers: ["Staging"] } } });
@@ -311,11 +521,10 @@ async function tui() {
     assertSingleWorkspaceTurn(mode === "tui-followup" ? 2 : 1);
   } catch (error) {
     // The last terminal output shows boot or extension-load errors behind an early failure.
-    console.error(`--- last PTY output ---\n${output.join("").slice(-4096)}`);
+    console.error(`--- last PTY output ---\n${redact(output.join("")).slice(-4096)}`);
     throw error;
   } finally {
-    proc.kill();
-    await proc.exited;
+    await stop();
   }
 }
 
@@ -329,7 +538,7 @@ async function rpc() {
       ...(SELECTOR ? { CODEX_HUB_FIXTURE_MODEL: SELECTOR, CODEX_HUB_FIXTURE_OPTIONS: JSON.stringify({ turns: ["work"], models: NATIVE_MODELS, modelPageSize: 3 }) } : {}),
       // rpc-removed-sandbox: the parent calls the direct codex_bridge tool with the removed `sandbox` argument.
       ...(mode === "rpc-removed-sandbox" ? { CODEX_HUB_FIXTURE_DIRECT_SANDBOX: "read-only" } : {}),
-      ...(QUESTION_MODES.includes(mode) ? { CODEX_HUB_FIXTURE_OPTIONS: JSON.stringify({ turns: [mode === "rpc-elicitation" ? "elicitation" : mode === "rpc-async-question" ? "async-question" : "question"], questionIsOther: mode === "rpc-question-ask" }) } : {}),
+      ...(QUESTION_MODES.includes(mode) ? { CODEX_HUB_FIXTURE_OPTIONS: JSON.stringify({ turns: [mode === "rpc-elicitation" ? "elicitation" : mode === "rpc-async-question" ? "async-question" : "question"], questionIsOther: mode === "rpc-question-ask", questionIsSecret: mode === "rpc-question-secret" }) } : {}),
       ...(mode === "rpc-rich" ? { CODEX_HUB_FIXTURE_OPTIONS: '{"turns":["rich-output"]}', CODEX_HUB_FIXTURE_STRUCTURED: "true", CODEX_HUB_FIXTURE_SCHEMA: JSON.stringify(OUTPUT_SCHEMA), CODEX_HUB_FIXTURE_ENABLE_EFFORT: "true", CODEX_HUB_FIXTURE_EFFORT: "hi" } : {}),
       ...(mode === "rpc-direct-rich" ? { CODEX_HUB_FIXTURE_OPTIONS: '{"turns":["rich-output"]}', CODEX_HUB_FIXTURE_DIRECT_JSON: JSON.stringify(DIRECT_RICH) } : {}),
       ...(mode === "rpc-lifecycle" ? { CODEX_HUB_FIXTURE_OPTIONS: '{"turns":["finish-later","rich-output","finish-later","finish-later","finish-later"]}', CODEX_HUB_FIXTURE_KEEP_RECENT_TOKENS: "1" } : {}),
@@ -372,11 +581,11 @@ async function rpc() {
   const assertChildFinished = async (child) => {
     const ended = await until("child task finished", () => frames.find((frame) =>
       frame.type === "subagent_lifecycle" && frame.payload?.id === child.id && frame.payload.status !== "started"), 30000);
-    assert.equal(ended.payload.status, "completed", JSON.stringify(ended.payload));
+    assert.equal(ended.payload.status, "completed", redact(JSON.stringify(ended.payload)));
     const listed = (await call({ type: "get_subagents" })).data.subagents.find((agent) => agent.id === child.id);
     assert.ok(!listed || !["running", "pending"].includes(listed.status), `child still ${listed?.status}`);
     const cancelled = await call({ type: "cancel_subagent", subagentId: child.id });
-    assert.equal(cancelled.success, true, JSON.stringify(cancelled));
+    assert.equal(cancelled.success, true, redact(JSON.stringify(cancelled)));
     assert.equal(cancelled.data.cancelled, false, "a finished child has nothing to cancel");
     await Bun.sleep(1000);
     assert.equal(sent("turn/interrupt").length, 0);
@@ -561,9 +770,22 @@ async function rpc() {
         return;
       }
       const question = await until("root UI question", () => frames.find(frame => frame.type === "extension_ui_request" && ["ask", "select", "input"].includes(frame.method)));
-      assert.equal(question.method, mode === "rpc-question-ask" ? "ask" : "select", "closed native choices must not expose unsupported custom input");
+      assert.equal(question.method, mode === "rpc-question-secret" ? "input" : mode === "rpc-question-ask" ? "ask" : "select", "native question uses the appropriate official dialog");
       await until("main settled with child question pending", idle);
       assert.ok(!frames.some(frame => frame.method === "cancel" && frame.targetId === question.id), "main turn end must not cancel child question");
+      if (mode === "rpc-question-secret") {
+        assert.equal(question.secret, true, "official RPC input request carries the secret masking flag");
+        respondUI(question, { value: SECRET });
+        const response = await until("secret RPC answer reaches native request", () => nativeResponse(901));
+        assert.ok(response.result?.answers?.environment?.answers?.[0] === SECRET, "only the native request receives the exact secret");
+        await assertChildFinished(child);
+        const root = await call({ type: "get_messages" });
+        const entries = await call({ type: "get_entries" });
+        const childMessages = await call({ type: "get_subagent_messages", subagentId: child.id });
+        assert.ok(!JSON.stringify([root.data, entries.data, childMessages.data, frames]).includes(SECRET), "RPC root/child transcripts and emitted events must not expose the secret answer");
+        assertSingleWorkspaceTurn();
+        return;
+      }
       if (mode === "rpc-question-cancel") {
         assert.equal((await call({ type: "cancel_subagent", subagentId: child.id })).success, true);
         await until("official RPC dialog cancellation", () => frames.find(frame => frame.type === "extension_ui_request" && frame.method === "cancel" && frame.targetId === question.id));

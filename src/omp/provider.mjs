@@ -1,6 +1,7 @@
 // Command-backed OMP provider: one Codex app-server thread per OMP provider session.
 // Codex owns inference, native tools, approvals and its persisted thread; OMP receives only
 // assistant events. Native activity streams as a thinking block, never as executable OMP tool calls.
+import { stripANSI } from 'bun';
 import { CodexAppServerClient } from '../codex/client.mjs';
 import { CODEX_BRIDGE_PROVIDER, CODEX_BRIDGE_API, CODEX_BRIDGE_MODELS, DEFAULT_MODEL_ID, parseCodexModelId, fetchCodexModels } from './catalog.mjs';
 import { inputId, inputBlocks, textOf, nativeInputs, nativeEffort, nativeOutputSchema, responseId, anchorOf } from './input.mjs';
@@ -14,6 +15,8 @@ const SANDBOX = 'workspace-write';
 const TERMINAL = new Set(['completed', 'failed', 'interrupted', 'disconnected']);
 const LINE_CHARS = 2000;
 const PROGRESS_CHARS = 64 * 1024;
+const FAILURE_TAIL_CHARS = 1200;
+const PROGRESS_LIMIT_NOTICE = '\n[codex] 64K-character append log limit reached (65,536 characters). Latest activity and plan continue in the status widget; codex_bridge status also exposes the latest state.';
 // Sent ids are never evicted (an evicted id could be resent); a full record stops new sends.
 const SENT_LIMIT = 5000;
 // Classification text for every error this provider reports. OMP auto-retry classifies errors
@@ -42,7 +45,7 @@ function applyUsage(output, state) {
 }
 
 
-const clip = (text, limit) => text.length > limit ? `${text.slice(0, limit)}…` : text;
+const clip = (text, limit) => text.length > limit ? `${text.slice(0, limit - 1)}…` : text;
 
 
 function lastAssistant(messages, provider) {
@@ -52,12 +55,31 @@ function lastAssistant(messages, provider) {
   }
   return undefined;
 }
+function planLine(plan) {
+  if (!plan) return undefined;
+  const steps = (plan.plan ?? []).slice(0, 12).map(({ step, status }) => `[${status}] ${clip(step, 120)}`);
+  if ((plan.plan?.length ?? 0) > steps.length) steps.push(`… ${plan.plan.length - steps.length} more steps`);
+  return clip(`plan${plan.explanation ? `: ${clip(plan.explanation, 300)}` : ''}\n${steps.join('\n')}`, LINE_CHARS);
+}
 
-function progressLine(method, params) {
+function commandLine(item, failure) {
+  const header = `$ ${clip(item.command ?? '', 400)} → ${item.status}${item.exitCode == null ? '' : ` (exit ${item.exitCode})`}`;
+  if (item.status !== 'failed' && !(typeof item.exitCode === 'number' && item.exitCode !== 0)) return header;
+  const output = failure?.itemId === item.id ? failure.outputTail : item.aggregatedOutput;
+  if (!output) return header;
+  const truncated = failure?.itemId === item.id ? failure.outputTruncated : item.outputTruncated;
+  const tail = stripANSI(output).replace(/[\u0000-\u0008\u000b-\u001f\u007f-\u009f]/g, '');
+  return `${header}\ncommand output tail${truncated || tail.length > FAILURE_TAIL_CHARS ? ' (truncated)' : ''}; may contain sensitive data:\n${tail.slice(-FAILURE_TAIL_CHARS)}`;
+}
+
+
+function progressLine(method, params, state) {
   if (method === 'thread/tokenUsage/updated' && params.tokenUsage?.modelContextWindow != null) {
     return `native context ${params.tokenUsage.last.totalTokens}/${params.tokenUsage.modelContextWindow} tokens`;
   }
   if (method === 'turn/started') return `turn ${params.turn?.id ?? ''} started`;
+  if (method === 'turn/completed') return `turn ${params.turn?.id ?? ''} ${params.turn?.status ?? 'ended'}`;
+  if (method === 'turn/plan/updated') return planLine(params);
   if (method === 'error') return `error: ${params.error?.message ?? 'Codex reported an error'}`;
   if (method === 'model/rerouted') return `model rerouted ${params.fromModel} → ${params.toModel} (${params.reason})`;
   const item = params.item;
@@ -72,7 +94,7 @@ function progressLine(method, params) {
     case 'agentMessage': return item.phase === 'final_answer' ? undefined : item.text;
     case 'reasoning': return item.summary?.length ? item.summary.join('\n') : undefined;
     case 'plan': return `plan: ${item.text}`;
-    case 'commandExecution': return `$ ${item.command} → ${item.status}${item.exitCode == null ? '' : ` (exit ${item.exitCode})`}`;
+    case 'commandExecution': return commandLine(item, state?.commandFailure);
     case 'fileChange': return `files ${item.status}: ${(item.changes ?? []).map(change => change.path).join(', ')}`;
     case 'mcpToolCall': return `mcp ${item.server}.${item.tool} → ${item.status}`;
     case 'userMessage': return undefined;
@@ -91,7 +113,7 @@ function progressLine(method, params) {
  * written before each native mutation, so a crash, dispose, revive or OMP requeue never sends
  * the same input to Codex twice.
  */
-export function createCodexBridgeProvider({ EventStream, stateDir, onRequest, createClient = options => new CodexAppServerClient(options) }) {
+export function createCodexBridgeProvider({ EventStream, stateDir, onRequest, onProgress, createClient = options => new CodexAppServerClient(options) }) {
   if (typeof stateDir !== 'string' || !stateDir) throw new TypeError('stateDir must be a nonempty path');
   const sessions = new Map();
   // Latest drive per session, and the teardown a reopened session must await.
@@ -104,6 +126,9 @@ export function createCodexBridgeProvider({ EventStream, stateDir, onRequest, cr
   // Fresh OMP branches inherit delivery receipts, then fork native history on first new input.
   const branchedSessions = new Map();
   const delay = (ms) => new Promise(resolveDelay => setTimeout(resolveDelay, ms).unref?.());
+  const reportProgress = (sessionId, status) => {
+    try { onProgress?.(sessionId, status); } catch { /* UI observers cannot break native work. */ }
+  };
   // Bound for each teardown wait (run's interrupt admission, native turn settling).
   const CLOSE_WAIT_MS = 10_000;
 
@@ -121,6 +146,7 @@ export function createCodexBridgeProvider({ EventStream, stateDir, onRequest, cr
     const providerState = {
       close() {
         if (sessions.get(sessionId) === session) sessions.delete(sessionId);
+        reportProgress(sessionId, undefined);
         session.sink = undefined;
         // OMP closes right after aborting a run; killing the app-server now could leave the native
         // turn unconfirmed (and the revived child stopped). Let the run's interrupt land and the
@@ -485,34 +511,80 @@ export function createCodexBridgeProvider({ EventStream, stateDir, onRequest, cr
     const { threadId, turnId } = session;
     if (!threadId || !turnId) return finish('error', 'Codex native turn identity is unknown; not resubmitted');
 
-    // Progress: one thinking block of Codex-origin activity, numbered lines.
+    // Progress: one bounded append-only thinking block; the official UI widget replaces latest state.
     let progress;
     let progressChars = 0;
+    let logTruncated = false;
     let lines = 0;
-    const note = (line) => {
-      if (!line || progressChars >= PROGRESS_CHARS) return;
+    let activity = null;
+    let plan = null;
+    const publish = (state = client.snapshot(threadId)) => {
+      if (state?.latestPlan) plan = planLine(state.latestPlan);
+      reportProgress(options.sessionId, {
+        threadId, turnId, status: state?.status ?? 'unknown', activity, plan,
+        execution: state?.execution ?? {
+          model: state?.model ?? null, cwd: state?.cwd ?? null, requestedReasoningEffort: null,
+        },
+        logTruncated,
+      });
+    };
+    const append = (delta) => {
       if (!progress) {
         progress = { type: 'thinking', thinking: '' };
         output.content.push(progress);
         stream.push({ type: 'thinking_start', contentIndex: 0, partial: output });
       }
-      const delta = `${progress.thinking ? '\n' : ''}[codex ${++lines}] ${clip(line, LINE_CHARS)}`;
       progressChars += delta.length;
       progress.thinking += delta;
       stream.push({ type: 'thinking_delta', contentIndex: 0, delta, partial: output });
     };
+    const note = (line) => {
+      if (!line || logTruncated) return;
+      const delta = `${progress?.thinking ? '\n' : ''}[codex ${++lines}] ${clip(line, LINE_CHARS)}`;
+      // Reserve the explicit ceiling notice; never grow the transcript beyond its original cap.
+      if (progressChars + delta.length > PROGRESS_CHARS - PROGRESS_LIMIT_NOTICE.length) {
+        logTruncated = true;
+        append(PROGRESS_LIMIT_NOTICE);
+        return;
+      }
+      append(delta);
+    };
     const sink = (method, params) => {
       if ((params?.turnId ?? params?.turn?.id) !== turnId) return;
-      try { note(progressLine(method, params)); } catch { /* malformed item: no progress line */ }
+      try {
+        const state = client.snapshot(threadId);
+        const line = progressLine(method, params, state);
+        if (line && method !== 'thread/tokenUsage/updated') activity = clip(line, LINE_CHARS);
+        if (method === 'turn/plan/updated') plan = planLine(params);
+        note(line);
+        publish(state);
+      } catch { /* malformed item: no progress line */ }
     };
-    // Events that arrived before admission returned are replayed from the client's bounded
-    // retained events; the live sink takes over in the same synchronous step, so none is lost or doubled.
-    for (const event of client.snapshot(threadId)?.events ?? []) sink(event.method, event.params);
-    session.sink = sink;
-    const initialUsage = client.snapshot(threadId);
-    if (initialUsage?.tokenUsageTurnId === turnId && initialUsage.tokenUsage) {
-      note(progressLine('thread/tokenUsage/updated', { tokenUsage: initialUsage.tokenUsage }));
+    const initial = client.snapshot(threadId);
+    // Snapshot activity initializes replay only; a newer live event must never be replaced by an older snapshot field.
+    if (initial?.latestActivity) {
+      const latest = initial.latestActivity;
+      const line = progressLine(latest.method, latest.params, initial);
+      if (line) activity = clip(line, LINE_CHARS);
     }
+    const execution = initial?.execution ?? initial;
+    note(`native execution: model ${clip(execution?.model ?? 'unknown (Codex default)', 200)}; cwd ${clip(execution?.cwd ?? 'unknown', 1000)}; requested reasoning effort ${execution?.requestedReasoningEffort ?? 'unknown (Codex default request)'}; effective reasoning effort unknown`);
+    // Replay the bounded event window, then recover semantic state even when its event was evicted.
+    for (const event of initial?.events ?? []) sink(event.method, event.params);
+    if (initial?.latestPlan && !(initial.events ?? []).some(event => event.method === 'turn/plan/updated' && event.params?.turnId === turnId)) {
+      note(planLine(initial.latestPlan));
+    }
+    if (initial?.commandFailure && !(initial.events ?? []).some(event => event.params?.item?.id === initial.commandFailure.itemId && event.method === 'item/completed')) {
+      note(commandLine({
+        id: initial.commandFailure.itemId, command: initial.commandFailure.command,
+        status: 'failed', exitCode: initial.commandFailure.exitCode,
+      }, initial.commandFailure));
+    }
+    session.sink = sink;
+    if (initial?.tokenUsageTurnId === turnId && initial.tokenUsage) {
+      note(progressLine('thread/tokenUsage/updated', { tokenUsage: initial.tokenUsage }));
+    }
+    publish(initial);
 
     const ended = new AbortController();
     let abortDetail;
@@ -594,6 +666,7 @@ export function createCodexBridgeProvider({ EventStream, stateDir, onRequest, cr
       return finish('error', `Codex native turn ${turnId} failed${detail || ': no error message'}`);
     } finally {
       ended.abort();
+      reportProgress(options.sessionId, undefined);
       if (session.sink === sink) session.sink = undefined;
     }
   }

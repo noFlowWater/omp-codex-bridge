@@ -131,6 +131,7 @@ async function withHost(options, store, body) {
     const api = {
       zod,
       registerTool: (tool) => tools.set(tool.name, tool),
+      registerCommand: () => {},
       registerProvider: (name, config) => providers.set(name, config),
       // Several registrations of one event all run, as in the host.
       on: (event, handler) => {
@@ -148,7 +149,7 @@ async function withHost(options, store, body) {
     const ctx = new Proxy({
       cwd,
       mode: 'json', hasUI: false,
-      ui: { notify() {} },
+      ui: { notify() {}, setWidget() {} },
       sessionManager: {
         getSessionId: () => agent ? `${agent}-child` : 'fixture-main',
         getBranch: () => [], getEntry: () => undefined,
@@ -1464,7 +1465,7 @@ function lifecycleContext(sessionId, model, initial = []) {
   const notices = [];
   let aborted = false;
   const ctx = {
-    cwd, model, ui: { notify: (message, type) => notices.push({ message, type }) },
+    cwd, model, ui: { notify: (message, type) => notices.push({ message, type }), setWidget() {} },
     notices, abort: () => { aborted = true; }, get aborted() { return aborted; },
     setEntries: value => { entries = value; },
     sessionManager: {
@@ -1691,7 +1692,7 @@ test('root switch aborts its open native UI request and old child cannot acquire
     let replacementRequests = 0;
     const replacement = {
       ...ctx, sessionManager: { ...ctx.sessionManager, getSessionId: () => 'new-root' },
-      ui: { notify() {}, select: async () => { replacementRequests++; return 'Production'; } },
+      ui: { notify() {}, setWidget() {}, select: async () => { replacementRequests++; return 'Production'; } },
     };
     await handlers.get('session_switch')?.({ type: 'session_switch', reason: 'resume' }, replacement);
     const second = await stream(providers, { messages: [task, first.message, at('old-root second question', 34000)] }, { sessionId: 'old-root-child' });
@@ -2533,4 +2534,154 @@ test('extracted storage retains legacy session filenames, serialized fields and 
   } finally {
     rmSync(dir, { recursive: true, force: true });
   }
+});
+
+// Consumer-only double: native projection is tested in client.test.mjs; these snapshots match its public contract.
+async function progressConsumer({ initial = {}, updates = [], finalText = '{"ok":true}', onProgress } = {}) {
+  const dir = mkdtempSync(join(tmpdir(), 'codex-progress-consumer-'));
+  const sessionId = 'progress-consumer';
+  const state = {
+    threadId: 'T-progress', turnId: 'U-progress', status: 'inProgress', events: [],
+    model: 'gpt-6.1-sol', cwd, text: `partial answer\n${finalText}`, finalText,
+    execution: { model: 'gpt-6.1-sol', cwd, requestedReasoningEffort: null },
+    latestActivity: null, latestPlan: null, commandFailure: null, ...initial,
+  };
+  let request;
+  let notifications;
+  let scheduled = false;
+  const listeners = new Set();
+  const provider = createCodexBridgeProvider({
+    EventStream: AssistantMessageEventStream, stateDir: dir, onProgress,
+    createClient(options) {
+      notifications = options.onNotification;
+      return {
+        snapshot: () => structuredClone(state),
+        run: async options => { request = options; options.onThread(state.threadId); return structuredClone(state); },
+        subscribe(listener) {
+          listeners.add(listener);
+          if (!scheduled) {
+            scheduled = true;
+            setTimeout(() => {
+              for (const { method, params, semantic } of updates) {
+                Object.assign(state, semantic);
+                if (params.turnId === state.turnId && !Object.hasOwn(semantic ?? {}, 'latestActivity')) state.latestActivity = { method, params, at: Date.now() };
+                notifications(method, params);
+                for (const notify of listeners) notify({ threadId: state.threadId, turnId: state.turnId, status: state.status });
+              }
+              state.status = 'completed';
+              const params = { threadId: state.threadId, turn: { id: state.turnId, status: state.status } };
+              notifications('turn/completed', params);
+              for (const notify of listeners) notify({ threadId: state.threadId, turnId: state.turnId, status: state.status });
+            }, 0);
+          }
+          return () => listeners.delete(listener);
+        },
+        close: async () => {},
+      };
+    },
+  });
+  provider.context({}, lifecycleContext(sessionId, DEFAULT_MODEL, [
+    { id: 'progress-init', parentId: null, type: 'session_init', outputSchema: RESULT_SCHEMA },
+  ]));
+  try {
+    const events = [];
+    for await (const event of provider(DEFAULT_MODEL, { messages: [at('progress contract', 42)], tools: [structuredYield] }, { sessionId, cwd })) {
+      events.push(event);
+      if (event.type === 'done' || event.type === 'error') break;
+    }
+    const final = events.at(-1);
+    return { events, final, message: final.type === 'done' ? final.message : final.error, request };
+  } finally {
+    await provider.closeAll();
+    rmSync(dir, { recursive: true, force: true });
+  }
+}
+
+test('provider recovers evicted semantic plan and failed command tail without polluting strict final JSON', async () => {
+  const statuses = [];
+  const outputTail = `OLD OUTPUT ${'x'.repeat(4000)}\n\u001b[31mDECISIVE FAILURE\u001b[0m\u001b]0;unsafe title\u0007\u0000\u0008\u000d\u0085\n\tuseful detail`;
+  const initial = {
+    execution: { model: 'gpt-6.1-sol', cwd, requestedReasoningEffort: 'high' },
+    latestPlan: { turnId: 'U-progress', explanation: 'Inspect and fix', plan: [
+      { step: 'Inspect', status: 'completed' }, { step: 'Fix', status: 'inProgress' },
+    ] },
+    commandFailure: { itemId: 'failed-command', command: 'check', exitCode: 17, outputTail, outputTruncated: true },
+    latestActivity: { method: 'item/completed', params: { turnId: 'U-progress', item: {
+      id: 'failed-command', type: 'commandExecution', command: 'check', status: 'failed', exitCode: 17,
+    } }, at: 1 },
+  };
+  const { message, final, request } = await progressConsumer({ initial, onProgress: (_session, status) => statuses.push(structuredClone(status)) });
+  assert.equal(final.type, 'done', message.errorMessage);
+  assert.deepEqual(request.outputSchema, RESULT_SCHEMA);
+  assert.deepEqual(message.content.find(block => block.type === 'toolCall').arguments, { data: { ok: true } });
+  assert.equal(textOf(message), 'partial answer\n{"ok":true}');
+  const thinking = message.content.find(block => block.type === 'thinking').thinking;
+  assert.equal(thinking.match(/native execution:/g).length, 1);
+  assert.match(thinking, /turn U-progress completed/);
+  assert.match(thinking, /model gpt-6\.1-sol; cwd .*; requested reasoning effort high; effective reasoning effort unknown/);
+  assert.match(thinking, /\[completed\] Inspect\n\[inProgress\] Fix/);
+  assert.match(thinking, /command output tail \(truncated\); may contain sensitive data:/);
+  assert.match(thinking, /DECISIVE FAILURE/);
+  assert.match(thinking, /DECISIVE FAILURE\n\tuseful detail/);
+  assert.doesNotMatch(thinking, /[\u0000-\u0008\u000b-\u001f\u007f-\u009f]|unsafe title/);
+  assert.doesNotMatch(thinking, /OLD OUTPUT/);
+  assert.ok(statuses.some(status => status?.plan?.includes('[inProgress] Fix')));
+  assert.ok(statuses.some(status => status?.activity?.includes('DECISIVE FAILURE')));
+  assert.ok(statuses.every(status => !status?.activity || !/[\u0000-\u0008\u000b-\u001f\u007f-\u009f]|unsafe title/.test(status.activity)));
+  assert.equal(initial.commandFailure.outputTail, outputTail, 'display cleaning does not rewrite raw native details');
+  assert.equal(statuses.at(-1), undefined);
+});
+
+test('provider explicitly caps append log while replacing latest activity and plan beyond the cap', async () => {
+  const statuses = [];
+  const params = item => ({ threadId: 'T-progress', turnId: 'U-progress', item });
+  const latestPlan = { turnId: 'U-progress', explanation: 'LATEST PLAN', plan: [
+    { step: 'Latest task', status: 'inProgress' },
+  ] };
+  const updates = [
+    ...Array.from({ length: 60 }, (_, id) => ({
+      method: 'item/completed', params: params({ id: `noise-${id}`, type: 'reasoning', summary: ['noise '.repeat(500)] }),
+    })),
+    { method: 'turn/plan/updated', params: { threadId: 'T-progress', ...latestPlan }, semantic: { latestPlan } },
+    { method: 'item/started', params: params({ id: 'latest', type: 'commandExecution', command: 'LATEST NATIVE ACTIVITY' }) },
+    { method: 'item/started', params: { turnId: 'other-turn', item: { type: 'commandExecution', command: 'FOREIGN ACTIVITY' } } },
+    {
+      method: 'model/rerouted',
+      params: { threadId: 'T-progress', turnId: 'U-progress', fromModel: 'gpt-6.1-sol', toModel: 'gpt-6-astra', reason: 'capacity' },
+      // Even a snapshot with older semantic activity must not overwrite this newer live notification.
+      semantic: { latestActivity: { method: 'item/started', params: params({
+        id: 'latest', type: 'commandExecution', command: 'LATEST NATIVE ACTIVITY',
+      }), at: 1 } },
+    },
+    {
+      method: 'thread/tokenUsage/updated',
+      params: { threadId: 'T-progress', turnId: 'U-progress', tokenUsage: { last: { totalTokens: 10 }, modelContextWindow: 1000 } },
+    },
+  ];
+  const { events, message, final } = await progressConsumer({ updates, onProgress: (_session, status) => statuses.push(structuredClone(status)) });
+  assert.equal(final.type, 'done', message.errorMessage);
+  const thinking = message.content.find(block => block.type === 'thinking').thinking;
+  assert.ok(thinking.length <= 64 * 1024);
+  assert.equal(thinking.match(/64K-character append log limit reached/g).length, 1);
+  assert.match(thinking, /requested reasoning effort unknown \(Codex default request\)/);
+  assert.doesNotMatch(thinking, /LATEST PLAN|LATEST NATIVE ACTIVITY|FOREIGN ACTIVITY|model rerouted/);
+  assert.ok(statuses.some(status => status?.logTruncated && status.activity?.includes('LATEST NATIVE ACTIVITY') && status.plan?.includes('LATEST PLAN')));
+  assert.ok(statuses.every(status => !status || (status.activity?.length ?? 0) <= 2000 && (status.plan?.length ?? 0) <= 2000));
+  assert.ok(statuses.every(status => !status?.activity?.includes('FOREIGN ACTIVITY')));
+  const rerouteIndex = statuses.findIndex(status => status?.logTruncated && status.activity?.includes('model rerouted gpt-6.1-sol → gpt-6-astra (capacity)'));
+  assert.ok(rerouteIndex >= 0, 'new reroute replaces older activity after append cap');
+  assert.match(statuses[rerouteIndex + 1].activity, /model rerouted gpt-6\.1-sol → gpt-6-astra/);
+  assert.ok(statuses.every(status => !status || status.execution.model === 'gpt-6.1-sol'), 'routing display never changes bound model identity');
+  assert.equal(events.filter(event => event.type === 'thinking_start').length, 1);
+  assert.equal(events.filter(event => event.type === 'thinking_end').length, 1);
+  assert.equal(textOf(message), 'partial answer\n{"ok":true}');
+  assert.deepEqual(message.content.find(block => block.type === 'toolCall').arguments, { data: { ok: true } });
+  assert.equal(statuses.at(-1), undefined);
+});
+
+test('progress never relaxes structured final JSON validation', async () => {
+  const { final, message } = await progressConsumer({ finalText: '{"ok":true,"unexpected":true}' });
+  assert.equal(final.type, 'error');
+  assert.match(message.errorMessage, /invalid structured data/);
+  assert.ok(message.content.every(block => block.type !== 'toolCall'));
 });

@@ -1,6 +1,6 @@
 {
   "name": "omp-codex-bridge",
-  "version": "0.2.0",
+  "version": "0.3.0",
   "description": "Run Codex app-server workers in Oh My Pi's Agent Hub.",
   "type": "module",
   "license": "MIT",
@@ -14,14 +14,14 @@
     "bun": ">=1.4.2"
   },
   "keywords": ["omp", "oh-my-pi", "codex", "app-server", "agents"],
-  "files": ["extensions", "agents", "src", "README.md", "LICENSE"],
+  "files": ["extensions", "agents", "src", "README.md", "CHANGELOG.md", "LICENSE"],
   "omp": {
     "extensions": ["./extensions/codex-bridge.ts"]
   },
   "scripts": {
-    "test": "node --test test/client.test.mjs && bun test ./test/provider.test.mjs",
+    "test": "node --test test/client.test.mjs && bun test ./test/provider.test.mjs ./test/operator.test.mjs",
     "test:package": "bun test/package.mjs",
-    "test:hub": "bun run test:package && bun test/hub/smoke.mjs rpc && bun test/hub/smoke.mjs rpc-model && bun test/hub/smoke.mjs rpc-lifecycle && bun test/hub/smoke.mjs rpc-branches && bun test/hub/smoke.mjs rpc-elicitation && bun test/hub/smoke.mjs tui-question && bun test/hub/smoke.mjs tui-clear"
+    "test:hub": "bun test/hub/run.mjs"
   },
   "devDependencies": {
     "ajv": "8.20.0",

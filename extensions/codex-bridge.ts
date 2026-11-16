@@ -4,6 +4,9 @@ import { join } from "node:path";
 import { CODEX_BRIDGE_API, CODEX_BRIDGE_MODELS, CODEX_BRIDGE_PROVIDER, createCodexBridgeProvider, fetchCodexModels } from "../src/omp/provider.mjs";
 import { captureRoot, releaseRoot, createRequestParsers, onRequest } from "../src/omp/dialogs.ts";
 import { registerDirectTool } from "../src/omp/direct-tool.ts";
+import { createProgressDisplay } from "../src/omp/presentation.ts";
+
+const progressDisplay = createProgressDisplay();
 
 // Module scope: every session's factory registers this one function, so the process-global
 // custom-API entry (last registration wins) always reaches the full per-session table.
@@ -12,6 +15,7 @@ const streamSimple = createCodexBridgeProvider({
   EventStream: AssistantMessageEventStream,
   stateDir: process.env.OMP_CODEX_BRIDGE_STATE_DIR || join(getAgentDir(), "codex-bridge-state"),
   onRequest,
+  onProgress: progressDisplay.update,
 });
 
 export default function (pi: ExtensionAPI) {
@@ -32,18 +36,25 @@ export default function (pi: ExtensionAPI) {
   const shutdown = registerDirectTool(pi);
   let preparedBranch;
 
-  pi.on("session_start", (_event, ctx) => captureRoot(ctx, parsers));
+  pi.on("session_start", (_event, ctx) => {
+    captureRoot(ctx, parsers);
+    progressDisplay.capture(ctx);
+  });
   pi.on("session_switch", async (event, ctx) => {
     const stopped = shutdown();
     if (event.reason === "fork") streamSimple.adoptBranch(preparedBranch, ctx);
     preparedBranch = undefined;
     captureRoot(ctx, parsers);
+    progressDisplay.capture(ctx);
     await stopped;
   });
   pi.on("session_before_switch", async (event, ctx) => {
     preparedBranch = event.reason === "fork" ? await streamSimple.prepareBranch(event, ctx) : undefined;
     if (preparedBranch?.cancel) return { cancel: true };
-    if (ctx.agent.kind === "main") releaseRoot();
+    if (ctx.agent.kind === "main") {
+      releaseRoot();
+      progressDisplay.release(ctx);
+    }
     await streamSimple.close(ctx.sessionManager.getSessionId());
   });
   pi.on("session_before_branch", async (event, ctx) => {
@@ -56,8 +67,12 @@ export default function (pi: ExtensionAPI) {
     streamSimple.adoptBranch(preparedBranch, ctx);
     preparedBranch = undefined;
     captureRoot(ctx, parsers);
+    progressDisplay.capture(ctx);
   });
-  pi.on("before_agent_start", (_event, ctx) => captureRoot(ctx, parsers));
+  pi.on("before_agent_start", (_event, ctx) => {
+    captureRoot(ctx, parsers);
+    progressDisplay.capture(ctx);
+  });
   pi.on("session_before_compact", (event, ctx) => streamSimple.beforeCompact(event, ctx));
   pi.on("session_compact", (event, ctx) => streamSimple.afterCompact(event, ctx));
   pi.on("session_before_tree", (event, ctx) => streamSimple.beforeTree(event, ctx));
@@ -65,11 +80,17 @@ export default function (pi: ExtensionAPI) {
   pi.on("context", (event, ctx) => streamSimple.context(event, ctx));
   pi.on("before_provider_request", (event, ctx) => streamSimple.beforeProviderRequest(event, ctx));
   pi.on("session_clear", async (_event, ctx) => {
-    if (ctx.agent.kind === "main") releaseRoot();
+    if (ctx.agent.kind === "main") {
+      releaseRoot();
+      progressDisplay.release(ctx);
+    }
     await streamSimple.clear(ctx.sessionManager.getSessionId());
   });
   pi.on("session_shutdown", async (_event, ctx) => {
-    if (ctx?.agent.kind === "main") releaseRoot(ctx);
+    if (ctx?.agent.kind === "main") {
+      releaseRoot(ctx);
+      progressDisplay.release(ctx);
+    }
     if (ctx) await streamSimple.close(ctx.sessionManager.getSessionId());
     await shutdown();
   });

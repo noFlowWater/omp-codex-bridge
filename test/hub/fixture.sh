@@ -18,7 +18,14 @@ NODE=$(command -v node)
 # CODEX_HUB_FIXTURE_DIR (an existing empty directory) replaces the mktemp directory; smoke.mjs uses it.
 FIX=${CODEX_HUB_FIXTURE_DIR:-$(mktemp -d "${TMPDIR:-/tmp}/codex-hub-fixture.XXXXXX")}
 mkdir -p "$FIX/bin" "$FIX/work" "$FIX/home" "$FIX/xdg/config" "$FIX/xdg/data" "$FIX/xdg/state" "$FIX/xdg/cache" "$FIX/tmp"
-printf '#!/bin/sh\nexec "%s" "%s" --fake-app-server\n' "$NODE" "$REPO/test/client.test.mjs" > "$FIX/bin/codex"
+cat > "$FIX/bin/codex" <<EOF
+#!/bin/sh
+if [ "\${1:-}" = "--version" ]; then
+  printf '%s\n' 'codex-cli 0.167.2 (test fixture)'
+  exit 0
+fi
+exec "$NODE" "$REPO/test/client.test.mjs" --fake-app-server
+EOF
 chmod 755 "$FIX/bin/codex"
 DEFAULT_OPTIONS='{"turns":["work"]}'
 printf '%s\n' "${CODEX_HUB_FIXTURE_OPTIONS:-$DEFAULT_OPTIONS}" > "$FIX/options.json"
@@ -64,6 +71,7 @@ exec env -i \
   TERM="${TERM:-xterm-256color}" LANG="${LANG:-C.UTF-8}" ${LC_ALL:+LC_ALL="$LC_ALL"} \
   ${OMP_TUI_DEBUG:+OMP_TUI_DEBUG="$OMP_TUI_DEBUG"} \
   ${CODEX_HUB_FIXTURE_CONTEXT:+CODEX_HUB_FIXTURE_CONTEXT="$CODEX_HUB_FIXTURE_CONTEXT"} \
+  ${CODEX_HUB_FIXTURE_CHILDREN:+CODEX_HUB_FIXTURE_CHILDREN="$CODEX_HUB_FIXTURE_CHILDREN"} \
   ${CODEX_HUB_FIXTURE_MODEL:+CODEX_HUB_FIXTURE_MODEL="$CODEX_HUB_FIXTURE_MODEL"} \
   ${CODEX_HUB_FIXTURE_DIRECT_SANDBOX:+CODEX_HUB_FIXTURE_DIRECT_SANDBOX="$CODEX_HUB_FIXTURE_DIRECT_SANDBOX"} \
   ${CODEX_HUB_FIXTURE_DIRECT_JSON:+CODEX_HUB_FIXTURE_DIRECT_JSON="$CODEX_HUB_FIXTURE_DIRECT_JSON"} \
