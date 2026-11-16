@@ -1,6 +1,6 @@
 {
   "name": "omp-codex-bridge",
-  "version": "0.6.3",
+  "version": "0.6.4",
   "description": "Run Codex app-server workers in Oh My Pi's Agent Hub.",
   "type": "module",
   "license": "MIT",

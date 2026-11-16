@@ -17,7 +17,8 @@ export function errorDetails(error: unknown, threadId?: string) {
   else if (code === "ENOENT") remedy = "Install Codex and make the codex executable available on OMP's PATH; then run /codex doctor.";
   else if (/auth|login|unauthorized|401/i.test(text)) remedy = "Check native Codex login outside this bridge, then run /codex doctor. No credentials are changed here.";
   else if (code === -32601) remedy = "This native API is unsupported by the installed Codex version. Check /codex doctor and update Codex if needed.";
-  else if (code === "THREAD_NOT_OWNED") remedy = "Inspect with /codex show THREAD_ID. To work again, start a new thread without threadId; inspection never grants ownership.";
+  else if (code === "THREAD_NOT_OWNED") remedy = "Inspect with /codex show THREAD_ID. To preserve saved context through a finished turn, use /codex fork THREAD_ID, then run the returned continuation arguments. Or start a new thread without threadId. Inspection never grants ownership.";
+  else if (code === "ABORT_ERR") remedy = "Inspect /codex status THREAD_ID before continuing; an interruption request alone does not confirm native completion. No input is replayed automatically.";
   else if (/permission|sandbox|approval/i.test(text)) remedy = "Inspect /codex doctor permissions and native policy. The bridge does not relax permissions or retry admission.";
   else if (/model/i.test(text)) remedy = "Inspect /codex doctor models and select a model available to the signed-in native account.";
   return {

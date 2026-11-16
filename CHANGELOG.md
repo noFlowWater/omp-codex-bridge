@@ -1,5 +1,12 @@
 # Changelog
 
+## 0.6.4 — 2026-11-17
+
+- Wait for direct native turns in print text/JSON mode so CLI disposal cannot interrupt a merely admitted task; return terminal output once and forward deadline cancellation.
+- Explain that `/codex` commands run in the main session and how to return from a focused Hub child.
+- Explain how to fork through a finished turn and use the returned continuation arguments when a direct thread is no longer locally owned.
+- Add an executable structured-output example with object-schema constraints and admission/result guidance.
+
 ## 0.6.3 — 2026-11-17
 
 - Keep interactive operator payloads in message details and send compact summaries as model context; retain expanded JSON, explicit `--json` and headless structured output.

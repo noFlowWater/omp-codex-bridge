@@ -88,7 +88,30 @@ export function registerDirectTool(pi: ExtensionAPI, options: { onRateLimits?: (
     return undefined;
   }
 
-  async function run(params: { threadId?: string; prompt?: string; input?: unknown[]; cwd: string; model?: string; effort?: string; outputSchema?: unknown; name?: string; serviceTier?: string }, signal?: AbortSignal) {
+  async function waitForTerminal(active: CodexAppServerClient, threadId: string, signal?: AbortSignal) {
+    if (TERMINAL.has(active.snapshot(threadId)?.status)) return;
+    await new Promise<void>((resolve, reject) => {
+      let unsubscribe = () => {};
+      const cancelled = () => Object.assign(new Error("Call cancelled while waiting for native completion; inspect status before continuing."), { name: "AbortError", code: "ABORT_ERR", threadId });
+      const finish = (error?: unknown) => {
+        unsubscribe();
+        signal?.removeEventListener("abort", abort);
+        if (error === undefined) resolve(); else reject(error);
+      };
+      const check = () => { if (TERMINAL.has(active.snapshot(threadId)?.status)) finish(signal?.aborted ? cancelled() : undefined); };
+      const abort = () => {
+        void active.cancel(threadId).then(
+          () => finish(cancelled()),
+          error => finish(Object.assign(error, { threadId })),
+        );
+      };
+      unsubscribe = active.subscribe(event => { if (event.threadId === threadId) check(); });
+      signal?.addEventListener("abort", abort, { once: true });
+      if (signal?.aborted) abort(); else check();
+    });
+  }
+
+  async function run(params: { threadId?: string; prompt?: string; input?: unknown[]; cwd: string; model?: string; effort?: string; outputSchema?: unknown; name?: string; serviceTier?: string }, signal?: AbortSignal, waitForCompletion = false) {
     // A shutdown/session switch during admission replaces the client; the old continuation
     // must not touch the new session's ownership, delivery or hold state.
     const admissionBarrier = closeBarrier;
@@ -96,13 +119,17 @@ export function registerDirectTool(pi: ExtensionAPI, options: { onRateLimits?: (
     if (admissionBarrier !== closeBarrier) throw new Error("Session changed before native admission; nothing was sent");
     // Local ownership prevents accidental attachment; it cannot detect external writers.
     if (params.threadId && !owned.has(params.threadId)) {
-      throw Object.assign(new Error(`Thread ${params.threadId} was not started by this session's Codex server; local ownership is required to continue it. External writers cannot be ruled out. Inspect it with status, or run without threadId to start a new thread`), { threadId: params.threadId, code: "THREAD_NOT_OWNED" });
+      throw Object.assign(new Error(`Thread ${params.threadId} was not started by this session's Codex server; local ownership is required to continue it. External writers cannot be ruled out. Inspect it with status. To preserve saved context through a finished turn, fork this thread and run the returned continuation arguments; or run without threadId to start a new thread`), { threadId: params.threadId, code: "THREAD_NOT_OWNED" });
     }
     runsInFlight++;
     try {
       const { name, ...native } = params;
-      const result = await active.run({ ...native, signal });
+      let result = await active.run({ ...native, signal });
       const nameWarning = await nameThread(active, result.threadId, name);
+      if (waitForCompletion) {
+        await waitForTerminal(active, result.threadId, signal);
+        result = active.snapshot(result.threadId) ?? result;
+      }
       return { ...(client === active ? reported(result.threadId) : summarizeRun(result)), ...(nameWarning ? { nameWarning } : {}) };
     } catch (error) {
       if (client !== active) throw error;
@@ -190,7 +217,7 @@ export function registerDirectTool(pi: ExtensionAPI, options: { onRateLimits?: (
   pi.registerTool({
     name: "codex_bridge",
     label: "Codex bridge agent",
-    description: "Direct native Codex control, outside Agent Hub. For Agent Hub delegation, spawn agent codex-bridge. run starts or continues a locally owned thread; active turns receive steering. fork creates a locally owned direct thread through a finished source boundary (completed, failed or interrupted), preserving source cwd and original history, with no inference; continue via run. Uses parent's cwd unless isolation requested. Inherits native Codex permissions/environment; optional OMP_CODEX_BRIDGE_CONFIG JSON provides operator-set native overrides. Approval requests require explicit user confirmation; unavailable UI declines them. run accepts prompt/native input, effort, outputSchema, optional name and native serviceTier for a new turn only. Omitted serviceTier preserves native defaults; availability, quota use and cost depend on the account/model. Returns bounded execution/activity/plan/file-change metadata; terminal results arrive as follow-ups. status reads retained state; diagnose inspects native availability. history and details inspect saved native history without ownership/resume/replay. includeDiff explicitly includes bounded native diff which may expose secrets and is not a complete audit. cancel interrupts a locally loaded thread. shutdown closes this session's server.",
+    description: "Direct native Codex control, outside Agent Hub. For Agent Hub delegation, spawn agent codex-bridge. run starts or continues a locally owned thread; active turns receive steering. fork creates a locally owned direct thread through a finished source boundary (completed, failed or interrupted), preserving source cwd and original history, with no inference; continue via run. Uses parent's cwd unless isolation requested. Inherits native Codex permissions/environment; optional OMP_CODEX_BRIDGE_CONFIG JSON provides operator-set native overrides. Approval requests require explicit user confirmation; unavailable UI declines them. run accepts prompt/native input, effort, outputSchema, optional name and native serviceTier for a new turn only. Omitted serviceTier preserves native defaults; availability, quota use and cost depend on the account/model. Returns bounded execution/activity/plan/file-change metadata. Print text/JSON run waits and returns terminal output; interactive TUI/RPC run returns admission and terminal results arrive as follow-ups. status reads retained state; diagnose inspects native availability. history and details inspect saved native history without ownership/resume/replay. includeDiff explicitly includes bounded native diff which may expose secrets and is not a complete audit. cancel interrupts a locally loaded thread. shutdown closes this session's server.",
     parameters: z.object({
       action: z.enum(["run", "fork", "status", "diagnose", "history", "details", "cancel", "shutdown"]),
       threadId: z.string().min(1).optional(),
@@ -242,7 +269,7 @@ export function registerDirectTool(pi: ExtensionAPI, options: { onRateLimits?: (
               outputSchema: params.outputSchema,
               name: params.name,
               serviceTier: params.serviceTier,
-            }, signal);
+            }, signal, ctx.mode === "json" || ctx.mode === "print");
             break;
           case "fork":
             if (!params.threadId) throw new Error("fork requires threadId");
@@ -269,6 +296,7 @@ export function registerDirectTool(pi: ExtensionAPI, options: { onRateLimits?: (
         return { content: [{ type: "text", text: JSON.stringify(result, null, 2) }], details: result };
       } catch (error) {
         const failure = errorDetails(error, params.threadId);
+        if (signal?.aborted && (ctx.mode === "json" || ctx.mode === "print")) console.error(`Codex print call cancelled: ${failure.error}`);
         return { content: [{ type: "text", text: JSON.stringify(failure, null, 2) }], details: failure, isError: true };
       }
     },

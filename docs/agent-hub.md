@@ -10,6 +10,8 @@ Ask the main assistant to delegate to `codex-bridge`, or use the task tool:
 
 Open Agent Hub with `Alt+A` or double left-arrow on an empty editor. Focus the child to inspect its progress and send messages; Hub `x` interrupts it. A follow-up to the same child continues its native thread.
 
+Run `/codex` diagnostics and inspection commands in the main session. From a focused child, press double left-arrow on an empty editor to return to the main session first.
+
 OMP task/session names are copied to native thread names on the next request. Child task identity supplies the name when no session title exists. Naming is metadata-only; a title failure does not replay or reject task input.
 
 Running-turn steering requires OMP's `providers.openaiLiveSteering` setting. With it disabled, a message is queued for the next native turn. Installation does not enable this setting.

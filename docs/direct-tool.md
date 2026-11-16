@@ -8,11 +8,34 @@
 {"action":"run","cwd":"/absolute/project","model":"gpt-6.1-sol","prompt":"Inspect the parser without edits."}
 ```
 
-A successful `run` acknowledges admission. Terminal results arrive as follow-ups. Inspect retained text, events and usage with:
+In the interactive TUI and RPC, a successful `run` acknowledges admission and terminal results arrive as follow-ups. In print mode (`-p`, text or JSON), `run` waits for the native turn to finish and returns its terminal state and retained answer directly, without a duplicate follow-up. This wait does not require `--wait-async`; `--max-time` cancellation interrupts the native turn. Inspect retained text, events and usage with:
 
 ```json
 {"action":"status","threadId":"<returned-thread-id>"}
 ```
+
+For print automation, prefer `--mode json` and check the tool result's `isError` and terminal `status`. OMP 18.21 can exit zero after a tool is cancelled by `--max-time`; a process exit code alone does not prove completion. The bridge reports cancellation on stderr and as `ABORT_ERR` when its wait is cancelled. Read `status` to confirm the native outcome; an interrupt acknowledgement alone is not completion.
+
+For a structured final answer, start a new turn with `outputSchema` (replace `cwd` with your project directory):
+
+```json
+{
+  "action": "run",
+  "cwd": "/absolute/project",
+  "prompt": "Do not use tools or access files. Return an object with ok=true and count=3.",
+  "outputSchema": {
+    "type": "object",
+    "properties": {
+      "ok": { "type": "boolean" },
+      "count": { "type": "integer" }
+    },
+    "required": ["ok", "count"],
+    "additionalProperties": false
+  }
+}
+```
+
+The schema must be an object; boolean schemas such as `true` are unsupported. This example requires both fields and excludes additional fields. In TUI/RPC, use the returned thread ID with `status` or wait for its terminal follow-up; print mode waits within the tool call. When completed, its final answer is JSON text such as `{"ok":true,"count":3}`. Set `outputSchema` only when starting a new turn; omit it from live follow-ups.
 
 Cancellation during admission is checked before submitting a new turn. If a new turn has already been submitted when its caller aborts, the bridge requests interruption; the interruption request alone does not prove native completion. A confirmed submission still returns its thread/turn identity, with any interruption failure in the snapshot, so cancellation cannot make accepted input look undelivered. Retained text preserves final answers ahead of partial prose at its size limit and reports when content or message separators exceed that limit.
 
@@ -38,6 +61,8 @@ The response returns the new thread ID and continuation arguments. Forking copie
 ## Inspect and diagnose
 
 Use OMP's `/codex` command without starting model work:
+
+These commands run in the main session. If focused on a Hub child, press double left-arrow on an empty editor to return first.
 
 ```text
 /codex doctor

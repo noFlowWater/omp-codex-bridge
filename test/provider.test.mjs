@@ -155,7 +155,7 @@ async function withHost(options, store, body) {
     await extension(new Proxy(api, { get: (target, key) => (key in target ? target[key] : anything) }));
     const ctx = new Proxy({
       cwd,
-      mode: 'json', hasUI: false,
+      mode: options.ompMode ?? 'rpc', hasUI: false,
       ui: { notify() {}, setStatus() {} },
       sessionManager: {
         getSessionId: () => agent ? `${agent}-child` : 'fixture-main',
@@ -319,6 +319,33 @@ test('direct run inherits native policy and exposes no model-controlled sandbox 
   });
 }, TIMEOUT);
 
+for (const mode of ['json', 'print']) {
+  test(`direct ${mode} calls wait for terminal output without a duplicate follow-up`, async () => {
+    await withHost({ ompMode: mode, turns: ['rich-output'] }, undefined, async ({ call, followUps, dir }) => {
+      const result = await call({ action: 'run', prompt: 'structured print', outputSchema: RESULT_SCHEMA });
+      assert.equal(result.isError, false);
+      assert.equal(result.json.status, 'completed');
+      assert.deepEqual(JSON.parse(result.json.text.split('\n').at(-1)), { ok: true });
+      assert.equal(followUps.length, 0, 'terminal output is already in the waiting tool response');
+      assert.equal(sentParams(dir, 'turn/start').length, 1);
+    });
+  }, TIMEOUT);
+}
+
+test('direct print cancellation interrupts its native turn and releases the waiting tool', async () => {
+  await withHost({ ompMode: 'json', turns: ['hold'] }, undefined, async ({ tool, ctx, dir, followUps }) => {
+    const controller = new AbortController();
+    const pending = tool.execute('print-cancel', { action: 'run', prompt: 'wait for cancellation', name: 'Print cancellation' }, controller.signal, undefined, ctx);
+    await until(() => sentParams(dir, 'thread/name/set').length === 1);
+    controller.abort();
+    const result = await pending;
+    assert.equal(result.isError, true);
+    assert.equal(result.details.code, 'ABORT_ERR');
+    assert.equal(sentParams(dir, 'turn/interrupt').length, 1);
+    assert.equal(followUps.length, 0);
+  });
+}, TIMEOUT);
+
 test('run never resumes a thread this server lifecycle did not start, including its own after shutdown', async () => {
   const store = { nextThread: 0, nextTurn: 100, threads: { 'saved-thread': { id: 'saved-thread', cwd, turns: [] } } };
   await withHost({}, store, async ({ call, followUps, dir }) => {
@@ -327,6 +354,9 @@ test('run never resumes a thread this server lifecycle did not start, including 
       assert.equal(result.json.code, 'THREAD_NOT_OWNED');
       assert.match(result.json.error, /was not started by this session's Codex server/);
       assert.match(result.json.error, /run without threadId to start a new thread/);
+      assert.match(result.json.error, /fork this thread and run the returned continuation arguments/);
+      assert.match(result.json.remedy, /\/codex fork THREAD_ID/);
+      assert.match(result.json.remedy, /through a finished turn/);
     };
     notOwned(await call({ action: 'run', threadId: 'saved-thread', prompt: 'must not run', cwd }));
     assert.deepEqual(mutations(dir), [], 'no thread/resume or turn/start');
