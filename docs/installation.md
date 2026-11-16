@@ -12,15 +12,27 @@ Command-driven Hub management and saved-history continuation additionally requir
 
 ## Install
 
+The current release is **v0.8.0**. Pin it when installing:
+
 ```sh
-git clone https://github.com/noflowwater/omp-codex-bridge.git
+git clone --branch v0.8.0 https://github.com/noflowwater/omp-codex-bridge.git
 cd omp-codex-bridge
 omp plugin install .
 ```
 
 OMP's native package discovery loads both `extensions/codex-bridge.ts` and `agents/codex-bridge.md`. The installed package's agent has user scope, so its exact frontmatter model selectors can grant per-call selection. No separate agent copy, symlink, installer, build, daemon or npm publication is needed.
 
-Local installation links the whole package into OMP's user plugin directory. Keep the checkout at that path. To pin a deployment, check out a reviewed Git commit or tag before installing. Update with `git pull --ff-only` (or check out another reviewed revision), then restart OMP. Local links have nothing for `omp plugin upgrade` to download.
+Local installation links the whole package into OMP's user plugin directory. Keep the checkout at that path. To upgrade a release-pinned checkout, first preserve any local changes, then run:
+
+```sh
+git fetch origin --tags
+git switch --detach v0.8.0
+omp plugin install .
+```
+
+Restart OMP after updating. For a checkout tracking `main`, use `git pull --ff-only` instead of switching tags. Local links have nothing for `omp plugin upgrade` to download.
+
+To use command-driven Hub controls, follow the [host patch build and installation steps](../patches/README.md), then start a new session with `omp-codex-hub`. The standard `omp` remains available. `/codex doctor` reports whether the current host exposes Hub controls; the plugin version alone does not establish host support.
 
 Uninstall with `omp plugin uninstall omp-codex-bridge`, then restart OMP. This removes the plugin registration and package link. It keeps the checkout, native Codex history and bridge receipts.
 

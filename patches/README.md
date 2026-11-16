@@ -35,6 +35,16 @@ bun packages/coding-agent/scripts/build-binary.ts
 
 The new executable is `$host_root/packages/coding-agent/dist/omp`; the source checkout and build stay under `$build_root`. Install this plugin through that executable and launch a new session. Stock OMP remains available for existing sessions. For other platforms, use the matching upstream native addon and build instructions.
 
+Give this build a separate command name. The following explicitly installs or replaces your dedicated `omp-codex-hub` build, without replacing `omp`:
+
+```sh
+install -D -m755 "$host_root/packages/coding-agent/dist/omp" "$HOME/.local/bin/omp-codex-hub"
+"$HOME/.local/bin/omp-codex-hub" plugin install "$bridge_root"
+"$HOME/.local/bin/omp-codex-hub"
+```
+
+Add `$HOME/.local/bin` to your shell's `PATH` if you want to use the shorter `omp-codex-hub` command. Updating the bridge checkout does not rebuild this separate host; rebuild it if the packaged host patch changes.
+
 CI runs the stock-host checks first, then checks out the pinned source, applies this packaged patch, extracts the exact stock addon, builds the separate host, and runs both patched-host cases below. These cases therefore run in CI rather than relying on the stock-host feature-detection skip.
 
 Validate the patched executable without credentials or model inference:

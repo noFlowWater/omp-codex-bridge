@@ -7,6 +7,7 @@
 - Continue saved history through a selected finished turn as a fresh Hub child after explicit question submission. Keep source history unchanged, fork context inside its child provider and never replay source transcripts or uncertain forks.
 - Page older finished boundaries and separate history selection, worker selection, host controls and durable fork admission into focused modules.
 - Ship an optional patch for the pinned OMP 18.21.0 host API; stock hosts retain direct-worker controls and report missing Hub controls explicitly.
+- Align release-pinned installation, command help, picker cancellation guidance and the separate `omp-codex-hub` setup with v0.8.0.
 
 ## 0.7.0 — 2026-11-17
 

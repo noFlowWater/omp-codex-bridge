@@ -6,6 +6,8 @@
 
 Run [Codex](https://github.com/openai/codex) workers in [Oh My Pi](https://github.com/can1357/oh-my-pi)'s Agent Hub.
 
+Current release: [v0.8.0](https://github.com/noFlowWater/omp-codex-bridge/releases/tag/v0.8.0). See the [changelog](CHANGELOG.md) for changes and [installation guide](docs/installation.md) for upgrades.
+
 The bridge connects OMP to `codex app-server --stdio`. Codex handles inference, tools, authentication and persistent threads. OMP handles delegation, live progress, steering and results.
 
 ## Features
@@ -23,7 +25,7 @@ Requires **OMP 18.21.0** and an authenticated **Codex CLI 0.169.0** on `PATH`. T
 
 ```sh
 codex login
-git clone https://github.com/noFlowWater/omp-codex-bridge.git
+git clone --branch v0.8.0 https://github.com/noFlowWater/omp-codex-bridge.git
 cd omp-codex-bridge
 omp plugin install .
 ```
@@ -47,6 +49,18 @@ The installed plugin links to this checkout. Keep it in place. For version pinni
 | Command: `/codex` | Worker picker, diagnostics, saved history, forks and processing tier |
 
 Start with `/codex doctor` to check the connection without model inference. Use `/codex history` to browse saved conversations.
+
+| Command | Purpose |
+| --- | --- |
+| `/codex doctor` | Check connection, login and quota |
+| `/codex status [THREAD_ID]` | Inspect thread status; no ID lists local direct threads |
+| `/codex jobs` | Select, inspect and control current workers |
+| `/codex history` | Browse saved threads and choose how to continue |
+| `/codex show THREAD_ID` | Inspect a saved thread |
+| `/codex fork THREAD_ID` | Create a direct thread without inference |
+| `/codex tier` | Choose this session's OpenAI processing tier |
+
+Add `--json` immediately after a subcommand for raw data. Closing a picker produces `Cancelled.` and submits no work.
 
 `/codex jobs` lists current direct workers and offers details, messages and interruption without copying IDs. Hub controls and **Continue in Agent Hub** require the host API supplied by the [optional OMP patch](patches/README.md). Stock OMP 18.21.0 keeps direct-worker controls and existing Agent Hub delegation; doctor reports the missing API. The plugin never silently replaces your host.
 

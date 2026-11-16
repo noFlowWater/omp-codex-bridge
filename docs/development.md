@@ -25,6 +25,10 @@ Runtime responsibilities live under `src/codex/` (native transport, thread/turn 
 
 CI pins OMP 18.21.0 and runs the unit and isolated package/Hub checks without credentials. Release delivery is the reviewed source commit/tag plus the native local install above. No publishing workflow, registry token, generated bundle or preview channel is required. Re-run these gates before changing the compatibility target.
 
+## Releases
+
+The package version, top changelog entry, README release link and installation tag must identify the same release (currently **0.8.0**). Check both stock-host and patched-host CI before tagging the reviewed commit. Push an annotated `vVERSION` tag without moving existing tags, then publish the matching GitHub release with compatibility requirements, host-patch setup and known limits. GitHub source archives include the packaged host patch; no compiled host binary is distributed by this project. Local package installs follow their checkout and need an OMP restart after updates.
+
 ## JavaScript maintenance conventions
 
 Use named functions for stable operations and modules with one concrete responsibility. Keep the session owner and its mutable maps together; extract formatting and independent form interactions. Prefer guard clauses and ordinary control flow over nested conditionals. Build display tables from structured fields, keeping native payloads separate from their rendering.
