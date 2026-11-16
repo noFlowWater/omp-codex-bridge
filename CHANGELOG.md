@@ -4,6 +4,7 @@
 
 - Focus the README on installation and first use; move detailed integration, configuration and development guides into `docs/`.
 - Include the documentation guides in the package file list.
+- Shorten native model labels; document token usage and billing limits outside the status line.
 
 ## 0.5.1
 

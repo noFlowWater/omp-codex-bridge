@@ -1101,9 +1101,6 @@ test('a thread/start timeout leaves nothing delivered: the next message starts a
   });
 }, TIMEOUT);
 
-test('R7: provider labels unknown subscription cost and native usage availability', () => {
-  for (const model of CODEX_BRIDGE_MODELS) assert.match(model.name, /native usage when available; cost unknown/);
-});
 
 
 test('a second request while the first is still awaiting admission sends nothing', async () => {
@@ -1174,7 +1171,6 @@ test('fetchDynamicModels lists every native model page as one exact profile each
     assert.deepEqual(config.models.map(({ id }) => id), ['default']);
     const models = await config.fetchDynamicModels(undefined);
     assert.deepEqual(models.map(({ id }) => id), ['default', ...NATIVE_MODELS]);
-    for (const model of models) assert.match(model.name, /cost unknown/);
     for (const model of models.slice(1)) assert.ok(model.name.includes(model.id), model.name);
     assert.ok(sentParams(dir, 'model/list').length >= 3, 'all pages read');
     assert.deepEqual(mutations(dir), [], 'discovery never starts a thread or turn');
@@ -1504,7 +1500,6 @@ test('native catalog capabilities and measured context window become model metad
     assert.equal(model.contextWindow, 200000);
     assert.equal(model.reasoning, true);
     assert.deepEqual(model.input, ['text', 'image']);
-    assert.match(model.name, /cost unknown/);
   }
 });
 

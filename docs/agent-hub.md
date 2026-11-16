@@ -36,6 +36,14 @@ The native OMP footer shows `Codex N active · Alt+A`; Agent Hub owns per-worker
 
 Native quota events generate one warning on exhaustion and an informational notice on observed recovery, shared across concurrent workers. Reset times appear when reported. Sparse or unavailable fields do not imply recovery; there is no quota polling or automatic retry.
 
+### Tokens and cost
+
+Model labels show only the native provider and selected model. Native token counts appear when reported.
+
+The [app-server API](https://learn.chatgpt.com/docs/app-server) reports token usage and account limits, not a per-turn billed amount. Its model catalog does not include prices. OMP's zero-valued price fields are placeholders for unavailable pricing, not a claim that execution is free.
+
+The [official pricing page](https://learn.chatgpt.com/docs/pricing) publishes token-based credit rates and links to API pricing. Those rates can support estimates; included subscription usage, purchased credits, processing tier and plan-specific billing determine the actual charge. Check the native usage dashboard for account usage.
+
 ## Inputs and lifecycle
 
 - Text, images, model-supported reasoning effort and object-valued JSON Schema output are forwarded to native APIs. Structured task output is validated before delivery. OMP's `forceReasoningOff` takes precedence over a requested effort.
