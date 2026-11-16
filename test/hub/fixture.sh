@@ -56,10 +56,9 @@ compaction:
 EOF
 echo "codex-hub-fixture: $FIX (trace: $FIX/trace.jsonl, isolated home: $FIX/home)" >&2
 cd "$FIX/work"
-# The orchestrator spawns the single `codex-bridge` agent (workspace-write in the child cwd), or with
-# CODEX_HUB_FIXTURE_DIRECT_SANDBOX calls the direct `codex_bridge` tool (then also enabled) with that removed argument.
+# The orchestrator delegates a native worker or invokes the direct tool with explicit fixture input.
 TOOLS=task
-if [ -n "${CODEX_HUB_FIXTURE_DIRECT_SANDBOX:-}${CODEX_HUB_FIXTURE_DIRECT_JSON:-}" ]; then TOOLS=task,codex_bridge; fi
+if [ -n "${CODEX_HUB_FIXTURE_DIRECT_JSON:-}" ]; then TOOLS=task,codex_bridge; fi
 # Test-only root selection uses the ordinary CLI flag, not a model-changing helper command.
 ROOT_MODEL=${CODEX_HUB_FIXTURE_ROOT_MODEL:-codex-hub-fixture/orchestrator}
 exec env -i \
@@ -73,7 +72,6 @@ exec env -i \
   ${CODEX_HUB_FIXTURE_CONTEXT:+CODEX_HUB_FIXTURE_CONTEXT="$CODEX_HUB_FIXTURE_CONTEXT"} \
   ${CODEX_HUB_FIXTURE_CHILDREN:+CODEX_HUB_FIXTURE_CHILDREN="$CODEX_HUB_FIXTURE_CHILDREN"} \
   ${CODEX_HUB_FIXTURE_MODEL:+CODEX_HUB_FIXTURE_MODEL="$CODEX_HUB_FIXTURE_MODEL"} \
-  ${CODEX_HUB_FIXTURE_DIRECT_SANDBOX:+CODEX_HUB_FIXTURE_DIRECT_SANDBOX="$CODEX_HUB_FIXTURE_DIRECT_SANDBOX"} \
   ${CODEX_HUB_FIXTURE_DIRECT_JSON:+CODEX_HUB_FIXTURE_DIRECT_JSON="$CODEX_HUB_FIXTURE_DIRECT_JSON"} \
   ${CODEX_HUB_FIXTURE_SCHEMA:+CODEX_HUB_FIXTURE_SCHEMA="$CODEX_HUB_FIXTURE_SCHEMA"} \
   ${CODEX_HUB_FIXTURE_EFFORT:+CODEX_HUB_FIXTURE_EFFORT="$CODEX_HUB_FIXTURE_EFFORT"} \

@@ -19,7 +19,8 @@ const cwd = realpathSync(process.cwd());
 // 700 KB of UTF-8 (3- and 4-byte characters), 300k UTF-16 units: under the 1 MiB retained-text cap.
 const BIG_TEXT = '가🙂'.repeat(100000);
 const UTF8_TEXT = '한글 ✓ 🙂 mixed — 끝';
-const ENV_NAMES = ['HOME', 'PATH', 'CODEX_HOME', 'OPENAI_API_KEY', 'AWS_SECRET_ACCESS_KEY', 'KUBECONFIG', 'CODEX_TEST_SECRET'];
+const ENV_NAMES = ['HOME', 'PATH', 'CODEX_HOME', 'OPENAI_API_KEY', 'AWS_SECRET_ACCESS_KEY', 'KUBECONFIG',
+  'CODEX_TEST_SECRET', 'CODEX_TEST_UNSET', 'HTTPS_PROXY', 'CODEX_CA_CERTIFICATE'];
 const MUTATIONS = new Set(['thread/start', 'thread/resume', 'thread/fork', 'thread/compact/start', 'turn/start', 'turn/steer', 'turn/interrupt']);
 
 // Protocol double of `codex app-server --stdio` using Codex 0.167.2 message shapes; it never starts Codex
@@ -234,13 +235,14 @@ export function fakeServer() {
       if (active) running.set(thread.id, active);
     }
     loaded.add(thread.id);
-    thread.model = params.model ?? thread.model ?? 'fake-model';
+    const config = params.config ?? {};
+    thread.model = params.model ?? config.model ?? thread.model ?? 'fake-model';
     save();
-    const mode = params.sandbox ?? 'workspace-write';
+    const mode = params.sandbox ?? config.sandbox_mode ?? 'workspace-write';
     const result = {
-      thread: threadView(thread), model: params.model ?? 'fake-model', modelProvider: 'openai', serviceTier: null,
+      thread: threadView(thread), model: thread.model, modelProvider: 'openai', serviceTier: null,
       disabledPluginIds: [], cwd: params.cwd ?? thread.cwd, instructionSources: [],
-      approvalPolicy: params.approvalPolicy ?? 'on-request', approvalsReviewer: 'user',
+      approvalPolicy: params.approvalPolicy ?? config.approval_policy ?? 'on-request', approvalsReviewer: 'user',
       // Effective policies as reported by a real 0.167.2 server for these modes.
       sandbox: mode === 'read-only' ? { type: 'readOnly', networkAccess: false }
         : mode === 'workspace-write'
@@ -762,12 +764,12 @@ it('coalesces connection and continues completed turns in the same native thread
     [first.threadId, [{ type: 'text', text: 'second' }]],
   ]);
   const [start] = sent(dir, 'thread/start');
-  assert.equal(start.sandbox, 'workspace-write');
-  assert.equal(start.approvalPolicy, 'never');
+  assert.ok(!('sandbox' in start));
+  assert.ok(!('approvalPolicy' in start));
   assert.equal(start.cwd, cwd);
 });
 
-it('resumes a saved thread with explicit restrictive controls and no history', async (t) => {
+it('resumes a saved thread with inherited native controls and no history', async (t) => {
   const { client, dir } = makeClient(t, {}, {}, savedStore([['persisted-thread', [savedTurn('turn-old', 'completed', 'old answer')]]]));
   const admitted = await client.run({ threadId: 'persisted-thread', prompt: 'resume', cwd });
   const done = await untilSnapshot(client, admitted.threadId, (value) => completed(value) && value.turnId === admitted.turnId);
@@ -776,8 +778,8 @@ it('resumes a saved thread with explicit restrictive controls and no history', a
   const [resume] = sent(dir, 'thread/resume');
   assert.equal(resume.threadId, 'persisted-thread');
   assert.equal(resume.excludeTurns, true);
-  assert.equal(resume.approvalPolicy, 'never');
-  assert.equal(resume.sandbox, 'workspace-write');
+  assert.ok(!('approvalPolicy' in resume));
+  assert.ok(!('sandbox' in resume));
   assert.equal(resume.cwd, cwd);
 });
 
@@ -806,7 +808,7 @@ it('sends an explicit native model on thread/start, thread/resume and turn/start
   const [turnChosen, turnResumed, turnDefault] = sent(dir, 'turn/start');
   assert.equal(startChosen.model, 'GPT-Test.Mini_2');
   assert.equal(resume.model, 'GPT-Test.Mini_2');
-  assert.equal(resume.sandbox, 'workspace-write');
+  assert.ok(!('sandbox' in resume));
   assert.equal(turnChosen.model, 'GPT-Test.Mini_2');
   assert.equal(turnResumed.model, 'GPT-Test.Mini_2');
   assert.ok(!('model' in startDefault), 'default model is left to the Codex config');
@@ -824,74 +826,109 @@ it('refuses a thread whose reported native model differs from the requested one,
   assert.deepEqual(prompts(dir), []);
 });
 
-it('always sends the fixed no-network workspace-write policy and accepts the native workspace-write default', async (t) => {
+it('inherits native sandbox, network, roots, temp and approvals without per-turn overrides', async (t) => {
   const { client, dir } = makeClient(t);
-  // The fake reports the real default for workspace-write: no roots listed and /tmp writable.
   const writable = await client.run({ prompt: 'write', cwd });
   await untilSnapshot(client, writable.threadId, completed);
-  assert.deepEqual(sent(dir, 'thread/start').map(({ sandbox, approvalPolicy }) => [sandbox, approvalPolicy]), [['workspace-write', 'never']]);
-  const [write] = sent(dir, 'turn/start');
-  assert.equal(write.approvalPolicy, 'never');
-  assert.deepEqual(write.sandboxPolicy, {
-    type: 'workspaceWrite', writableRoots: [cwd], networkAccess: false, excludeTmpdirEnvVar: true, excludeSlashTmp: true,
+  for (const request of [...sent(dir, 'thread/start'), ...sent(dir, 'turn/start')]) {
+    for (const key of ['sandbox', 'sandboxPolicy', 'approvalPolicy', 'config']) assert.ok(!(key in request), key);
+  }
+  assert.equal(writable.permissions.approvalPolicy, 'on-request');
+  assert.deepEqual(writable.permissions.sandbox, {
+    type: 'workspaceWrite', writableRoots: [], networkAccess: false, excludeTmpdirEnvVar: false, excludeSlashTmp: false,
   });
-  // The sandbox is not a caller choice: any explicit value, narrower or wider, is refused before a request.
+  // Per-client native config is authoritative; retired per-thread sandbox options never silently change it.
   for (const sandbox of ['read-only', 'workspace-write', 'danger-full-access']) {
-    await assert.rejects(client.run({ prompt: `must not run ${sandbox}`, cwd, sandbox }), /sandbox is not configurable/);
+    await assert.rejects(client.run({ prompt: `must not run ${sandbox}`, cwd, sandbox }), /use constructor config/);
   }
   assert.equal(sent(dir, 'thread/start').length, 1);
   assert.equal(prompts(dir).length, 1);
 });
 
-it('fails closed when the native thread reports wider or unidentifiable permissions', async (t) => {
-  const elsewhere = join(cwd, 'elsewhere');
-  const writable = { type: 'workspaceWrite', writableRoots: [], networkAccess: false, excludeTmpdirEnvVar: false, excludeSlashTmp: false };
-  const granular = { granular: { sandbox_approval: true, rules: true, skill_approval: true, request_permissions: true, mcp_elicitations: true } };
+it('accepts native permissions including wider roots, networking, full access and read-only', async (t) => {
+  const writable = { type: 'workspaceWrite', writableRoots: [cwd, '/tmp'], networkAccess: true,
+    excludeTmpdirEnvVar: false, excludeSlashTmp: false };
   const cases = [
-    { approvalPolicy: 'on-request' },
-    { approvalPolicy: granular },
-    { approvalPolicy: null },
-    { sandbox: { type: 'dangerFullAccess' } },
-    { sandbox: { type: 'externalSandbox', networkAccess: 'enabled' } },
+    { approvalPolicy: 'on-request', sandbox: writable },
+    { approvalPolicy: { granular: { sandbox_approval: true, rules: true } }, sandbox: { type: 'dangerFullAccess' } },
+    { approvalPolicy: 'never', sandbox: { type: 'externalSandbox', networkAccess: 'enabled' } },
     { sandbox: { type: 'readOnly', networkAccess: true } },
-    { sandbox: null },
-    { sandbox: { ...writable, networkAccess: true } },
-    { sandbox: { ...writable, writableRoots: [cwd, elsewhere] } },
-    { sandbox: { ...writable, writableRoots: ['/tmp'] } },
-    { cwd: elsewhere },
-    { cwd: null },
+    { approvalPolicy: null, sandbox: null },
   ];
   for (const permissions of cases) {
-    const label = JSON.stringify(permissions);
-    const { client, dir } = makeClient(t, { permissions });
-    await assert.rejects(client.run({ prompt: 'must not run', cwd }), (error) => {
-      assert.equal(error.code, 'PERMISSION_UNSAFE', label);
-      assert.notEqual(error.outcomeUnknown, true, label);
-      return true;
-    });
-    assert.deepEqual(prompts(dir), [], label);
+    const { client } = makeClient(t, { permissions });
+    const admitted = await client.run({ prompt: 'native config', cwd });
+    await untilSnapshot(client, admitted.threadId, completed);
+    assert.equal(client.snapshot(admitted.threadId).status, 'completed');
     await client.close();
   }
-  // A refused resume is not reused as an attachment: a retry is refused again.
-  const { client, dir } = makeClient(t, { permissions: { approvalPolicy: 'on-request' } }, {}, savedStore([['persisted-thread', []]]));
-  for (let attempt = 0; attempt < 2; attempt++) {
-    await assert.rejects(client.run({ threadId: 'persisted-thread', prompt: 'must not run', cwd }), (error) => {
-      assert.equal(error.code, 'PERMISSION_UNSAFE');
-      assert.equal(error.threadId, 'persisted-thread');
+});
+
+it('refuses missing or changed native cwd without weakening thread identity guards', async (t) => {
+  for (const directory of [join(cwd, 'elsewhere'), null]) {
+    const { client, dir } = makeClient(t, { permissions: { cwd: directory } });
+    await assert.rejects(client.run({ prompt: 'must not run', cwd }), error => {
+      assert.equal(error.code, 'CWD_MISMATCH');
+      assert.notEqual(error.outcomeUnknown, true);
       return true;
     });
+    assert.deepEqual(prompts(dir), []);
+  }
+  const { client, dir } = makeClient(t, { permissions: { cwd: '/' } }, {}, savedStore([['persisted-thread', []]]));
+  for (let attempt = 0; attempt < 2; attempt++) {
+    await assert.rejects(client.run({ threadId: 'persisted-thread', prompt: 'must not run', cwd }),
+      error => error.code === 'CWD_MISMATCH' && error.threadId === 'persisted-thread');
   }
   assert.deepEqual(prompts(dir), []);
 });
 
-it('refuses a stricter native sandbox instead of running under an unrequested policy', async (t) => {
-  const { client, dir } = makeClient(t, { permissions: { sandbox: { type: 'readOnly', networkAccess: false } } });
-  await assert.rejects(client.run({ prompt: 'must not run', cwd }), (error) => {
-    assert.equal(error.code, 'PERMISSION_STRICTER');
-    assert.equal(typeof error.threadId, 'string');
-    return true;
+it('merges env and constructor native config on start, resume and fork, then inherits it on turns', async (t) => {
+  const inherited = { sandbox_mode: 'read-only', approval_policy: 'on-request',
+    'sandbox_workspace_write.writable_roots': ['/tmp/shared'], 'sandbox_workspace_write.network_access': true };
+  const config = { sandbox_mode: 'danger-full-access', features: { web_search_request: true } };
+  const { client, dir } = makeClient(t, {}, { config, env: { OMP_CODEX_BRIDGE_CONFIG: JSON.stringify(inherited) } },
+    savedStore([['persisted-thread', []]]));
+  const expected = { ...inherited, sandbox_mode: 'danger-full-access', features: { web_search_request: true } };
+  config.features.web_search_request = false;
+  const snapshot = client.config;
+  snapshot.features.web_search_request = false;
+  assert.deepEqual(client.config, expected, 'constructor and getter cannot mutate effective overrides');
+  const first = await client.run({ prompt: 'explicit', cwd });
+  await untilSnapshot(client, first.threadId, completed);
+  const resumed = await client.run({ threadId: 'persisted-thread', prompt: 'resume config', cwd });
+  await untilSnapshot(client, resumed.threadId, completed);
+  const forked = await client.fork({ threadId: first.threadId, cwd });
+  await client.run({ threadId: forked.threadId, prompt: 'fork config', cwd });
+  for (const method of ['thread/start', 'thread/resume', 'thread/fork']) {
+    assert.deepEqual(sent(dir, method)[0].config, expected, method);
+    assert.ok(!('approvalPolicy' in sent(dir, method)[0]));
+    assert.ok(!('sandbox' in sent(dir, method)[0]));
+  }
+  for (const turn of sent(dir, 'turn/start')) {
+    for (const key of ['sandboxPolicy', 'approvalPolicy', 'config']) assert.ok(!(key in turn), key);
+  }
+  assert.equal(first.permissions.sandbox.type, 'dangerFullAccess');
+  assert.equal(first.permissions.approvalPolicy, 'on-request');
+});
+
+it('resolves global env config at construction and validates config before spawning', async (t) => {
+  const previous = process.env.OMP_CODEX_BRIDGE_CONFIG;
+  t.after(() => {
+    if (previous === undefined) delete process.env.OMP_CODEX_BRIDGE_CONFIG;
+    else process.env.OMP_CODEX_BRIDGE_CONFIG = previous;
   });
-  assert.deepEqual(prompts(dir), []);
+  process.env.OMP_CODEX_BRIDGE_CONFIG = '{"approval_policy":"on-request"}';
+  const { client, dir } = makeClient(t);
+  process.env.OMP_CODEX_BRIDGE_CONFIG = '{"approval_policy":"never"}';
+  assert.deepEqual(client.config, { approval_policy: 'on-request' });
+  await client.run({ prompt: 'captured config', cwd });
+  assert.equal(sent(dir, 'thread/start')[0].config.approval_policy, 'on-request');
+  for (const raw of ['', 'not json', '[]', 'null', '1']) {
+    assert.throws(() => new CodexAppServerClient({ env: { OMP_CODEX_BRIDGE_CONFIG: raw } }), /OMP_CODEX_BRIDGE_CONFIG/);
+  }
+  for (const config of [null, [], 1, { '': true }, { 'bad\0key': true }, { model: undefined }, { value: Infinity }]) {
+    assert.throws(() => new CodexAppServerClient({ config, env: { OMP_CODEX_BRIDGE_CONFIG: null } }), /config/);
+  }
 });
 
 it('reads the saved last turn of an unloaded thread without mutating or owning it', async (t) => {
@@ -1285,19 +1322,27 @@ it('drains app-server stderr without exposing it', async (t) => {
   assert.doesNotMatch(JSON.stringify(await client.status()), /STDERR-SECRET/);
 });
 
-it('does not inherit or forward credential environment variables', async (t) => {
-  const previous = process.env.CODEX_TEST_SECRET;
-  process.env.CODEX_TEST_SECRET = 'inherited-test-secret';
+it('inherits native provider credentials and proxy settings with explicit environment overrides', async (t) => {
+  const inherited = {
+    CODEX_TEST_SECRET: 'inherited-provider-key',
+    CODEX_TEST_UNSET: 'remove-this-value',
+    HTTPS_PROXY: 'http://native-proxy.example:8080',
+    CODEX_CA_CERTIFICATE: '/tmp/native-ca.pem',
+    OPENAI_API_KEY: 'inherited-openai-key',
+  };
+  const previous = Object.fromEntries(Object.keys(inherited).map(name => [name, process.env[name]]));
+  Object.assign(process.env, inherited);
   t.after(() => {
-    if (previous === undefined) delete process.env.CODEX_TEST_SECRET;
-    else process.env.CODEX_TEST_SECRET = previous;
+    for (const [name, value] of Object.entries(previous)) {
+      if (value === undefined) delete process.env[name];
+      else process.env[name] = value;
+    }
   });
   const { client, dir } = makeClient(t, {}, { env: {
-    HOME: process.env.HOME,
-    PATH: process.env.PATH,
-    OPENAI_API_KEY: 'explicit-test-secret',
-    AWS_SECRET_ACCESS_KEY: 'explicit-cloud-secret',
-    KUBECONFIG: '/tmp/cluster-secret',
+    OPENAI_API_KEY: 'explicit-provider-key',
+    AWS_SECRET_ACCESS_KEY: 'explicit-cloud-key',
+    KUBECONFIG: '/tmp/native-cluster',
+    CODEX_TEST_UNSET: null,
   } });
   const admitted = await client.run({ prompt: 'env', cwd });
   const done = await untilSnapshot(client, admitted.threadId, completed);
@@ -1305,9 +1350,22 @@ it('does not inherit or forward credential environment variables', async (t) => 
   assert.equal(environment.HOME, process.env.HOME);
   assert.equal(environment.PATH, process.env.PATH);
   assert.equal(environment.CODEX_HOME, dir);
-  for (const name of ['OPENAI_API_KEY', 'AWS_SECRET_ACCESS_KEY', 'KUBECONFIG', 'CODEX_TEST_SECRET']) {
-    assert.equal(environment[name], null, `${name} leaked to native process`);
+  assert.equal(environment.CODEX_TEST_SECRET, inherited.CODEX_TEST_SECRET);
+  assert.equal(environment.HTTPS_PROXY, inherited.HTTPS_PROXY);
+  assert.equal(environment.CODEX_CA_CERTIFICATE, inherited.CODEX_CA_CERTIFICATE);
+  assert.equal(environment.OPENAI_API_KEY, 'explicit-provider-key');
+  assert.equal(environment.AWS_SECRET_ACCESS_KEY, 'explicit-cloud-key');
+  assert.equal(environment.KUBECONFIG, '/tmp/native-cluster');
+  assert.equal(environment.CODEX_TEST_UNSET, null);
+});
+
+it('validates every explicit environment key and value before spawning Codex', () => {
+  for (const env of [{ CUSTOM_PROVIDER_KEY: 42 }, { CUSTOM_PROVIDER_KEY: 'bad\0key' },
+    { 'BAD=KEY': 'value' }, { 'BAD\0KEY': 'value' }]) {
+    assert.throws(() => new CodexAppServerClient({ env }), /env/);
   }
+  const client = new CodexAppServerClient({ env: { CODEX_TEST_SECRET: undefined } });
+  assert.equal(Object.hasOwn(client._transport.env, 'CODEX_TEST_SECRET'), false);
 });
 
 it('rejects server approval requests without authorizing execution', async (t) => {
@@ -1449,15 +1507,109 @@ it('declines every approval variant with exact schemas and refuses unsupported a
   methods.forEach((method, index) => client._transport.receive({ id: 950 + index, method,
     params: { threadId: state.threadId, turnId: state.turnId } }));
   await until(() => trace(dir).filter(({ message }) => message?.id >= 950 && message.method === undefined).length === methods.length);
-  const replies = trace(dir).filter(({ message }) => message?.id >= 950 && message.method === undefined).map(({ message }) => message);
-  assert.deepEqual(replies[0].result, { decision: 'decline' });
-  assert.deepEqual(replies[1].result, { permissions: {}, scope: 'turn' });
-  assert.ok(replies[2].result.decision.denied.rejection);
-  assert.ok(replies[3].result.decision.denied.rejection);
-  assert.equal(replies[4].error.code, -32601);
+  const replies = new Map(trace(dir).filter(({ message }) => message?.id >= 950 && message.method === undefined)
+    .map(({ message }) => [message.id, message]));
+  assert.deepEqual(replies.get(950).result, { decision: 'decline' });
+  assert.deepEqual(replies.get(951).result, { permissions: {}, scope: 'turn' });
+  assert.ok(replies.get(952).result.decision.denied.rejection);
+  assert.ok(replies.get(953).result.decision.denied.rejection);
+  assert.equal(replies.get(954).error.code, -32601);
 });
 
-it('forks through the selected completed native turn with fixed guards and no input replay', async (t) => {
+it('forwards supported native approval results only through the host callback', async (t) => {
+  const observed = [];
+  const { client, dir } = makeClient(t, {}, { onRequest: request => {
+    observed.push(request);
+    return request.params.answer;
+  } });
+  const active = await client.run({ prompt: 'hold', cwd });
+  const cases = [
+    ['item/commandExecution/requestApproval', { decision: 'accept' }],
+    ['item/commandExecution/requestApproval', { decision: 'acceptForSession' }],
+    ['item/commandExecution/requestApproval', { decision: { acceptWithExecpolicyAmendment: { execpolicy_amendment: ['git', 'status'] } } }],
+    ['item/commandExecution/requestApproval', { decision: { applyNetworkPolicyAmendment: { network_policy_amendment: { action: 'allow', host: 'example.com' } } } }],
+    ['item/fileChange/requestApproval', { decision: 'accept' }],
+    ['item/permissions/requestApproval', { permissions: { network: { enabled: true } }, scope: 'turn' }],
+    ['execCommandApproval', { decision: 'approved' }],
+    ['applyPatchApproval', { decision: 'approved' }],
+  ];
+  cases.forEach(([method, answer], index) => client._transport.receive({ id: 1100 + index, method, params: {
+    ...(method.includes('/') ? { threadId: active.threadId, turnId: active.turnId } : { conversationId: active.threadId }),
+    itemId: `approval-${index}`, answer,
+  } }));
+  await until(() => trace(dir).filter(({ message }) => message?.id >= 1100 && message.method === undefined).length === cases.length);
+  const replies = new Map(trace(dir).filter(({ message }) => message?.id >= 1100 && message.method === undefined)
+    .map(({ message }) => [message.id, message]));
+  cases.forEach(([, answer], index) => assert.deepEqual(replies.get(1100 + index).result, answer));
+  assert.equal(observed.length, cases.length);
+  for (const request of observed) {
+    assert.equal(request.threadId, active.threadId);
+    assert.equal(request.turnId, active.turnId);
+    assert.equal(request.signal.aborted, false);
+  }
+});
+
+it('never grants approvals for invalid host answers or handler failures', async (t) => {
+  for (const answer of [undefined, { decision: true }, { decision: 'approved' }, { decision: { acceptWithExecpolicyAmendment: {} } }]) {
+    const { client, dir } = makeClient(t, {}, { onRequest: () => answer });
+    const active = await client.run({ prompt: 'approval', cwd });
+    await untilSnapshot(client, active.threadId, completed);
+    const response = trace(dir).find(({ message }) => message?.id === 900 && message.method === undefined).message;
+    assert.equal(response.error.code, -32602);
+    assert.equal(response.result, undefined);
+  }
+  const { client, dir } = makeClient(t, {}, { onRequest: () => { throw new Error('host declined'); } });
+  const active = await client.run({ prompt: 'approval', cwd });
+  await untilSnapshot(client, active.threadId, completed);
+  const response = trace(dir).find(({ message }) => message?.id === 900 && message.method === undefined).message;
+  assert.equal(response.error.code, -32602);
+  assert.equal(response.result, undefined);
+});
+
+it('refuses foreign, retired and inactive approval requests before invoking the host', async (t) => {
+  const observed = [];
+  const { client, dir } = makeClient(t, {}, { onRequest: request => {
+    observed.push(request);
+    return { decision: 'accept' };
+  } });
+  const ended = await client.run({ prompt: 'first', cwd });
+  await untilSnapshot(client, ended.threadId, completed);
+  const active = await client.run({ threadId: ended.threadId, prompt: 'hold', cwd });
+  const params = [
+    { threadId: 'foreign', turnId: active.turnId },
+    { threadId: active.threadId, turnId: ended.turnId },
+    { threadId: active.threadId },
+  ];
+  params.forEach((value, index) => client._transport.receive({ id: 1200 + index,
+    method: 'item/commandExecution/requestApproval', params: value }));
+  await client.cancel(active.threadId);
+  client._transport.receive({ id: 1203, method: 'item/fileChange/requestApproval',
+    params: { threadId: active.threadId, turnId: active.turnId } });
+  await until(() => trace(dir).filter(({ message }) => message?.id >= 1200 && message.method === undefined).length === 4);
+  assert.deepEqual(observed, []);
+  for (const { message } of trace(dir).filter(({ message }) => message?.id >= 1200 && message.method === undefined)) {
+    assert.ok(message.error);
+    assert.equal(message.result, undefined);
+  }
+});
+
+it('aborts pending native approvals on cancellation without sending a late grant', async (t) => {
+  let accept;
+  let signal;
+  const { client, dir } = makeClient(t, {}, { onRequest: request => {
+    signal = request.signal;
+    return new Promise(resolve => { accept = resolve; });
+  } });
+  const active = await client.run({ prompt: 'approval', cwd });
+  await until(() => signal);
+  await client.cancel(active.threadId);
+  await until(() => signal.aborted);
+  accept({ decision: 'accept' });
+  await delay(20);
+  assert.equal(trace(dir).filter(({ message }) => message?.id === 900 && message.method === undefined).length, 0);
+});
+
+it('forks through the selected completed native turn with inherited controls and no input replay', async (t) => {
   const { client, dir } = makeClient(t);
   const first = await client.run({ prompt: 'first', cwd, model: 'fake-model' });
   await untilSnapshot(client, first.threadId, completed);
@@ -1470,17 +1622,17 @@ it('forks through the selected completed native turn with fixed guards and no in
   const request = sent(dir, 'thread/fork')[0];
   assert.equal(request.lastTurnId, first.turnId);
   assert.equal(request.excludeTurns, true);
-  assert.equal(request.sandbox, 'workspace-write');
-  assert.equal(request.approvalPolicy, 'never');
+  assert.ok(!('sandbox' in request));
+  assert.ok(!('approvalPolicy' in request));
   assert.equal((await client._readLastTurn(fork.threadId)).id, first.turnId);
   await client.run({ threadId: fork.threadId, prompt: 'branch only', cwd });
   assert.equal(sent(dir, 'thread/resume').length, 0);
 });
 
-it('refuses unsafe effective fork settings before a child turn', async (t) => {
-  const { client, dir } = makeClient(t, { permissions: { approvalPolicy: 'on-request' } }, {},
+it('refuses a changed effective fork cwd before a child turn', async (t) => {
+  const { client, dir } = makeClient(t, { permissions: { cwd: '/' } }, {},
     savedStore([['source', [savedTurn('old', 'completed', 'old')]]]));
-  await assert.rejects(client.fork({ threadId: 'source', lastTurnId: 'old', cwd }), error => error.code === 'PERMISSION_UNSAFE');
+  await assert.rejects(client.fork({ threadId: 'source', lastTurnId: 'old', cwd }), error => error.code === 'CWD_MISMATCH');
   assert.equal(sent(dir, 'turn/start').length, 0);
   assert.equal(client.snapshot('source'), undefined);
 });
@@ -1604,8 +1756,8 @@ it('attaches metadata after readonly reload status and compacts without submitti
   assert.deepEqual(mutations(dir).map(({ method }) => method), ['thread/resume']);
   const request = sent(dir, 'thread/resume')[0];
   assert.equal(request.excludeTurns, true);
-  assert.equal(request.approvalPolicy, 'never');
-  assert.equal(request.sandbox, 'workspace-write');
+  assert.ok(!('approvalPolicy' in request));
+  assert.ok(!('sandbox' in request));
   assert.equal(request.model, 'fake-model');
   assert.equal(request.developerInstructions, 'trusted rules');
   await client.resume(options);

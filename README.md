@@ -6,9 +6,10 @@ Codex owns inference, native tools, authentication and persistent threads. OMP o
 
 ## Requirements
 
-- Compatibility target: OMP 18.20.3 and Codex CLI 0.167.2. Other versions require the protocol and Hub checks below.
+- Compatibility target: OMP 18.20.3. Codex 0.167.2 supplies the protocol fixtures; native startup, diagnostics and thread-permission checks also pass on 0.169.0 without model inference. Re-run the checks below after upgrades.
 - Codex CLI on `PATH`, authenticated with `codex login`. OMP uses its embedded Bun runtime to load the plugin.
 - Development: Node.js 20.19 or newer and Bun 1.4.2 or newer. The standalone client also supports Node.js 20.19+.
+- Local lifecycle, branching and `/clear` smoke checks also passed on OMP 18.21.0; the pinned CI target remains 18.20.3.
 
 ## Install
 
@@ -93,7 +94,7 @@ The direct tool exposes the same operations:
 {"action":"details","threadId":"THREAD_ID","includeDiff":true,"limit":10}
 ```
 
-Live execution context, current activity and structured plans appear in the progress view. A bounded latest-state widget continues updating when the transcript log is full. Failed-command output tails can contain sensitive application output; longer command output and file diffs are not automatically dumped.
+The native OMP footer shows `Codex N active · Alt+A`; Agent Hub owns per-worker progress. Execution context, activity and plans remain in the child's transcript and `codex_bridge status`, including updates beyond the transcript log cap. Failed-command output tails can contain sensitive application output; longer command output and file diffs are not automatically dumped.
 
 Versioned changes are recorded in [CHANGELOG.md](CHANGELOG.md). Install a reviewed release tag to pin deployment, and restart OMP after changing revisions.
 
@@ -110,9 +111,29 @@ Versioned changes are recorded in [CHANGELOG.md](CHANGELOG.md). Install a review
 
 ## State and security
 
-Each worker requests `workspace-write`, parent-cwd writable roots, `networkAccess: false`, excluded `/tmp` and `$TMPDIR`, and approvals `never`. Review and editing use the same policy.
+Workers inherit Codex's native filesystem, network and approval settings. The default cwd is the parent session's directory; cwd does not define which files the task authorizes editing. Specify the permitted output paths in the task.
 
-**Codex trusted allow rules, MCP/apps and hooks retain their own execution scope. These settings are not a complete process or network isolation boundary.** Review Codex configuration before running untrusted work.
+Configure optional access in `~/.codex/config.toml`, for example:
+
+```toml
+sandbox_mode = "workspace-write"
+approval_policy = "on-request"
+
+[sandbox_workspace_write]
+writable_roots = ["/absolute/path/to/intent"]
+```
+
+This keeps the parent cwd while allowing the intent directory. `danger-full-access` is an explicit native option; it removes sandbox restrictions beyond the project. Trusted rules, MCP/apps and hooks retain their native scope. Review configuration before running untrusted work.
+
+The app-server inherits the parent process environment, including configured provider credentials, proxy and MCP variables. Native Codex settings govern which variables its shell tools inherit. The standalone client's optional `env` map overrides individual variables; `null` or `undefined` removes one.
+
+For bridge-only overrides, set a native JSON configuration map before starting OMP:
+
+```sh
+export OMP_CODEX_BRIDGE_CONFIG='{"sandbox_mode":"workspace-write","sandbox_workspace_write.writable_roots":["/absolute/path/to/intent"]}'
+```
+
+These keys go directly to app-server's thread configuration API; Codex validates them. No config file is modified. Changing bridge overrides requires a fresh task; existing fixed-policy task records also require a fresh task.
 
 Delivery receipts live in `codex-bridge-state` under OMP's agent directory. Set `OMP_CODEX_BRIDGE_STATE_DIR` to override it. State is kept outside this checkout; native history remains under Codex's own storage. Do not publish either location or delete receipts for active tasks.
 
@@ -130,13 +151,14 @@ bun run test:hub # native install, agent grants, branch/fork, dialogs, reload an
 
 Unit tests and Hub smoke tests use a protocol double, isolated homes and temporary state. They do not run model inference or use stored credentials. Each Hub fixture installs this checkout with the real `omp plugin install` command, then exercises actual RPC/TUI and child-agent behavior without a copied user agent. Hub tests require the supported `omp` executable on `PATH`. Additional modes live in `test/hub/smoke.mjs`; `test/hub/fixture.sh` opens an isolated manual fixture.
 
-Runtime responsibilities live under `src/codex/` (native transport, thread/turn ownership and side-effect-free `inspection.mjs`) and `src/omp/` (provider, receipts, operator commands and `presentation.ts` for cards/widgets). Byte budgets and screen-line limits stay separate. Codex owns durable native history outside this package. `extensions/codex-bridge.ts` is the package entrypoint; tests stay under `test/` and are excluded from the package file list.
+Runtime responsibilities live under `src/codex/` (native transport, thread/turn ownership and side-effect-free `inspection.mjs`) and `src/omp/` (provider, receipts, operator commands and `presentation.ts` for cards and footer status). Byte budgets and screen-line limits stay separate. Codex owns durable native history outside this package. `extensions/codex-bridge.ts` is the package entrypoint; tests stay under `test/` and are excluded from the package file list.
 
 CI pins OMP 18.20.3 and runs the unit and isolated package/Hub checks without credentials. Release delivery is the reviewed source commit/tag plus the native local install above. No publishing workflow, registry token, generated bundle or preview channel is required. Re-run these gates before changing the compatibility target.
 
 ## References
 
 - [Codex app-server API](https://learn.chatgpt.com/docs/app-server.md)
+- [Codex native configuration](https://learn.chatgpt.com/docs/config-file/config-reference)
 - [OMP package install/update/remove contracts](https://github.com/can1357/oh-my-pi/blob/v18.20.3/docs/plugin-manager-installer-plumbing.md)
 - [OMP agent discovery and per-call grants](https://github.com/can1357/oh-my-pi/blob/v18.20.3/docs/task-agent-discovery.md)
 - [Current OMP extension loading guide](https://github.com/can1357/oh-my-pi/blob/main/docs/extension-loading.md)

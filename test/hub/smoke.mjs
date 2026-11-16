@@ -17,7 +17,7 @@ import { createInterface } from "node:readline";
 const mode = process.argv[2] ?? "tui-steer";
 const QUESTION_MODES = ["rpc-question", "rpc-question-secret", "rpc-question-ask", "rpc-question-cancel", "rpc-question-headless", "rpc-elicitation", "rpc-async-question"];
 const USABILITY_MODES = ["tui-operator", "tui-progress", "tui-execution"];
-if (!["tui-steer", "tui-followup", "tui-kill", "tui-revive", "tui-question", "tui-question-secret", "tui-progress-many", "tui-clear", "rpc", "rpc-queued", "rpc-model", "rpc-removed-sandbox", "rpc-rich", "rpc-direct-rich", "rpc-lifecycle", "rpc-branches", ...QUESTION_MODES, ...USABILITY_MODES].includes(mode)) throw new Error(`unknown mode ${mode}`);
+if (!["tui-steer", "tui-followup", "tui-kill", "tui-revive", "tui-question", "tui-question-secret", "tui-progress-many", "tui-clear", "rpc", "rpc-queued", "rpc-model", "rpc-rich", "rpc-direct-rich", "rpc-lifecycle", "rpc-branches", ...QUESTION_MODES, ...USABILITY_MODES].includes(mode)) throw new Error(`unknown mode ${mode}`);
 const AGENT = "codex-bridge";
 // rpc-model: the task item picks one concrete native model with OMP's per-call `model` selector. The fake
 // native model/list serves the real slug list in pages of 3; the grant comes from the production agent
@@ -73,16 +73,19 @@ async function until(what, probe, ms = 30000) {
   }
 }
 
-// Native protocol invariants shared by every mode: one thread, the expected turn count, approvals never,
-// and workspace-write confined to the child cwd (the parent's cwd) with network and temp dirs off.
+// Native configuration stays authoritative; the bridge supplies cwd and task identity only.
 function assertSingleWorkspaceTurn(turns = 1, resumes = 0) {
   const work = realpathSync(join(FIX, "work"));
   const [start] = sent("thread/start");
-  assert.equal(start.sandbox, "workspace-write");
-  assert.equal(start.approvalPolicy, "never");
+  assert.ok(!("sandbox" in start));
+  assert.ok(!("approvalPolicy" in start));
   // The child shares the parent's cwd (no isolation) in every mode.
   assert.equal(start.cwd, work);
-  for (const resume of sent("thread/resume")) assert.deepEqual([resume.sandbox, resume.approvalPolicy, resume.cwd], ["workspace-write", "never", work]);
+  for (const resume of sent("thread/resume")) {
+    assert.equal(resume.cwd, work);
+    assert.ok(!("sandbox" in resume));
+    assert.ok(!("approvalPolicy" in resume));
+  }
   // Without a per-call model Codex's configured default runs: no `model` is sent at all.
   for (const params of [...sent("thread/start"), ...sent("thread/resume"), ...sent("turn/start")]) {
     if (NATIVE_MODEL) assert.equal(params.model, NATIVE_MODEL, "selected native model on every native request");
@@ -96,7 +99,8 @@ function assertSingleWorkspaceTurn(turns = 1, resumes = 0) {
     assert.ok(!JSON.stringify(params).includes("6d1f"), "shared context must not be replayed as native turn input or steering");
   }
   for (const turn of sent("turn/start")) {
-    assert.deepEqual(turn.sandboxPolicy, { type: "workspaceWrite", writableRoots: [work], networkAccess: false, excludeTmpdirEnvVar: true, excludeSlashTmp: true });
+    assert.ok(!("sandboxPolicy" in turn));
+    assert.ok(!("approvalPolicy" in turn));
   }
   assert.equal(sent("thread/start").length, 1, "one native thread per child session");
   assert.equal(sent("thread/resume").length, resumes, "the live child keeps its loaded thread; only a revived one resumes it");
@@ -181,7 +185,7 @@ async function tui() {
     if (mode === "tui-operator") {
       const doctor = await command("/codex doctor", "doctor");
       assert.match(doctor, /codex-cli 0\.167\.2 \(test fixture\)/);
-      for (const section of ["connection", "auth", "models", "permissions", "steering", "requestedPermissions"]) assert.ok(doctor.includes(`"${section}"`), `doctor omitted ${section}`);
+      for (const section of ["connection", "auth", "models", "permissions", "steering", "permissionSource"]) assert.ok(doctor.includes(`"${section}"`), `doctor omitted ${section}`);
       assert.match(doctor, /"readOnly"\s*:\s*true/);
       assert.match(doctor, /"authenticated"\s*:\s*true/);
       assert.ok(doctor.includes("fake-model") && doctor.includes("workspace-write"));
@@ -201,22 +205,19 @@ async function tui() {
       const turns = sent("turn/start");
       const ids = turns.map(turn => turn.threadId);
       assert.equal(new Set(ids).size, 3, "three independent native sessions must actually start");
-      const oldest = ids.reduce((first, id) => Number(id.slice(7)) < Number(first.slice(7)) ? id : first);
-      const live = await until("oldest session's latest update visible among three active sessions", async () => {
+      const live = await until("three active workers in the native footer", async () => {
         const text = await painted();
-        return text.includes("OLDEST SESSION LATEST ACTIVITY") && text.includes("1 more active Codex sessions omitted") ? text : undefined;
+        return text.includes("Codex 3 active") && text.includes("Alt+A") ? text : undefined;
       });
-      const headings = live.split("\n").filter(line => line.includes("Codex activity [inProgress]"));
-      assert.equal(headings.length, 2, "the real ten-row widget consumer shows the newest two sessions");
-      assert.ok(headings[0].includes(oldest), "the originally oldest session moves first when it updates last");
-      assert.ok(live.indexOf("OLDEST SESSION LATEST ACTIVITY") < live.indexOf(headings[1]), "latest activity belongs to the first visible session");
-      assert.ok(live.includes("requestedEffort=") && live.includes("effectiveEffort=unknown"));
+      assert.ok(!live.includes("Codex activity ["));
+      assert.ok(!live.includes("sessions omitted"));
+      assert.ok(!live.includes("Plan: unknown"));
       assert.equal(sent("thread/start").length, 3);
       assert.equal(sent("turn/start").length, 3);
       assert.equal(sent("thread/resume").length, 0);
       assert.equal(sent("turn/steer").length, 0);
       assert.equal(sent("turn/interrupt").length, 0, "all three sessions stay active during the consumer assertion");
-      console.log(`--- newest activity in the official bounded multi-session widget ---\n${live}`);
+      console.log(`--- compact native footer with three workers ---\n${live}`);
       return;
     }
     if (USABILITY_MODES.includes(mode)) {
@@ -226,19 +227,17 @@ async function tui() {
         return existsSync(path) && JSON.parse(readFileSync(path, "utf8")).threads[threadId]?.turns[0];
       };
       if (mode === "tui-progress") {
-        const live = await until("latest native activity painted after append-log cap", async () => {
-          const text = await painted();
-          return text.includes("LATEST NATIVE ACTIVITY") && text.includes("Progress log truncated; latest activity remains here.") ? text : undefined;
+        await until("native command history exceeds the append-log capacity", () => {
+          const commands = nativeTurn()?.items.filter(item => item.type === "commandExecution").map(item => item.command ?? "").join("");
+          return commands?.length > 65536;
         });
-        assert.match(live, /Codex activity \[inProgress\]/);
-        assert.ok(live.includes(threadId));
-        assert.ok(live.includes("model=fake-model"));
-        assert.ok(live.includes(`cwd=${realpathSync(join(FIX, "work"))}`));
-        assert.ok(live.includes("requestedEffort=") && live.includes("effectiveEffort=unknown"));
-        assert.ok(live.includes("Plan:") && live.includes("Inspect native output") && live.includes("Fix failing command"), "structured plan remains visible beyond the append-log cap");
-        const nativeCommands = nativeTurn().items.filter(item => item.type === "commandExecution").map(item => item.command ?? "").join("");
-        assert.ok(nativeCommands.length > 65536, "fixture command headers actually exceed the append-log capacity");
-        console.log(`--- latest activity beyond append-log cap (painted) ---\n${live}`);
+        const live = await until("compact native footer remains visible past the log cap", async () => {
+          const text = await painted();
+          return text.includes("Codex 1 active") && text.includes("Alt+A") ? text : undefined;
+        });
+        assert.ok(!live.includes("Codex activity ["));
+        assert.ok(!live.includes("Plan: unknown"));
+        console.log(`--- compact native progress footer (painted) ---\n${live}`);
       }
       await until("usability turn terminal failure", () => nativeTurn()?.status === "failed");
       assert.equal(sent("turn/start").length, 1, "failed native work must not silently retry");
@@ -306,7 +305,7 @@ async function tui() {
         await show("read-only history and details after process restart");
         return;
       }
-      await until("terminal activity widget cleared", async () => !(await painted()).includes("Codex activity ["));
+      await until("terminal native footer cleared", async () => !(await painted()).includes("Codex 1 active"));
       // Ctrl+T is OMP's official thinking display toggle, including retired transcript rows.
       if (!(await screen()).includes("native execution:")) await ask({ op: "bytes", data: "\x14" });
       const log = await until("native progress thinking displayed", async () => {
@@ -318,7 +317,7 @@ async function tui() {
         "[inProgress] Fix failing command", "files completed: old.txt", "native-usability-command", "exit 17",
         "command output tail (truncated); may contain sensitive data:", "FAILURE TAIL", "second failure line",
         "64K-character append log limit reached"]) assert.ok(logText.includes(text), `native progress log omitted ${text}`);
-      assert.ok(!logText.includes("LATEST NATIVE ACTIVITY"), "append log is capped while the replacement widget showed newer native activity");
+      assert.ok(!logText.includes("LATEST NATIVE ACTIVITY"), "the append log is capped; newer activity remains available through native status/details");
       console.log(`--- bounded native progress and failure log ---\n${log}`);
       const details = await command(`/codex show ${threadId} {"includeItems":true,"limit":3}`, "details");
       assert.match(details, /"exitCode"\s*:\s*17/);
@@ -536,8 +535,6 @@ async function rpc() {
       // rpc-queued: OMP's shipped default (no live steering) and a first native turn that ends on its own.
       ...(mode === "rpc-queued" ? { CODEX_HUB_FIXTURE_LIVE_STEERING: "false", CODEX_HUB_FIXTURE_OPTIONS: '{"turns":["work-then-finish","finish-later"]}' } : {}),
       ...(SELECTOR ? { CODEX_HUB_FIXTURE_MODEL: SELECTOR, CODEX_HUB_FIXTURE_OPTIONS: JSON.stringify({ turns: ["work"], models: NATIVE_MODELS, modelPageSize: 3 }) } : {}),
-      // rpc-removed-sandbox: the parent calls the direct codex_bridge tool with the removed `sandbox` argument.
-      ...(mode === "rpc-removed-sandbox" ? { CODEX_HUB_FIXTURE_DIRECT_SANDBOX: "read-only" } : {}),
       ...(QUESTION_MODES.includes(mode) ? { CODEX_HUB_FIXTURE_OPTIONS: JSON.stringify({ turns: [mode === "rpc-elicitation" ? "elicitation" : mode === "rpc-async-question" ? "async-question" : "question"], questionIsOther: mode === "rpc-question-ask", questionIsSecret: mode === "rpc-question-secret" }) } : {}),
       ...(mode === "rpc-rich" ? { CODEX_HUB_FIXTURE_OPTIONS: '{"turns":["rich-output"]}', CODEX_HUB_FIXTURE_STRUCTURED: "true", CODEX_HUB_FIXTURE_SCHEMA: JSON.stringify(OUTPUT_SCHEMA), CODEX_HUB_FIXTURE_ENABLE_EFFORT: "true", CODEX_HUB_FIXTURE_EFFORT: "hi" } : {}),
       ...(mode === "rpc-direct-rich" ? { CODEX_HUB_FIXTURE_OPTIONS: '{"turns":["rich-output"]}', CODEX_HUB_FIXTURE_DIRECT_JSON: JSON.stringify(DIRECT_RICH) } : {}),
@@ -826,7 +823,7 @@ async function rpc() {
         return existsSync(path) && JSON.parse(readFileSync(path, "utf8")).threads[turn.threadId]?.turns[0]?.status === "completed";
       });
       assert.equal(sent("thread/start").length, 1);
-      assert.equal(turn.approvalPolicy, "never");
+      assert.ok(!("approvalPolicy" in turn));
       return;
     }
     if (mode === "rpc-rich") {
@@ -845,20 +842,6 @@ async function rpc() {
       assert.deepEqual(sent("turn/start")[0].outputSchema, OUTPUT_SCHEMA);
       assert.equal(sent("turn/start")[0].effort, "high");
       assertSingleWorkspaceTurn();
-      return;
-    }
-    if (mode === "rpc-removed-sandbox") {
-      // The real OMP tool path (validation, then execute) must refuse it as SANDBOX_REMOVED: an error tool
-      // result and no native thread or turn at all.
-      assert.equal((await call({ type: "prompt", message: "Run the Codex removed-sandbox fixture." })).success, true);
-      const result = await until("codex_bridge tool result", async () =>
-        (await call({ type: "get_messages" })).data?.messages?.find((message) => message.role === "toolResult" && message.toolName === "codex_bridge"));
-      const text = JSON.stringify(result.content);
-      console.log("codex_bridge result:", text.slice(0, 2000));
-      assert.equal(result.isError, true, `removed sandbox argument accepted: ${text}`);
-      assert.match(text, /SANDBOX_REMOVED|sandbox is no longer accepted/, "refused as the removed sandbox argument");
-      await Bun.sleep(2000);
-      assert.deepEqual(counts(), { "thread/start": 0, "thread/resume": 0, "turn/start": 0, "turn/steer": 0, "turn/interrupt": 0 });
       return;
     }
     if (SELECTOR) {
@@ -917,10 +900,10 @@ async function rpc() {
     // OMP records the selected concrete profile (or the default) as the child's model.
     const models = new Set(transcript.filter((message) => message.role === "assistant").map((message) => `${message.provider}/${message.model}`));
     assert.deepEqual([...models], [SELECTOR ?? "codex-bridge/default"]);
-    // The child's provider record binds the fixed sandbox and the native model (absent = Codex default) for later reloads.
+    // Receipts bind native override identity, cwd and model for later reloads.
     const records = readdirSync(join(FIX, "codex-bridge-state")).filter((name) => name.endsWith(".json"))
       .map((name) => JSON.parse(readFileSync(join(FIX, "codex-bridge-state", name), "utf8")));
-    assert.deepEqual(records.map((record) => [record.sandbox, record.cwd, record.model]), [["workspace-write", realpathSync(join(FIX, "work")), NATIVE_MODEL]]);
+    assert.deepEqual(records.map((record) => [record.policy, record.config, record.cwd, record.model]), [["native-config", {}, realpathSync(join(FIX, "work")), NATIVE_MODEL]]);
     await Bun.sleep(3000);
     assert.equal(sent("turn/steer").length, 1);
     assertSingleWorkspaceTurn();

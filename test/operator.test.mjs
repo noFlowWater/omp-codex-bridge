@@ -134,7 +134,9 @@ test('doctor reports actual native availability without exposing identities, std
     assert.deepEqual(result.steering.modelSelection.perCallModelAllow.codexBridgeSelectors, ['codex-bridge/gpt-6.1-sol']);
     assert.equal(result.steering.modelSelection.codexBridgeOverride, 'codex-bridge/default');
     assert.equal(result.steering.modelSelection.approvedAgentSelectors.status, 'unavailable');
-    assert.equal(result.requestedPermissions.approvalPolicy, 'never');
+    assert.equal(result.permissionSource, 'native-config');
+    assert.equal(Object.hasOwn(result, 'requestedPermissions'), false);
+    assert.match(result.permissionsNote, /explicit user confirmation/);
     assert.deepEqual(execs, [{ command: 'codex', args: ['--version'] }]);
     assert.doesNotMatch(JSON.stringify(result), /email|accessToken|refreshToken|NEVER-ECHO-STDERR|PRIVATE-|other\/private-model|WRONG-GLOBAL/);
     assert.equal(trace().filter(entry => MUTATIONS.has(entry.message?.method)).length, 0);
@@ -180,30 +182,28 @@ test('collapsed execution card exposes identity, plan, native changes, and bound
   assert.match(card, /not a complete audit/);
 });
 
-test('latest progress replaces the widget past log limit and clears on root lifecycle change', () => {
+test('native footer summarizes work without repainting command updates and clears on root changes', () => {
   const display = createProgressDisplay();
   const painted = [];
-  const ctx = id => ({ agent: { kind: 'main' }, hasUI: true, sessionManager: { getSessionId: () => id }, ui: { setWidget: (key, lines) => painted.push({ key, lines }) } });
+  const ctx = id => ({ agent: { kind: 'main' }, hasUI: true, sessionManager: { getSessionId: () => id }, ui: { setStatus: (key, text) => painted.push({ key, text }) } });
   display.capture(ctx('root-one'));
-  const status = { threadId: 'saved-one', turnId: 'live-turn', status: 'inProgress', activity: 'first activity', plan: 'inspect', execution: { model: 'native-model', cwd, requestedReasoningEffort: 'high' }, logTruncated: true };
+  const status = { threadId: 'saved-one', turnId: 'live-turn', status: 'inProgress', activity: 'PRIVATE-LONG-COMMAND', plan: 'inspect', execution: { model: 'native-model', cwd, requestedReasoningEffort: 'high' }, logTruncated: true };
   display.update('child', status);
+  assert.match(painted.at(-1).text, /Codex 1 active.*Alt\+A/);
+  const count = painted.length;
   display.update('child', { ...status, activity: 'LATEST-ACTIVITY' });
-  const text = painted.at(-1).lines.join('\n');
-  assert.match(text, /LATEST-ACTIVITY/);
-  assert.doesNotMatch(text, /first activity/);
-  assert.match(text, /Progress log truncated/);
-  assert.match(text, /requestedEffort=high/);
-  assert.match(text, /effectiveEffort=unknown/);
+  assert.equal(painted.length, count, 'activity changes must not repaint the footer');
+  assert.doesNotMatch(JSON.stringify(painted), /PRIVATE-LONG-COMMAND|LATEST-ACTIVITY|saved-one|effectiveEffort/);
   display.update('child', undefined);
-  assert.equal(painted.at(-1).lines, undefined);
+  assert.equal(painted.at(-1).text, undefined);
   display.update('child', status);
   display.capture(ctx('root-two'));
-  assert.equal(painted.at(-1).lines, undefined);
+  assert.equal(painted.at(-1).text, undefined);
   display.release();
-  assert.equal(painted.at(-1).lines, undefined);
+  assert.equal(painted.at(-1).text, undefined);
 });
 
-test('headless root changes never call UI widget methods', () => {
+test('headless root changes never call status UI methods', () => {
   const display = createProgressDisplay();
   const ctx = id => ({ agent: { kind: 'main' }, hasUI: false, sessionManager: { getSessionId: () => id }, ui: { notify() {} } });
   display.capture(ctx('headless-one'));
@@ -230,19 +230,16 @@ test('status without ID labels its direct-tool scope and starts no native server
   });
 });
 
-test('latest of three sessions remains in the actual first-ten-line widget view', () => {
+test('footer counts all workers without duplicating Agent Hub details', () => {
   const painted = [];
   const display = createProgressDisplay();
-  display.capture({ agent: { kind: 'main' }, hasUI: true, sessionManager: { getSessionId: () => 'root-many' }, ui: { setWidget: (_key, lines) => painted.push(lines) } });
+  display.capture({ agent: { kind: 'main' }, hasUI: true, sessionManager: { getSessionId: () => 'root-many' }, ui: { setStatus: (_key, text) => painted.push(text) } });
   const status = id => ({ threadId: id, turnId: 'turn', status: 'inProgress', activity: `activity ${id}`, plan: 'inspect', execution: { model: 'native-model', cwd, requestedReasoningEffort: 'high' }, logTruncated: true });
-  for (const id of ['one', 'two', 'three']) display.update(id, status(id));
-  display.update('one', { ...status('one'), activity: 'LATEST-OF-THREE' });
-  const lines = painted.at(-1);
-  assert.ok(lines.length <= 10);
-  assert.match(lines[0], /one/);
-  assert.match(lines.slice(0, 10).join('\\n'), /LATEST-OF-THREE/);
-  assert.match(lines.join('\\n'), /1 more active Codex sessions omitted/);
-  assert.doesNotMatch(lines.join('\\n'), /activity two/);
+  for (const id of ['one', 'two', 'three', 'four', 'five']) display.update(id, status(id));
+  assert.match(painted.at(-1), /Codex 5 active/);
+  display.update('two');
+  assert.match(painted.at(-1), /Codex 4 active/);
+  assert.doesNotMatch(painted.join('\n'), /activity|cwd|omitted|unknown/);
   display.release();
 });
 

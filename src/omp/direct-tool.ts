@@ -127,9 +127,7 @@ export function registerDirectTool(pi: ExtensionAPI) {
   pi.registerTool({
     name: "codex_bridge",
     label: "Codex bridge agent",
-    description: "Direct native Codex control. For Agent Hub delegation, spawn agent codex-bridge. run starts or continues a locally owned thread; active turns receive steering. Uses parent's cwd unless isolation requested. Requests workspace-write, cwd-only writable roots, networkAccess false, excluded temp directories, approvalPolicy never. Native trusted rules, MCP servers, apps and hooks retain policy; this is not a complete process/network boundary. run accepts prompt/native input, native effort and outputSchema. Returns bounded execution/activity/plan/file-change metadata; terminal results arrive as follow-ups. status reads retained state; diagnose checks executable/version/auth/models/permissions/steering without config writes. history lists saved native threads with cursor/limit/searchTerm/cwd. details inspects threadId without ownership/resume/replay; includeItems, turnId, cursor, limit select native items. includeDiff explicitly includes bounded diff which may expose secrets; native file events are not a complete audit. cancel interrupts a locally loaded thread. shutdown closes this session's server. /codex exposes read-only operator commands.",
-    // OMP's validator heals a closed schema by deleting unknown keys, so a retired `sandbox` stays a
-    // declared, reserved key: it reaches execute() and is refused there, never dropped and run as write.
+    description: "Direct native Codex control. For Agent Hub delegation, spawn agent codex-bridge. run starts or continues a locally owned thread; active turns receive steering. Uses parent's cwd unless isolation requested. Inherits native Codex configuration, including sandbox, network and approval policy; optional OMP_CODEX_BRIDGE_CONFIG JSON provides operator-set native overrides. Approval requests require explicit user confirmation; unavailable UI declines them. run accepts prompt/native input, native effort and outputSchema. Returns bounded execution/activity/plan/file-change metadata; terminal results arrive as follow-ups. status reads retained state; diagnose checks executable/version/auth/models/permissions/steering without config writes. history lists saved native threads with cursor/limit/searchTerm/cwd. details inspects threadId without ownership/resume/replay; includeItems, turnId, cursor, limit select native items. includeDiff explicitly includes bounded diff which may expose secrets; native file events are not a complete audit. cancel interrupts a locally loaded thread. shutdown closes this session's server. /codex exposes read-only operator commands.",
     parameters: z.object({
       action: z.enum(["run", "status", "diagnose", "history", "details", "cancel", "shutdown"]),
       threadId: z.string().min(1).optional(),
@@ -144,7 +142,6 @@ export function registerDirectTool(pi: ExtensionAPI) {
       ])).min(1).optional(),
       effort: z.string().min(1).optional().describe("Native model-supported reasoning effort; omitted preserves Codex default."),
       outputSchema: z.record(z.string(), z.unknown()).optional().describe("JSON Schema object constraining the final native answer; boolean schemas are not supported."),
-      sandbox: z.string().optional().describe("Removed parameter; omit it."),
       cursor: z.string().min(1).optional(),
       limit: z.number().int().min(1).max(100).optional(),
       searchTerm: z.string().min(1).optional(),
@@ -158,9 +155,6 @@ export function registerDirectTool(pi: ExtensionAPI) {
     async execute(_id, params, signal, _onUpdate, ctx) {
       try {
         if (signal?.aborted) throw new Error("Call cancelled before submission");
-        if (Object.hasOwn(params, "sandbox")) {
-          throw Object.assign(new Error("sandbox is no longer accepted: the adapter requests workspace-write shell/file sandbox settings (cwd writable roots, networkAccess false, excluded temp directories, approvalPolicy never). Nothing was sent; retry without sandbox if write access is intended"), { code: "SANDBOX_REMOVED" });
-        }
         let result: unknown;
         switch (params.action) {
           case "run":

@@ -131,44 +131,39 @@ export type ProgressStatus = {
   logTruncated: boolean;
 };
 
-// OMP 18.20.3 displays only the first ten widget strings. Two four-line entries leave one summary line.
+// Agent Hub owns per-worker activity. The native footer only summarizes active Codex work.
 export function createProgressDisplay() {
-  const active = new Map<string, ProgressStatus>();
+  const active = new Set<string>();
   let root: ExtensionContext | undefined;
+  let rendered: string | undefined;
   function render() {
     if (!root?.hasUI) return;
-    const entries = [...active.values()].reverse();
-    const lines = entries.slice(0, 2).flatMap(status => [
-      `Codex activity [${screenLine(status.status, 40)}] ${screenLine(status.threadId, 80)}`,
-      `model=${screenLine(status.execution?.model, 120)} cwd=${screenLine(status.execution?.cwd, 240)} requestedEffort=${screenLine(status.execution?.requestedReasoningEffort, 40)} effectiveEffort=unknown`,
-      `Activity: ${screenLine(status.activity, 500)}`,
-      `Plan: ${screenLine(status.plan, 400)}${status.logTruncated ? " | Progress log truncated; latest activity remains here. /codex show THREAD_ID for native details." : ""}`,
-    ]);
-    if (entries.length > 2) lines.push(`${entries.length - 2} more active Codex sessions omitted; newest activity shown first.`);
-    root.ui.setWidget("codex-bridge-progress", lines.length ? lines : undefined);
+    const text = active.size ? `Codex ${active.size} active · Alt+A` : undefined;
+    if (text === rendered) return;
+    root.ui.setStatus("codex-bridge", text);
+    rendered = text;
   }
   return {
     update(sessionId: string, status?: ProgressStatus) {
-      if (status) {
-        active.delete(sessionId);
-        active.set(sessionId, status);
-        if (active.size > 32) active.delete(active.keys().next().value!);
-      } else active.delete(sessionId);
+      if (status) active.add(sessionId);
+      else active.delete(sessionId);
       render();
     },
     capture(ctx: ExtensionContext) {
       if (ctx.agent.kind !== "main") return;
       if (root && root.sessionManager.getSessionId() !== ctx.sessionManager.getSessionId()) {
-        if (root.hasUI) root.ui.setWidget("codex-bridge-progress", undefined);
+        if (root.hasUI) root.ui.setStatus("codex-bridge", undefined);
         active.clear();
+        rendered = undefined;
       }
       root = ctx;
       render();
     },
     release(ctx?: ExtensionContext) {
       if (!root || (ctx && root.sessionManager.getSessionId() !== ctx.sessionManager.getSessionId())) return;
-      if (root.hasUI) root.ui.setWidget("codex-bridge-progress", undefined);
+      if (root.hasUI) root.ui.setStatus("codex-bridge", undefined);
       root = undefined;
+      rendered = undefined;
       active.clear();
     },
   };

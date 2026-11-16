@@ -2,13 +2,13 @@ import { CodexAppServerClient } from '../codex/client.mjs';
 
 export const CODEX_BRIDGE_PROVIDER = 'codex-bridge';
 export const CODEX_BRIDGE_API = 'codex-bridge-app-server';
-// Every codex-bridge thread runs workspace-write: writable only at the session cwd, network and
-// temp dirs off, approvals never. The OMP model id selects only the native model, explicitly
-// (agent frontmatter or model switch), never inferred from prompt text: `default` runs Codex's
-// configured default model; any other id is a native model slug discovered via native model/list.
+// Native Codex configuration and optional operator overrides set thread permissions.
+// The OMP model id selects only the native model, explicitly (agent frontmatter or model switch),
+// never inferred from prompt text: `default` runs Codex's configured default model; any other id
+// is a native model slug discovered via native model/list.
 export const DEFAULT_MODEL_ID = 'default';
 // Native slugs OMP selectors cannot express (whitespace, CSV comma, glob characters) are never offered or run.
-// Retired `<sandbox>[--<model>]` ids are refused, never mapped onto workspace-write.
+// Retired `<sandbox>[--<model>]` ids are refused, never mapped onto native-config model selectors.
 const UNSELECTABLE = /[\s,*?{}[\]\0]|^(read-only|workspace-write)(--|$)/;
 
 // { model } for a codex-bridge OMP model id (model undefined = Codex default), else undefined.

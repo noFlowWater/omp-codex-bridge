@@ -151,6 +151,7 @@ export function threadSnapshot(state) {
     textTruncated: state.textTruncated, events: structuredClone(state.events),
     error: state.error, outcomeUnknown: state.outcomeUnknown,
     cwd: state.cwd, model: state.model, inspection: state.inspection, attached: state.attached,
+    permissions: structuredClone(state.permissions ?? null),
     requestedReasoningEffort: state.requestedReasoningEffort,
     execution: { model: state.model, cwd: state.cwd, requestedReasoningEffort: state.requestedReasoningEffort },
     latestActivity: structuredClone(state.latestActivity), latestPlan: structuredClone(state.latestPlan),

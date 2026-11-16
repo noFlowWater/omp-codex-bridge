@@ -83,12 +83,12 @@ export async function diagnose(pi: ExtensionAPI, ctx: ExtensionContext, client: 
   ]);
   return {
     readOnly: true, ompVersion: pi.pi?.VERSION ?? "unknown", executable, ...native, steering,
-    requestedPermissions: { sandboxMode: "workspace-write", writableRoots: [ctx.cwd], networkAccess: false, excludeTmpdirEnvVar: true, excludeSlashTmp: true, approvalPolicy: "never" },
-    permissionsNote: "Read-only diagnostics do not prove permissions accepted for a future thread. Trusted native rules, MCP servers, apps and hooks retain native policy.",
+    permissionSource: "native-config",
+    permissionsNote: "Native Codex configuration and optional operator overrides determine sandbox, network and approval policy. Read-only diagnostics do not prove future admission. Approval requests require explicit user confirmation; unavailable UI declines them.",
     remedies: {
       auth: "If unauthenticated, use native Codex login outside this bridge, then run /codex doctor.",
       models: "Select a model from the native catalog. Availability does not guarantee future quota or admission.",
-      permissions: "Check native config and requirements against requested permissions. This bridge never changes config or relaxes policy.",
+      permissions: "Inspect effective native config, operator overrides and requirements. This bridge does not automatically relax policy or retry admission.",
       steering: "Inspect effective OMP steering settings in the host settings UI. No steering request is sent by doctor.",
     },
   };

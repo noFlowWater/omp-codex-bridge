@@ -1,8 +1,8 @@
 import { resolve } from 'node:path';
 
 export const TERMINAL = new Set(['completed', 'failed', 'interrupted']);
-// Refusals of one thread's effective settings; the transport stays usable.
-export const REFUSED_CODES = new Set(['PERMISSION_UNSAFE', 'PERMISSION_STRICTER', 'MODEL_MISMATCH']);
+// Refusals of one thread's effective identity; the transport stays usable.
+export const REFUSED_CODES = new Set(['CWD_MISMATCH', 'MODEL_MISMATCH']);
 export const MODEL_PAGE_SIZE = 100;
 export const MODEL_PAGES = 20;
 export const MAX_TEXT = 1024 * 1024;
@@ -52,6 +52,51 @@ export function jsonValue(value, name) {
   });
   if (text === undefined) throw new TypeError(`${name} must be a JSON value`);
   return JSON.parse(text);
+}
+
+// Native thread config accepts TOML-key JSON overrides. Keep Codex responsible for config semantics.
+export function resolveNativeConfig(config, env) {
+  const raw = env && Object.hasOwn(env, 'OMP_CODEX_BRIDGE_CONFIG')
+    ? env.OMP_CODEX_BRIDGE_CONFIG : process.env.OMP_CODEX_BRIDGE_CONFIG;
+  let inherited = {};
+  if (raw !== undefined && raw !== null) {
+    if (typeof raw !== 'string' || raw.includes('\0')) throw new TypeError('OMP_CODEX_BRIDGE_CONFIG must be a JSON object string');
+    try { inherited = JSON.parse(raw); }
+    catch { throw new TypeError('OMP_CODEX_BRIDGE_CONFIG must be a JSON object string'); }
+  }
+  for (const [name, value] of [['OMP_CODEX_BRIDGE_CONFIG', inherited], ['config', config ?? {}]]) {
+    if (!value || typeof value !== 'object' || Array.isArray(value)
+      || ![Object.prototype, null].includes(Object.getPrototypeOf(value)) || (name === 'config' && config === null)) {
+      throw new TypeError(`${name} must be a native config object`);
+    }
+    for (const key of Object.keys(value)) nonempty(key, `${name} key`);
+  }
+  return { ...jsonValue(inherited, 'OMP_CODEX_BRIDGE_CONFIG'), ...jsonValue(config ?? {}, 'config') };
+}
+
+export function validateApprovalResult(method, result) {
+  const object = value => value !== null && typeof value === 'object' && !Array.isArray(value);
+  const strings = value => Array.isArray(value) && value.every(entry => typeof entry === 'string');
+  const network = value => object(value) && ['allow', 'deny'].includes(value.action) && typeof value.host === 'string';
+  let valid;
+  if (method === 'item/permissions/requestApproval') {
+    valid = object(result.permissions) && (result.scope === undefined || ['turn', 'session'].includes(result.scope))
+      && (result.strictAutoReview == null || typeof result.strictAutoReview === 'boolean');
+  } else {
+    const decision = result.decision;
+    const command = method === 'item/commandExecution/requestApproval';
+    const legacy = method === 'execCommandApproval' || method === 'applyPatchApproval';
+    valid = (legacy ? ['approved', 'approved_for_session', 'approved_mcp_policy_amendment', 'timed_out', 'abort']
+      : ['accept', 'acceptForSession', 'decline', 'cancel']).includes(decision);
+    if (object(decision) && Object.keys(decision).length === 1) {
+      valid = command && (strings(decision.acceptWithExecpolicyAmendment?.execpolicy_amendment)
+        || network(decision.applyNetworkPolicyAmendment?.network_policy_amendment));
+      if (legacy) valid = typeof decision.denied?.rejection === 'string'
+        || strings(decision.approved_execpolicy_amendment?.proposed_execpolicy_amendment)
+        || network(decision.network_policy_amendment?.network_policy_amendment);
+    }
+  }
+  if (!valid) throw new TypeError('Invalid native approval result');
 }
 
 export function userInput(prompt, input) {
@@ -113,7 +158,7 @@ export function validateThreadOptions({ threadId, cwd, model, onThread, sandbox,
   if (model !== undefined) nonempty(model, 'model');
   if (developerInstructions !== undefined && typeof developerInstructions !== 'string') throw new TypeError('developerInstructions must be a string');
   if (onThread !== undefined && typeof onThread !== 'function') throw new TypeError('onThread must be a function');
-  if (sandbox !== undefined) throw new TypeError('sandbox is not configurable; every Codex thread runs workspace-write in its cwd');
+  if (sandbox !== undefined) throw new TypeError('sandbox is not a thread option; use constructor config native overrides');
 }
 
 export function rpcError(payload) {
@@ -131,22 +176,9 @@ export function withThread(error, threadId) {
   });
 }
 
-// Every thread requests workspace-write at cwd, networkAccess:false and approvals never. The guard
-// checks native effective settings; it does not override Codex trusted rules, MCP servers or hooks.
-// thread/start, resume and fork accept a sandbox mode; turn/start also excludes temporary roots.
-// Effective read-only is refused rather than silently accepting fewer rights than requested.
-export const SANDBOX = 'workspace-write';
-export function permissionError(result, cwd) {
-  const policy = result?.sandbox;
-  const roots = policy?.writableRoots;
-  const base = result?.approvalPolicy === 'never' && typeof result.cwd === 'string' && resolve(result.cwd) === cwd
-    && policy?.networkAccess === false;
-  if (base && policy.type === 'workspaceWrite' && Array.isArray(roots)
-    && roots.every(root => typeof root === 'string' && resolve(root) === cwd)) return null;
-  const stricter = base && policy.type === 'readOnly';
-  const error = new Error(stricter
-    ? 'Codex enforces a read-only sandbox for this workspace-write request; no turn started'
-    : 'Codex reported an effective cwd, approval policy or sandbox wider than requested or unclear; no turn started');
-  error.code = stricter ? 'PERMISSION_STRICTER' : 'PERMISSION_UNSAFE';
-  return error;
+// Native sandbox and approval policy are authoritative. A thread must still preserve its requested cwd.
+export function cwdError(result, cwd) {
+  if (typeof result?.cwd === 'string' && resolve(result.cwd) === cwd
+    && (result.thread?.cwd === undefined || (typeof result.thread.cwd === 'string' && resolve(result.thread.cwd) === cwd))) return null;
+  return Object.assign(new Error('Codex reported a different or unclear cwd; no turn started'), { code: 'CWD_MISMATCH' });
 }

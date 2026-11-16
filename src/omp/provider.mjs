@@ -2,6 +2,7 @@
 // Codex owns inference, native tools, approvals and its persisted thread; OMP receives only
 // assistant events. Native activity streams as a thinking block, never as executable OMP tool calls.
 import { stripANSI } from 'bun';
+import { isDeepStrictEqual } from 'node:util';
 import { CodexAppServerClient } from '../codex/client.mjs';
 import { CODEX_BRIDGE_PROVIDER, CODEX_BRIDGE_API, CODEX_BRIDGE_MODELS, DEFAULT_MODEL_ID, parseCodexModelId, fetchCodexModels } from './catalog.mjs';
 import { inputId, inputBlocks, textOf, nativeInputs, nativeEffort, nativeOutputSchema, responseId, anchorOf } from './input.mjs';
@@ -10,13 +11,11 @@ import { loadSession, saveSession, sessionFile, readSessionRecord } from './sess
 export { CODEX_BRIDGE_PROVIDER, CODEX_BRIDGE_API, CODEX_BRIDGE_MODELS, DEFAULT_MODEL_ID, parseCodexModelId, fetchCodexModels };
 export { inputId, nativeInputs } from './input.mjs';
 
-const SANDBOX = 'workspace-write';
-
 const TERMINAL = new Set(['completed', 'failed', 'interrupted', 'disconnected']);
 const LINE_CHARS = 2000;
 const PROGRESS_CHARS = 64 * 1024;
 const FAILURE_TAIL_CHARS = 1200;
-const PROGRESS_LIMIT_NOTICE = '\n[codex] 64K-character append log limit reached (65,536 characters). Latest activity and plan continue in the status widget; codex_bridge status also exposes the latest state.';
+const PROGRESS_LIMIT_NOTICE = '\n[codex] 64K-character append log limit reached (65,536 characters). Use codex_bridge status for latest activity and plan, or /codex show THREAD_ID for saved native details.';
 // Sent ids are never evicted (an evicted id could be resent); a full record stops new sends.
 const SENT_LIMIT = 5000;
 // Classification text for every error this provider reports. OMP auto-retry classifies errors
@@ -108,7 +107,7 @@ function progressLine(method, params, state) {
  * session table. Each `options.sessionId` owns its own client and thread; teardown of
  * one session (provider state `close()`) never touches another.
  *
- * `stateDir` holds one small record per session (file name = sha256 of the session id): sandbox,
+ * `stateDir` holds one small record per session (file name = sha256 of the session id): policy marker,
  * cwd, native thread id, latest admitted turn id and the ids of every input already sent. It is
  * written before each native mutation, so a crash, dispose, revive or OMP requeue never sends
  * the same input to Codex twice.
@@ -134,12 +133,21 @@ export function createCodexBridgeProvider({ EventStream, stateDir, onRequest, on
 
   function openSession(sessionId, nativeModel, options) {
     let session = sessions.get(sessionId);
-    if (session) return session;
+    if (session) {
+      // Lifecycle hooks can open the client before its first stream supplies OMP's teardown map.
+      options.providerSessionState?.set(CODEX_BRIDGE_PROVIDER, session.providerState);
+      return session;
+    }
     session = loadSession(stateDir, sessionId, nativeModel, options.cwd);
     session.client = createClient({
       onNotification: (method, params) => session.sink?.(method, params),
       onRequest: onRequest?.forClient?.() ?? onRequest,
     });
+    const config = session.client.config ?? {};
+    if (session.recorded && !isDeepStrictEqual(session.config, config)) {
+      throw new Error('Native Codex bridge config overrides changed for this session; start a new task or fresh session. Nothing sent to Codex');
+    }
+    session.config = config;
     sessions.set(sessionId, session);
     // OMP closes provider session state on dispose, park, kill, new/fresh session and reload.
     // ponytail: records are never pruned (one small file per session); prune by mtime if it matters.
@@ -163,6 +171,7 @@ export function createCodexBridgeProvider({ EventStream, stateDir, onRequest, on
         return done;
       },
     };
+    session.providerState = providerState;
     session.close = () => providerState.close();
     options.providerSessionState?.set(CODEX_BRIDGE_PROVIDER, providerState);
     return session;
@@ -184,7 +193,7 @@ export function createCodexBridgeProvider({ EventStream, stateDir, onRequest, on
     const selected = parseCodexModelId(ctx.model.id);
     if (!selected) throw new Error('Unknown native model; no lifecycle operation performed');
     const session = openSession(sessionIdOf(ctx), selected.model, { cwd: ctx.cwd });
-    if (session.sandbox !== SANDBOX || session.cwd !== ctx.cwd || session.model !== selected.model) {
+    if (session.cwd !== ctx.cwd || session.model !== selected.model) {
       throw new Error('Native lifecycle settings do not match this session record; no native operation performed');
     }
     return session;
@@ -347,10 +356,6 @@ export function createCodexBridgeProvider({ EventStream, stateDir, onRequest, on
     };
 
     const session = openSession(options.sessionId, nativeModel, options);
-    // Never upgraded: the earlier turns of a read-only record ran without write access.
-    if (session.sandbox !== SANDBOX) {
-      return finish('error', `This session's native thread ran ${session.sandbox}; read-only Codex threads are not continued; start a new task. No native turn started`);
-    }
     if (session.cwd !== options.cwd) {
       return finish('error', `This session's native thread runs in ${session.cwd}; start a new task for ${options.cwd}. No native turn started`);
     }
@@ -511,7 +516,7 @@ export function createCodexBridgeProvider({ EventStream, stateDir, onRequest, on
     const { threadId, turnId } = session;
     if (!threadId || !turnId) return finish('error', 'Codex native turn identity is unknown; not resubmitted');
 
-    // Progress: one bounded append-only thinking block; the official UI widget replaces latest state.
+    // Progress stays in a bounded thinking block; the native footer summarizes active workers.
     let progress;
     let progressChars = 0;
     let logTruncated = false;
@@ -725,17 +730,19 @@ export function createCodexBridgeProvider({ EventStream, stateDir, onRequest, on
   streamSimple.clear = async sessionId => {
     sessionId = providerSessionIds.get(sessionId) ?? sessionId;
     await closing.get(sessionId);
-    const session = sessions.get(sessionId);
+    let session = sessions.get(sessionId);
     contexts.delete(sessionId);
     outputSchemas.delete(sessionId);
-    if (session) await resetSession(session);
-    else {
+    if (!session) {
       // Load only this session's durable record; never delete old native thread history.
       const record = readSessionRecord(sessionFile(stateDir, sessionId));
       if (record === undefined) return;
-      const loaded = openSession(sessionId, record.model, { cwd: record.cwd });
-      await resetSession(loaded);
+      session = openSession(sessionId, record.model, { cwd: record.cwd });
     }
+    // OMP closes provider state before session_clear and rotates the next request's UUID.
+    // A client reopened to confirm reset must not survive as an unregistered old-session server.
+    try { await resetSession(session); }
+    finally { await session.close(); }
   };
   function captureContext(_event, ctx, sessionId) {
     const branch = ctx.sessionManager.getBranch();

@@ -43,11 +43,31 @@ export function captureRoot(ctx: ExtensionContext, parsers: RequestParsers) {
 
 
 export async function onRequest(request: NativeRequest, owner: typeof root | null = root) {
-  const empty = request.method === "mcpServer/elicitation/request" ? { action: "cancel" } : { answers: {} };
+  const approval = request.method === "item/commandExecution/requestApproval" || request.method === "item/fileChange/requestApproval";
+  const permissions = request.method === "item/permissions/requestApproval";
+  const legacy = request.method === "applyPatchApproval" || request.method === "execCommandApproval";
+  const empty = approval ? { decision: "decline" }
+    : permissions ? { permissions: {}, scope: "turn" }
+    : legacy ? { decision: { denied: { rejection: "User approval was not granted" } } }
+    : request.method === "mcpServer/elicitation/request" ? { action: "cancel" } : { answers: {} };
   if (!owner?.ctx.hasUI || request.signal.aborted || owner.controller.signal.aborted) return empty;
   const signal = AbortSignal.any([request.signal, owner.controller.signal]);
   const current = () => !signal.aborted && root === owner;
   const ui = owner.ctx.ui;
+  if (approval || permissions || legacy) {
+    const params = request.params as Record<string, unknown>;
+    if (!params || typeof params !== "object" || Array.isArray(params)) return empty;
+    if (permissions && (!params.permissions || typeof params.permissions !== "object" || Array.isArray(params.permissions))) return empty;
+    if (request.method === "item/commandExecution/requestApproval" && params.availableDecisions != null
+      && (!Array.isArray(params.availableDecisions) || !params.availableDecisions.includes("accept"))) return empty;
+    const scope = permissions ? "Approve these permissions for this turn only?" : "Approve only this request?";
+    const selected = await ui.select(`Native Codex approval: ${request.method}\n${JSON.stringify(params, null, 2)}\n${scope}`,
+      ["Decline", "Approve once"], { signal });
+    if (!current() || selected !== "Approve once") return empty;
+    if (permissions) return { permissions: params.permissions, scope: "turn" };
+    if (legacy) return { decision: "approved" };
+    return { decision: "accept" };
+  }
   if (request.method === "item/tool/requestUserInput") {
     const params = owner.parsers.questions.parse(request.params);
     if (!params.isBlocking && params.delivery !== "async") return empty;

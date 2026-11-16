@@ -29,9 +29,6 @@ export default function (pi: ExtensionAPI) {
     streamSimple(model, context, options) {
       if (process.env.CODEX_HUB_FIXTURE_DISPATCH) appendFileSync(process.env.CODEX_HUB_FIXTURE_DISPATCH, `${JSON.stringify({ sessionId: options?.sessionId, model: model.id })}\n`);
       const stream = new AssistantMessageEventStream();
-      // CODEX_HUB_FIXTURE_DIRECT_SANDBOX: instead of the task call, one direct `codex_bridge` run carrying the
-      // removed `sandbox` argument with that value; the real OMP tool path must refuse it (SANDBOX_REMOVED).
-      const retiredSandbox = process.env.CODEX_HUB_FIXTURE_DIRECT_SANDBOX;
       const directArgs = process.env.CODEX_HUB_FIXTURE_DIRECT_JSON ? JSON.parse(process.env.CODEX_HUB_FIXTURE_DIRECT_JSON) : undefined;
       // A later explicit user prompt makes the fixture request the real tool's status card.
       const lastUser = context.messages.findLastIndex(message => message.role === "user");
@@ -39,7 +36,7 @@ export default function (pi: ExtensionAPI) {
       const userText = typeof userContent === "string" ? userContent
         : Array.isArray(userContent) ? userContent.filter(block => block.type === "text").map(block => block.text).join("\n") : "";
       const statusThread = directArgs ? /fixture-execution-status:(thread-\d+)/.exec(userText)?.[1] : undefined;
-      const direct = Boolean(retiredSandbox || directArgs);
+      const direct = Boolean(directArgs);
       const tool = direct ? "codex_bridge" : "task";
       // One initial call, plus one status call for each explicit later status prompt.
       const spawn = Boolean(context.tools?.some(entry => entry.name === tool))
@@ -49,7 +46,7 @@ export default function (pi: ExtensionAPI) {
         id: `codex-hub-fixture-${tool}${statusThread ? `-status-${lastUser}` : ""}`,
         name: tool,
         arguments: direct ? statusThread ? { action: "status", threadId: statusThread }
-          : directArgs ?? { action: "run", prompt: "fixture: removed sandbox argument must be refused", sandbox: retiredSandbox } : {
+          : directArgs : {
           // smoke.mjs passes a rich context (markdown, code, quoted headings) to check it reaches Codex whole.
           context: process.env.CODEX_HUB_FIXTURE_CONTEXT || "Codex bridge Hub fixture (test-only; fake app-server, no model inference).",
           tasks: Array.from({ length: Number(process.env.CODEX_HUB_FIXTURE_CHILDREN ?? 1) }, (_, index) => ({

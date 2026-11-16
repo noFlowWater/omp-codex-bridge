@@ -4,7 +4,7 @@ import { AppServerTransport } from './transport.mjs';
 import {
   TERMINAL, REFUSED_CODES, MAX_EVENT_TEXT, USAGE_KEYS,
   bounded, nonempty, jsonValue, userInput, usageBreakdown, aborted, checkSignal,
-  validateThreadOptions, withThread, SANDBOX, permissionError,
+  validateThreadOptions, withThread, resolveNativeConfig, cwdError, validateApprovalResult,
 } from './protocol.mjs';
 import {
   listModels, inspectConnection, listThreads, getThreadDetails, inspectThreadStatus, readLastTurn,
@@ -14,7 +14,7 @@ import {
 function blankState(threadId) {
   return {
     threadId, turnId: null, status: 'idle', error: null, outcomeUnknown: false,
-    cwd: null, model: null, requestedReasoningEffort: null, developerInstructions: undefined,
+    cwd: null, model: null, permissions: null, requestedReasoningEffort: null, developerInstructions: undefined,
     latestActivity: null, latestPlan: null, fileChanges: [], commandFailure: null, inspection: 'live',
     tokenUsage: null, tokenUsageTurnId: null, usageBaseline: null, turnUsage: null,
     events: [], messages: new Map(), textSize: 0, textTruncated: false,
@@ -27,9 +27,10 @@ function blankState(threadId) {
 export class CodexAppServerClient {
   // onNotification(method, boundedParams) observes owned-thread notifications (item progress for
   // provider streaming); the default subscriber API stays the lightweight {threadId, turnId, status}.
-  constructor({ command, timeoutMs, env, onNotification, onRequest } = {}) {
+  constructor({ command, timeoutMs, env, config, onNotification, onRequest } = {}) {
     if (onNotification !== undefined && typeof onNotification !== 'function') throw new TypeError('onNotification must be a function');
     if (onRequest !== undefined && typeof onRequest !== 'function') throw new TypeError('onRequest must be a function');
+    this._config = resolveNativeConfig(config, env);
     this._threads = new Map();
     this._queues = new Map();
     this._listeners = new Set();
@@ -45,6 +46,11 @@ export class CodexAppServerClient {
         for (const state of this._threads.values()) this._detachThread(state, error.message);
       },
     });
+  }
+
+  // A defensive copy binds callers' receipts without exposing mutable effective overrides.
+  get config() {
+    return structuredClone(this._config);
   }
 
   connect() {
@@ -151,7 +157,8 @@ export class CodexAppServerClient {
         if (threadId) state = this._getThread(threadId);
         try {
           await this._request(threadId ? 'thread/resume' : 'thread/start', {
-            cwd: directory, sandbox: SANDBOX, approvalPolicy: 'never', ...(model === undefined ? {} : { model }),
+            cwd: directory, ...(model === undefined ? {} : { model }),
+            ...(Object.keys(this._config).length ? { config: this.config } : {}),
             ...(developerInstructions === undefined ? {} : { developerInstructions }),
             ...(threadId ? { threadId, excludeTurns: true } : {}),
           }, {
@@ -160,7 +167,7 @@ export class CodexAppServerClient {
               const id = nonempty(result?.thread?.id, 'response.thread.id');
               if (threadId && id !== threadId) throw new Error('Codex resumed an unexpected thread');
               state = this._getThread(id);
-              const denied = permissionError(result, directory)
+              const denied = cwdError(result, directory)
                 // An explicit model is the thread's model; Codex silently using another one gets no turn.
                 ?? (model !== undefined && typeof result.model === 'string' && result.model !== model
                   ? Object.assign(new Error(`Codex reported model ${result.model} for requested model ${model}; no turn started`), { code: 'MODEL_MISMATCH' })
@@ -170,7 +177,8 @@ export class CodexAppServerClient {
                 state.error = denied.message;
                 throw denied;
               }
-              Object.assign(state, { cwd: result.cwd ?? directory, model: result.model ?? model ?? null, developerInstructions, attached: true });
+              Object.assign(state, { cwd: result.cwd ?? directory, model: result.model ?? model ?? null, developerInstructions,
+                permissions: bounded({ approvalPolicy: result.approvalPolicy ?? null, sandbox: result.sandbox ?? null }), attached: true });
               if (!threadId) state.usageBaseline = Object.fromEntries(USAGE_KEYS.map(key => [key, 0]));
               this._confirmOutcome(state, request.id);
               this._applyThread(state, result.thread);
@@ -213,7 +221,6 @@ export class CodexAppServerClient {
 
   // onThread(threadId) runs once the thread ID is confirmed and before any turn request, so a
   // caller can record the authoritative native ID first; if it throws, no turn is requested.
-  // The sandbox is always workspace-write (see permissionError); a caller-chosen sandbox is refused.
   async run({ threadId, prompt, input, cwd, model, onThread, sandbox, effort, outputSchema, developerInstructions } = {}) {
     input = userInput(prompt, input);
     if (effort !== undefined) nonempty(effort, 'effort');
@@ -242,11 +249,7 @@ export class CodexAppServerClient {
           this._publish(state);
           try {
             await this._request('turn/start', {
-              threadId: state.threadId, input, cwd: directory, approvalPolicy: 'never',
-              sandboxPolicy: {
-                type: 'workspaceWrite', writableRoots: [directory], networkAccess: false,
-                excludeTmpdirEnvVar: true, excludeSlashTmp: true,
-              },
+              threadId: state.threadId, input, cwd: directory,
               ...(model === undefined ? {} : { model }),
               ...(effort === undefined ? {} : { effort }),
               ...(outputSchema === undefined ? {} : { outputSchema }),
@@ -283,7 +286,7 @@ export class CodexAppServerClient {
     if (model !== undefined) nonempty(model, 'model');
     if (developerInstructions !== undefined && typeof developerInstructions !== 'string') throw new TypeError('developerInstructions must be a string');
     if (onThread !== undefined && typeof onThread !== 'function') throw new TypeError('onThread must be a function');
-    if (sandbox !== undefined) throw new TypeError('sandbox is not configurable');
+    if (sandbox !== undefined) throw new TypeError('sandbox is not a thread option; use constructor config native overrides');
     return this._serialize(threadId, async () => {
       const source = this._threads.get(threadId);
       if (source?.outcomeUnknown) throw new Error('Cannot fork a thread with an unconfirmed mutation');
@@ -298,7 +301,8 @@ export class CodexAppServerClient {
       try {
         await this._request('thread/fork', {
           threadId, ...(lastTurnId === undefined ? {} : { lastTurnId }),
-          cwd: directory, sandbox: SANDBOX, approvalPolicy: 'never', excludeTurns: true,
+          cwd: directory, excludeTurns: true,
+          ...(Object.keys(this._config).length ? { config: this.config } : {}),
           ...(model === undefined ? {} : { model }),
           ...(developerInstructions === undefined ? {} : { developerInstructions }),
         }, {
@@ -307,14 +311,15 @@ export class CodexAppServerClient {
             const id = nonempty(result?.thread?.id, 'response.thread.id');
             if (id === threadId || this._threads.has(id)) throw new Error('Codex fork returned an existing thread ID');
             forked = this._getThread(id);
-            const denied = permissionError(result, directory)
+            const denied = cwdError(result, directory)
               ?? (model !== undefined && typeof result.model === 'string' && result.model !== model
                 ? Object.assign(new Error('Codex fork reported a different model; no turn started'), { code: 'MODEL_MISMATCH' }) : null);
             if (denied) {
               forked.error = denied.message;
               throw withThread(denied, id);
             }
-            Object.assign(forked, { cwd: result.cwd ?? directory, model: result.model ?? model ?? null, developerInstructions, attached: true });
+            Object.assign(forked, { cwd: result.cwd ?? directory, model: result.model ?? model ?? null, developerInstructions,
+              permissions: bounded({ approvalPolicy: result.approvalPolicy ?? null, sandbox: result.sandbox ?? null }), attached: true });
             this._applyThread(forked, result.thread);
             if (request.timedOut) forked.error = 'Codex thread/fork response arrived after its timeout; no turn was started';
             this._publish(forked);
@@ -468,7 +473,7 @@ export class CodexAppServerClient {
     }
     if (!state.outcomeUnknown && !(state.status === 'inProgress' && !state.turnId)) return;
     // Only a native turn this client has not retired settles the outcome. A read cannot prove a timed-out
-    // resume applied its permission overrides, and an in-progress turn proves nothing about a timed-out
+    // resume attached successfully, and an in-progress turn proves nothing about a timed-out
     // steer/interrupt of that same turn or about work left by a dead server.
     const unproven = turn?.status === 'inProgress' && (state.status === 'disconnected'
       || (turn.id === state.turnId && ['turn/steer', 'turn/interrupt'].includes(state.uncertain?.method)));
@@ -557,7 +562,7 @@ export class CodexAppServerClient {
       compaction.reject(Object.assign(new Error(reason), { outcomeUnknown: true, threadId: state.threadId }));
     }
     state.attached = false;
-    // Permission overrides of a timed-out resume cannot outlive the server that held them.
+    // A timed-out resume cannot remain attached to a server that no longer holds it.
     if (state.uncertain?.method === 'thread/resume') this._confirmOutcome(state);
     if (state.status === 'inProgress' || state.outcomeUnknown) {
       Object.assign(state, { status: 'disconnected', outcomeUnknown: true, uncertain: null, error: reason });
@@ -706,33 +711,30 @@ export class CodexAppServerClient {
       try { this._transport.send({ id, ...payload }); }
       catch (error) { this._transport.fail(error); }
     };
-    if (method === 'item/commandExecution/requestApproval' || method === 'item/fileChange/requestApproval') {
-      reply({ result: { decision: 'decline' } });
-      return;
-    }
-    if (method === 'item/permissions/requestApproval') {
-      reply({ result: { permissions: {}, scope: 'turn' } });
-      return;
-    }
-    if (method === 'applyPatchApproval' || method === 'execCommandApproval') {
-      reply({ result: { decision: { denied: { rejection: 'OMP Codex native never grants approvals' } } } });
-      return;
-    }
+    const commandApproval = method === 'item/commandExecution/requestApproval';
+    const fileApproval = method === 'item/fileChange/requestApproval';
+    const permissionApproval = method === 'item/permissions/requestApproval';
+    const legacyApproval = method === 'applyPatchApproval' || method === 'execCommandApproval';
+    const approval = commandApproval || fileApproval || permissionApproval || legacyApproval;
+    const denied = legacyApproval ? { decision: { denied: { rejection: 'No approval handler is available' } } }
+      : permissionApproval ? { permissions: {}, scope: 'turn' } : { decision: 'decline' };
     const questions = method === 'item/tool/requestUserInput';
     const form = method === 'mcpServer/elicitation/request'
       && ['form', 'openai/form', 'openaiForm'].includes(params?.mode);
-    if (!questions && !form) {
+    if (!questions && !form && !approval) {
       reply({ error: { code: -32601, message: 'Server request method is not supported by this client' } });
       return;
     }
-    const state = this._threads.get(params?.threadId);
-    const turnId = params?.turnId ?? null;
+    const state = this._threads.get(params?.threadId ?? (legacyApproval ? params?.conversationId : undefined));
+    const turnId = params?.turnId ?? (legacyApproval ? state?.turnId : null);
     if (state?.interruptRequested && (turnId === null || state.interruptRequested.turnId === null
       || turnId === state.interruptRequested.turnId)) {
       reply({ error: { code: -32600, message: 'Native turn interruption is pending; user interaction cancelled' } });
       return;
     }
     if (!state || (questions && (!turnId || state.status !== 'inProgress' || state.turnId !== turnId))
+      || (approval && (!state.attached || state.outcomeUnknown || !turnId || state.status !== 'inProgress' || state.turnId !== turnId))
+      || (legacyApproval && params?.conversationId && params.conversationId !== state.threadId)
       || (!questions && turnId && (state.status !== 'inProgress' || state.turnId !== turnId))) {
       reply({ error: { code: -32602, message: 'Server request does not belong to an owned active turn' } });
       return;
@@ -749,7 +751,7 @@ export class CodexAppServerClient {
       if (controller.signal.aborted) return;
       return this._onRequest
         ? this._onRequest({ method, params: structuredClone(params), threadId: state.threadId, turnId, signal: controller.signal })
-        : questions ? { answers: {} } : { action: 'cancel' };
+        : approval ? denied : questions ? { answers: {} } : { action: 'cancel' };
     }).then(result => {
       if (this._serverRequests.get(id) !== request || controller.signal.aborted) return;
       if (!result || typeof result !== 'object' || Array.isArray(result)) throw new TypeError('onRequest must return a native result object');
@@ -757,7 +759,8 @@ export class CodexAppServerClient {
         if (!result.answers || typeof result.answers !== 'object' || Array.isArray(result.answers)
           || Object.values(result.answers).some(answer => !Array.isArray(answer?.answers)
             || answer.answers.some(value => typeof value !== 'string'))) throw new TypeError('Invalid native question answers');
-      } else if (!['accept', 'decline', 'cancel'].includes(result.action)) throw new TypeError('Invalid native MCP elicitation action');
+      } else if (approval) validateApprovalResult(method, result);
+      else if (!['accept', 'decline', 'cancel'].includes(result.action)) throw new TypeError('Invalid native MCP elicitation action');
       const value = jsonValue(result, 'onRequest result');
       this._serverRequests.delete(id);
       reply({ result: value });

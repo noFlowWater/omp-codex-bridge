@@ -3,7 +3,6 @@ import { readFileSync } from 'node:fs';
 import { nonempty, rpcError, REFUSED_CODES, OPT_OUT } from './protocol.mjs';
 
 const VERSION = JSON.parse(readFileSync(new URL('../../package.json', import.meta.url), 'utf8')).version;
-const ENV_KEYS = ['HOME', 'PATH', 'LANG', 'LC_ALL', 'TERM', 'TMPDIR', 'CODEX_HOME', 'SSL_CERT_FILE', 'SSL_CERT_DIR'];
 // Native userMessage items can echo attached data URLs. Bound each JSONL message, including those echoes.
 const MAX_LINE = 64 * 1024 * 1024;
 const LINE_TOO_LONG = 'Codex stdout JSONL line exceeded 64 MiB';
@@ -24,8 +23,11 @@ export class AppServerTransport {
     this.command = [...command];
     this.timeoutMs = timeoutMs;
     this.env = {};
-    for (const key of ENV_KEYS) {
-      const value = env && Object.hasOwn(env, key) ? env[key] : process.env[key];
+    // Native providers, proxies and MCP servers resolve credentials/settings from the process environment.
+    // Keep partial caller overrides; null/undefined explicitly removes an inherited variable.
+    for (const [key, value] of Object.entries({ ...process.env, ...env })) {
+      nonempty(key, 'env key');
+      if (key.includes('=')) throw new TypeError('env keys must not contain "="');
       if (value === undefined || value === null) continue;
       if (typeof value !== 'string' || value.includes('\0')) throw new TypeError(`env.${key} must be a string without NUL characters`);
       this.env[key] = value;

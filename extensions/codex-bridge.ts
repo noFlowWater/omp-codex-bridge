@@ -20,7 +20,7 @@ const streamSimple = createCodexBridgeProvider({
 
 export default function (pi: ExtensionAPI) {
   // The Codex-backed task agent (agents/codex-bridge.md) runs on this provider; Codex keeps the
-  // tool loop, OMP sees assistant events only. Every thread runs workspace-write in its cwd. The
+  // tool loop and configured permissions; OMP sees assistant events only. The
   // static `default` id runs Codex's default model; discovery (native model/list, cached by OMP)
   // adds one profile per native model slug.
   pi.registerProvider(CODEX_BRIDGE_PROVIDER, {
