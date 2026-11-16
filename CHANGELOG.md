@@ -3,7 +3,7 @@
 ## 0.8.0 — 2026-11-17
 
 - Add `/codex jobs` with native worker selection, details, messages and targeted interruption; retain failed drafts and reject stale turn selections.
-- Include current Codex Hub workers when the host exposes `ctx.agents`, with queued cancellation and native Hub focus.
+- Include started Codex Hub workers when the host exposes `ctx.agents`, with native Hub focus.
 - Continue saved history through a selected finished turn as a fresh Hub child after explicit question submission. Keep source history unchanged, fork context inside its child provider and never replay source transcripts or uncertain forks.
 - Page older finished boundaries and separate history selection, worker selection, host controls and durable fork admission into focused modules.
 - Ship an optional patch for the pinned OMP 18.21.0 host API; stock hosts retain direct-worker controls and report missing Hub controls explicitly.
