@@ -3049,7 +3049,7 @@ test('provider explicitly caps append log while replacing latest activity and pl
   const thinking = message.content.find(block => block.type === 'thinking').thinking;
   assert.ok(thinking.length <= 64 * 1024);
   assert.equal(thinking.match(/64K-character append log limit reached/g).length, 1);
-  assert.match(thinking, /requested[^;\n]*unknown/);
+  assert.match(thinking, /requested effort native default \(not overridden\)/);
   assert.doesNotMatch(thinking, /LATEST PLAN|LATEST NATIVE ACTIVITY|FOREIGN ACTIVITY|model rerouted/);
   assert.ok(statuses.some(status => status?.logTruncated && status.activity?.includes('LATEST NATIVE ACTIVITY') && status.plan?.includes('LATEST PLAN')));
   assert.ok(statuses.every(status => !status || (status.activity?.length ?? 0) <= 2000 && (status.plan?.length ?? 0) <= 2000));
@@ -3125,8 +3125,9 @@ test('native execution and partial delegation records keep unknown identity and 
   assert.equal(final.type, 'done', message.errorMessage);
   const thinking = message.content.find(block => block.type === 'thinking').thinking;
   const header = thinking.split('\n')[0];
-  assert.equal(header.match(/unknown/g)?.length, 3, 'model, cwd and requested effort remain unknown');
-  assert.doesNotMatch(header, /gpt-|default|effective/);
+  assert.equal(header.match(/unknown/g)?.length, 2, 'model and cwd remain unknown');
+  assert.match(header, /requested effort native default \(not overridden\)/);
+  assert.doesNotMatch(header, /gpt-|effective/);
   const partial = statuses.find(status => status?.activity?.includes('delegation') && !status.activity.includes('native-child-long'))?.activity;
   assert.match(partial, /unknown/);
   assert.doesNotMatch(partial, /\b0\b|done|completed/);

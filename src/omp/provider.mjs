@@ -337,7 +337,8 @@ export function createCodexBridgeProvider({ EventStream, stateDir, onRequest, on
       if (line) activity = clip(line, LINE_CHARS);
     }
     const execution = initial?.execution ?? initial;
-    note(`native execution: model ${nativeLabel(execution?.model, 200)}; cwd ${nativeLabel(execution?.cwd, 1000)}; requested effort ${nativeLabel(execution?.requestedReasoningEffort, 32)}`);
+    const effortLabel = execution?.requestedReasoningEffort == null ? 'native default (not overridden)' : nativeLabel(execution.requestedReasoningEffort, 32);
+    note(`native execution: model ${nativeLabel(execution?.model, 200)}; cwd ${nativeLabel(execution?.cwd, 1000)}; requested effort ${effortLabel}`);
     // Replay the bounded event window, then recover semantic state even when its event was evicted.
     for (const event of initial?.events ?? []) sink(event.method, event.params);
     if (initial?.latestPlan && !(initial.events ?? []).some(event => event.method === 'turn/plan/updated' && event.params?.turnId === turnId)) {

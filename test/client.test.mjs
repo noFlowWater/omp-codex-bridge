@@ -263,7 +263,12 @@ export function fakeServer() {
       if (value === null) delete result[key];
       else result[key] = value;
     }
-    const started = () => notify('thread/started', { thread: threadView(thread) });
+    if (method === 'thread/resume' && options.completeOnResume && running.has(thread.id)) {
+      running.get(thread.id).status = 'completed';
+      running.delete(thread.id);
+      save();
+    }
+    const started = () => notify('thread/started', { thread: options.completeOnResume && method === 'thread/resume' ? result.thread : threadView(thread) });
     if (options.earlyThread) {
       started();
       const foreign = { id: 'foreign-thread', cwd: '/', parentThreadId: thread.id };
@@ -1534,6 +1539,28 @@ it('rejects turn-only settings on a resumed active turn instead of discarding th
   assert.equal(client.snapshot('active').status, 'inProgress');
   assert.equal(sent(dir, 'thread/resume')[0].excludeTurns, true);
   assert.equal(sent(dir, 'turn/start').length, 0);
+  assert.equal(sent(dir, 'turn/steer').length, 0);
+});
+
+it('reconciles an omitted active turn before deciding whether run settings would change it', async (t) => {
+  const { client, dir } = makeClient(t, { staleTurns: true, liveResume: true, earlyThread: true }, {}, savedStore([
+    ['active-without-id', [savedTurn('running', 'inProgress')]],
+  ]));
+  await assert.rejects(client.run({ threadId: 'active-without-id', prompt: 'never sent', effort: 'high', cwd }), /cannot change an active turn/);
+  assert.equal(client.snapshot('active-without-id').turnId, 'running', 'the active turn is identified before rejection');
+  assert.ok(sent(dir, 'thread/turns/list').length > 0);
+  assert.equal(sent(dir, 'turn/start').length, 0);
+  assert.equal(sent(dir, 'turn/steer').length, 0);
+});
+
+it('starts a new turn when reconciliation shows the omitted active turn has already completed', async (t) => {
+  const { client, dir } = makeClient(t, { staleTurns: true, liveResume: true, earlyThread: true, completeOnResume: true, turns: ['hold'] }, {}, savedStore([
+    ['ending-without-id', [savedTurn('finished', 'inProgress')]],
+  ]));
+  const result = await client.run({ threadId: 'ending-without-id', prompt: 'new input', effort: 'high', cwd });
+  assert.notEqual(result.turnId, 'finished');
+  assert.equal(sent(dir, 'turn/start').length, 1);
+  assert.equal(sent(dir, 'turn/start')[0].effort, 'high');
   assert.equal(sent(dir, 'turn/steer').length, 0);
 });
 

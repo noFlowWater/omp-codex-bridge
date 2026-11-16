@@ -1,5 +1,10 @@
 # Changelog
 
+## 0.6.2 — 2026-11-17
+
+- Resolve the current native turn before rejecting turn-start options on a resumed thread with omitted turns; retain the guard for a confirmed running turn and explain how to send a live follow-up.
+- Label an omitted requested effort as the native default rather than unknown; effective effort still requires native evidence.
+
 ## 0.6.1 — 2026-11-17
 
 - Honor cancellation while direct/native turn admission is pending; interrupt a newly submitted turn when its caller aborts before the admission reply.

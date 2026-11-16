@@ -271,11 +271,11 @@ export class CodexAppServerClient {
         const directory = state.cwd;
         if (onThread) await onThread(state.threadId);
         checkSignal(signal);
-        if (state.status === 'inProgress' && (effort !== undefined || outputSchema !== undefined || serviceTier != null)) {
-          throw new Error('effort, outputSchema and serviceTier cannot change an active turn through turn/steer');
-        }
         if (state.status === 'inProgress' && !state.turnId) await this._reconcile(state);
         checkSignal(signal);
+        if (state.status === 'inProgress' && (effort !== undefined || outputSchema !== undefined || serviceTier != null)) {
+          throw new Error('effort, outputSchema and serviceTier cannot change an active turn through turn/steer. Omit these turn-start options for a live follow-up, or wait for completion before starting a new turn; no input sent');
+        }
         if (state.status === 'inProgress') {
           await this._steerTurn(state, input);
         } else {

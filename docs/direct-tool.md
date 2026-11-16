@@ -18,6 +18,8 @@ Cancellation during admission is checked before submitting a new turn. If a new 
 
 Continue or cancel a thread owned by the current direct-tool server:
 
+While its turn is running, `run` sends follow-up input with `turn/steer`. Omit `effort`, `outputSchema` and `serviceTier` for that follow-up, even if they match the original request. Those options apply only when starting a new turn after the current turn finishes.
+
 ```json
 {"action":"run","threadId":"<returned-thread-id>","cwd":"/absolute/project","prompt":"Check the error path next."}
 {"action":"cancel","threadId":"<returned-thread-id>"}
