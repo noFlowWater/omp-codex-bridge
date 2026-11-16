@@ -1108,6 +1108,63 @@ test('a thread/start timeout leaves nothing delivered: the next message starts a
 
 
 
+test('cancellation during admission keeps delivery receipts so the next request cannot replay accepted input', async () => {
+  await withHost({ turns: ['slow-admit', 'finish-later'] }, undefined, async ({ providers, dir }) => {
+    const task = at('accepted before cancellation', 1000);
+    const controller = new AbortController();
+    const pending = stream(providers, { messages: [task] }, { sessionId: 'cancel-admitted', signal: controller.signal });
+    await until(() => sentParams(dir, 'turn/start').length === 1);
+    controller.abort();
+    const cancelled = await pending;
+    assert.equal(cancelled.final.reason, 'aborted');
+    assert.ok(readRecord('cancel-admitted').sent.includes(inputId(task)), 'native acceptance remains recorded after cancellation');
+    const continued = await stream(providers, { messages: [task, cancelled.message, at('new request', 3000)] }, { sessionId: 'cancel-admitted' });
+    assert.equal(continued.final.type, 'done', continued.message.errorMessage);
+    assert.equal(deliveries(dir, task.content), 1, 'accepted input is never replayed');
+    assert.equal(deliveries(dir, 'new request'), 1);
+  });
+}, TIMEOUT);
+
+test('cancelling while a previous native turn is ending releases the wait without consuming new input', async () => {
+  await withHost({ turns: ['hold'], interruptCompletionDelay: 3000 }, undefined, async ({ providers, dir }) => {
+    const waiting = Promise.withResolvers();
+    let observeWait = false;
+    let client;
+    const { config } = providerModel(providers);
+    config.streamSimple = createCodexBridgeProvider({ EventStream: AssistantMessageEventStream, stateDir: STATE_DIR,
+      createClient: options => {
+        client = new CodexAppServerClient(options);
+        const snapshot = client.snapshot.bind(client);
+        client.snapshot = threadId => {
+          const state = snapshot(threadId);
+          if (observeWait && state?.status === 'inProgress') waiting.resolve();
+          return state;
+        };
+        return client;
+      },
+    });
+    const task = at('interrupted task', 1000);
+    const next = at('cancelled before next admission', 3000);
+    const firstAbort = new AbortController();
+    const first = stream(providers, { messages: [task] }, { sessionId: 'cancel-wait', signal: firstAbort.signal });
+    await until(() => sentParams(dir, 'turn/start').length === 1);
+    firstAbort.abort();
+    assert.equal((await first).final.reason, 'aborted');
+    observeWait = true;
+    const secondAbort = new AbortController();
+    const second = stream(providers, { messages: [task, next] }, { sessionId: 'cancel-wait', signal: secondAbort.signal });
+    await waiting.promise;
+    secondAbort.abort();
+    const result = await Promise.race([second, delay(1000).then(() => assert.fail('Cancellation did not release the previous-turn wait'))]);
+    assert.equal(result.final.reason, 'aborted');
+    assert.match(result.message.errorMessage, /no native turn started/);
+    assert.equal(client.snapshot(sentParams(dir, 'turn/start')[0].threadId).status, 'inProgress', 'cancellation does not wait for native completion');
+    assert.equal(sentParams(dir, 'turn/start').length, 1);
+    assert.equal(deliveries(dir, next.content), 0);
+    assert.ok(!readRecord('cancel-wait').sent.includes(inputId(next)), 'unsubmitted input remains available');
+  });
+}, TIMEOUT);
+
 test('a second request while the first is still awaiting admission sends nothing', async () => {
   await withHost({ turns: ['slow-admit'] }, undefined, async ({ providers, dir }) => {
     const task = at('slow task 3e9a', 1000);
@@ -1493,6 +1550,7 @@ test('native catalog capabilities and measured context window become model metad
   const { fetchCodexModels } = await import('../src/omp/provider.mjs');
   let closed = false;
   const models = await fetchCodexModels({ createClient: () => ({
+    defaultModel: async () => undefined,
     listModels: async () => [{
       model: 'catalog-model', isDefault: true, contextWindow: 200000,
       inputModalities: ['text', 'image'], supportedReasoningEfforts: [{ reasoningEffort: 'high' }],
@@ -1505,6 +1563,31 @@ test('native catalog capabilities and measured context window become model metad
     assert.equal(model.reasoning, true);
     assert.deepEqual(model.input, ['text', 'image']);
   }
+});
+
+test('advertised max and ultra efforts reach Codex without a bridge allowlist', async () => {
+  await withHost({ reasoningEfforts: ['max', 'ultra'], turns: ['finish-later', 'finish-later'] }, undefined, async ({ providers, dir }) => {
+    for (const reasoning of ['max', 'ultra']) {
+      const result = await stream(providers, { messages: [at(reasoning, 20100)] }, { sessionId: `new-effort-${reasoning}`, reasoning });
+      assert.equal(result.final.type, 'done', result.message.errorMessage);
+      assert.equal(sentParams(dir, 'turn/start').at(-1).effort, reasoning);
+    }
+  });
+}, TIMEOUT);
+
+test('default model metadata follows effective configuration rather than the catalog default', async () => {
+  const { fetchCodexModels } = await import('../src/omp/catalog.mjs');
+  const models = await fetchCodexModels({ createClient: () => ({
+    defaultModel: async () => 'configured',
+    listModels: async () => [
+      { model: 'catalog-default', isDefault: true, inputModalities: ['text'], supportedReasoningEfforts: [] },
+      { model: 'configured', inputModalities: ['text', 'image'], supportedReasoningEfforts: ['high'], contextWindow: 200000 },
+    ],
+    close: async () => {},
+  }) });
+  assert.deepEqual(models[0].input, ['text', 'image']);
+  assert.equal(models[0].reasoning, true);
+  assert.equal(models[0].contextWindow, 200000);
 });
 
 function lifecycleContext(sessionId, model, initial = []) {
@@ -1829,6 +1912,19 @@ test('native approval uses full scope and grants only the explicit once answer',
   });
 }, TIMEOUT);
 
+test('direct tool cancellation during thread admission submits no native turn', async () => {
+  await withHost({ startDelay: 200, turns: ['hold'] }, undefined, async ({ tool, ctx, dir }) => {
+    const controller = new AbortController();
+    const pending = tool.execute('cancel-admission', { action: 'run', prompt: 'cancel before turn', cwd }, controller.signal, undefined, ctx);
+    await until(() => sentParams(dir, 'thread/start').length === 1);
+    controller.abort();
+    const result = await pending;
+    assert.equal(result.isError, true);
+    assert.match(result.details.error, /aborted/i);
+    assert.equal(sentParams(dir, 'turn/start').length, 0);
+  });
+}, TIMEOUT);
+
 test('completion notices and direct results render human cards while retaining structured transport', async () => {
   await withHost({ turns: ['finish-later'] }, undefined, async ({ call, tool, followUps, renderers }) => {
     const started = await call({ action: 'run', prompt: 'finish' });
@@ -2110,6 +2206,10 @@ for (const [name, field, input] of [
       let submitPrompts = 0;
       let inputPrompts = 0;
       ctx.ui.input = async () => { inputPrompts++; return input; };
+      if (field.type === 'array') ctx.ui.askDialog = async questions => {
+        inputPrompts++;
+        return { kind: 'submit', results: [{ id: questions[0].id, selectedOptions: JSON.parse(input) }] };
+      };
       ctx.ui.select = async title => { if (title.includes('Submit these answers?')) submitPrompts++; return 'Submit answers'; };
       const result = await stream(providers, { messages: [at(`invalid ${name}`, 44000)] }, { sessionId: `form-${name}` });
       assert.equal(result.final.type, 'done', result.message.errorMessage);
@@ -2120,6 +2220,87 @@ for (const [name, field, input] of [
     });
   }, TIMEOUT);
 }
+
+for (const [control, field] of [
+  ['input', { type: 'integer' }],
+  ['select', { type: 'string', enum: ['red', 'blue'] }],
+  ['askDialog', { type: 'array', items: { enum: ['red', 'blue'] } }],
+]) {
+  test(`MCP form ${control} failures reach the native error response without asking to edit an answer`, async () => {
+    const elicitationSchema = { type: 'object', properties: { value: field }, required: ['value'] };
+    await withHost({ elicitationSchema, turns: ['elicitation'] }, undefined, async ({ providers, ctx, dir }) => {
+      ctx.hasUI = true;
+      let corrections = 0;
+      ctx.ui.select = async () => { corrections++; return 'Cancel form'; };
+      ctx.ui[control] = async title => {
+        if (typeof title === 'string' && title.includes('Other answers are kept.')) { corrections++; return 'Cancel form'; }
+        throw new Error('Fixture UI unavailable');
+      };
+      const result = await stream(providers, { messages: [at('form UI failure', 44050)] }, { sessionId: `form-error-${control}` });
+      assert.equal(result.final.type, 'done', result.message.errorMessage);
+      const answer = trace(dir).find(({ message }) => message?.id === 902 && !message.method)?.message;
+      assert.equal(answer.error?.message, 'Fixture UI unavailable');
+      assert.equal(answer.result, undefined);
+      assert.equal(corrections, 0, 'host failures cannot be repaired by changing an answer');
+    });
+  }, TIMEOUT);
+}
+
+test('MCP form corrections keep valid fields and revalidate before explicit submission', async () => {
+  const elicitationSchema = { type: 'object', properties: { name: { type: 'string', minLength: 2 }, count: { type: 'integer', minimum: 1 } }, required: ['name', 'count'] };
+  await withHost({ elicitationSchema, turns: ['elicitation'] }, undefined, async ({ providers, ctx, dir }) => {
+    ctx.hasUI = true;
+    const reads = [];
+    const counts = ['not a number', '0', '2'];
+    ctx.ui.input = async title => { reads.push(title.includes('count') ? 'count' : 'name'); return title.includes('count') ? counts.shift() : 'saved name'; };
+    ctx.ui.select = async title => title.includes('Other answers are kept.') ? 'Edit answer' : 'Submit answers';
+    const result = await stream(providers, { messages: [at('correct field', 44100)] }, { sessionId: 'form-correction' });
+    assert.equal(result.final.type, 'done', result.message.errorMessage);
+    const answer = trace(dir).find(({ message }) => message?.id === 902 && !message.method)?.message;
+    assert.deepEqual(answer.result, { action: 'accept', content: { name: 'saved name', count: 2 } });
+    assert.deepEqual(reads, ['name', 'count', 'count', 'count']);
+  });
+}, TIMEOUT);
+
+test('MCP array enums use native multi-select and retain array constraints', async () => {
+  const elicitationSchema = { type: 'object', properties: { colors: { type: 'array', items: { enum: ['red', 'blue'] }, minItems: 2, maxItems: 2 } }, required: ['colors'] };
+  await withHost({ elicitationSchema, turns: ['elicitation'] }, undefined, async ({ providers, ctx, dir }) => {
+    ctx.hasUI = true;
+    const selections = [['red'], ['red', 'blue']];
+    ctx.ui.input = async () => { assert.fail('Enumerated arrays must not ask for JSON'); };
+    ctx.ui.askDialog = async questions => {
+      assert.equal(questions[0].multi, true);
+      assert.deepEqual(questions[0].options.map(option => option.label), ['red', 'blue']);
+      return { kind: 'submit', results: [{ id: 'colors', selectedOptions: selections.shift() }] };
+    };
+    ctx.ui.select = async title => title.includes('Other answers are kept.') ? 'Edit answer' : 'Submit answers';
+    const result = await stream(providers, { messages: [at('choose colors', 44200)] }, { sessionId: 'form-choices' });
+    assert.equal(result.final.type, 'done', result.message.errorMessage);
+    const answer = trace(dir).find(({ message }) => message?.id === 902 && !message.method)?.message;
+    assert.deepEqual(answer.result, { action: 'accept', content: { colors: ['red', 'blue'] } });
+    assert.equal(selections.length, 0);
+  });
+}, TIMEOUT);
+
+test('MCP array controls support empty selections and the native checkbox fallback', async () => {
+  for (const rich of [true, false]) {
+    const elicitationSchema = { type: 'object', properties: { colors: { type: 'array', items: { enum: ['red', 'blue'] }, minItems: rich ? 0 : 1 } }, required: ['colors'] };
+    await withHost({ elicitationSchema, turns: ['elicitation'] }, undefined, async ({ providers, ctx, dir }) => {
+      ctx.hasUI = true;
+      ctx.ui.input = async () => { assert.fail('Choice arrays do not need JSON input'); };
+      if (rich) ctx.ui.askDialog = async questions => {
+        assert.ok(questions[0].options.some(option => option.label === 'Select none'));
+        return { kind: 'submit', results: [{ id: 'colors', selectedOptions: ['Select none'] }] };
+      };
+      ctx.ui.select = async (title, choices) => title.includes('Submit these answers?') ? 'Submit answers'
+        : choices.includes('[x] red') ? 'Done' : '[ ] red';
+      const result = await stream(providers, { messages: [at('array controls', 44300)] }, { sessionId: `array-${rich}` });
+      assert.equal(result.final.type, 'done', result.message.errorMessage);
+      const answer = trace(dir).find(({ message }) => message?.id === 902 && !message.method)?.message;
+      assert.deepEqual(answer.result, { action: 'accept', content: { colors: rich ? [] : ['red'] } });
+    });
+  }
+}, TIMEOUT);
 
 test('MCP required fields cannot disappear from the original schema during UI rendering', async () => {
   const elicitationSchema = { type: 'object', properties: {}, required: ['notRendered'] };
@@ -2253,6 +2434,7 @@ test('static default advertises image and effort support before background nativ
 test('discovered model restrictions remain authoritative for default and explicit native profiles', async () => {
   const { fetchCodexModels } = await import('../src/omp/provider.mjs');
   const models = await fetchCodexModels({ createClient: () => ({
+    defaultModel: async () => undefined,
     listModels: async () => [{
       model: 'text-only-native', isDefault: true, inputModalities: ['text'], supportedReasoningEfforts: [],
     }],

@@ -1,21 +1,17 @@
 // Command-backed OMP provider: one Codex app-server thread per OMP provider session.
 // Codex owns inference, native tools, approvals and its persisted thread; OMP receives only
 // assistant events. Native activity streams as a thinking block, never as executable OMP tool calls.
-import { stripANSI } from 'bun';
 import { isDeepStrictEqual } from 'node:util';
 import { CodexAppServerClient } from '../codex/client.mjs';
 import { CODEX_BRIDGE_PROVIDER, CODEX_BRIDGE_API, CODEX_BRIDGE_MODELS, DEFAULT_MODEL_ID, parseCodexModelId, fetchCodexModels } from './catalog.mjs';
 import { inputId, inputBlocks, textOf, nativeInputs, nativeEffort, nativeOutputSchema, responseId, anchorOf } from './input.mjs';
+import { LINE_CHARS, PROGRESS_CHARS, PROGRESS_LIMIT_NOTICE, clip, planLine, commandLine, nativeLabel, progressLine } from './progress.mjs';
 import { loadSession, saveSession, sessionFile, readSessionRecord } from './session-store.mjs';
 
 export { CODEX_BRIDGE_PROVIDER, CODEX_BRIDGE_API, CODEX_BRIDGE_MODELS, DEFAULT_MODEL_ID, parseCodexModelId, fetchCodexModels };
 export { inputId, nativeInputs } from './input.mjs';
 
 const TERMINAL = new Set(['completed', 'failed', 'interrupted', 'disconnected']);
-const LINE_CHARS = 2000;
-const PROGRESS_CHARS = 64 * 1024;
-const FAILURE_TAIL_CHARS = 1200;
-const PROGRESS_LIMIT_NOTICE = '\n[codex] 64K-character append log limit reached (65,536 characters). Use codex_bridge status for latest activity and plan, or /codex show THREAD_ID for saved native details.';
 // Sent ids are never evicted (an evicted id could be resent); a full record stops new sends.
 const SENT_LIMIT = 5000;
 // Classification text for every error this provider reports. OMP auto-retry classifies errors
@@ -44,7 +40,6 @@ function applyUsage(output, state) {
 }
 
 
-const clip = (text, limit) => text.length > limit ? `${text.slice(0, limit - 1)}…` : text;
 
 
 function lastAssistant(messages, provider) {
@@ -53,82 +48,6 @@ function lastAssistant(messages, provider) {
     if (message.role === 'assistant' && message.provider === provider) return message;
   }
   return undefined;
-}
-function planLine(plan) {
-  if (!plan) return undefined;
-  const steps = (plan.plan ?? []).slice(0, 12).map(({ step, status }) => `[${status}] ${clip(step, 120)}`);
-  if ((plan.plan?.length ?? 0) > steps.length) steps.push(`… ${plan.plan.length - steps.length} more steps`);
-  return clip(`plan${plan.explanation ? `: ${clip(plan.explanation, 300)}` : ''}\n${steps.join('\n')}`, LINE_CHARS);
-}
-
-function commandLine(item, failure) {
-  const header = `$ ${clip(item.command ?? '', 400)} → ${item.status}${item.exitCode == null ? '' : ` (exit ${item.exitCode})`}`;
-  if (item.status !== 'failed' && !(typeof item.exitCode === 'number' && item.exitCode !== 0)) return header;
-  const output = failure?.itemId === item.id ? failure.outputTail : item.aggregatedOutput;
-  if (!output) return header;
-  const truncated = failure?.itemId === item.id ? failure.outputTruncated : item.outputTruncated;
-  const tail = stripANSI(output).replace(/[\u0000-\u0008\u000b-\u001f\u007f-\u009f]/g, '');
-  return `${header}\ncommand output tail${truncated || tail.length > FAILURE_TAIL_CHARS ? ' (truncated)' : ''}; may contain sensitive data:\n${tail.slice(-FAILURE_TAIL_CHARS)}`;
-}
-
-
-const nativeLabel = (value, limit = 120) => typeof value === 'string' && value
-  ? clip(stripANSI(value).replace(/[\u0000-\u001f\u007f-\u009f]/g, ' '), limit) : 'unknown';
-
-function delegationLine(item) {
-  const prefix = 'Codex internal delegation';
-  if (item.type === 'subAgentActivity') {
-    return `${prefix}: child ${nativeLabel(item.kind, 32)}; thread ${nativeLabel(item.agentThreadId, 80)}; path ${nativeLabel(item.agentPath, 160)}`
-      + (item.model ? `; model ${nativeLabel(item.model)}` : '')
-      + (item.reasoningEffort ? `; effort ${nativeLabel(item.reasoningEffort, 32)}` : '');
-  }
-  const operation = {
-    spawnAgent: 'spawn', sendInput: 'send input', resumeAgent: 'resume', wait: 'wait',
-    closeAgent: 'close', sendMessage: 'send message', followupTask: 'follow-up',
-    interruptAgent: 'interrupt', listAgents: 'list',
-  }[item.tool] ?? 'operation unknown';
-  const states = item.agentsStates && typeof item.agentsStates === 'object' && !Array.isArray(item.agentsStates)
-    ? item.agentsStates : null;
-  const receivers = Array.isArray(item.receiverThreadIds) ? item.receiverThreadIds : null;
-  const children = new Set([...(receivers ?? []), ...Object.keys(states ?? {})].filter(id => typeof id === 'string' && id));
-  const counts = new Map();
-  for (const id of children) {
-    const status = states?.[id]?.status;
-    const label = ['pendingInit', 'running', 'interrupted', 'completed', 'errored', 'shutdown', 'notFound'].includes(status) ? status : 'unknown';
-    counts.set(label, (counts.get(label) ?? 0) + 1);
-  }
-  const statuses = [...counts].map(([status, count]) => `${count} ${status}`).join(', ');
-  return `${prefix}: ${operation} ${nativeLabel(item.status, 32)}; observed children ${states || receivers ? children.size : 'unknown'}${statuses ? ` (${statuses})` : ''}`;
-}
-
-function progressLine(method, params, state) {
-  // Native context stays in snapshots and assistant usage, not the append-only activity log.
-  if (method === 'thread/tokenUsage/updated') return undefined;
-  if (method === 'turn/started') return `turn ${params.turn?.id ?? ''} started`;
-  if (method === 'turn/completed') return `turn ${params.turn?.id ?? ''} ${params.turn?.status ?? 'ended'}`;
-  if (method === 'turn/plan/updated') return planLine(params);
-  if (method === 'error') return `error: ${params.error?.message ?? 'Codex reported an error'}`;
-  if (method === 'model/rerouted') return `model rerouted ${params.fromModel} → ${params.toModel} (${params.reason})`;
-  const item = params.item;
-  if (!item) return undefined;
-  if ((method === 'item/started' || method === 'item/completed')
-    && (item.type === 'subAgentActivity' || item.type === 'collabAgentToolCall')) return delegationLine(item);
-  if (method === 'item/started') {
-    if (item.type === 'commandExecution') return `$ ${item.command}`;
-    if (item.type === 'mcpToolCall') return `mcp ${item.server}.${item.tool} started`;
-    return undefined;
-  }
-  if (method !== 'item/completed') return undefined;
-  switch (item.type) {
-    case 'agentMessage': return item.phase === 'final_answer' ? undefined : item.text;
-    case 'reasoning': return item.summary?.length ? item.summary.join('\n') : undefined;
-    case 'plan': return `plan: ${item.text}`;
-    case 'commandExecution': return commandLine(item, state?.commandFailure);
-    case 'fileChange': return `files ${item.status}: ${(item.changes ?? []).map(change => change.path).join(', ')}`;
-    case 'mcpToolCall': return `mcp ${item.server}.${item.tool} → ${item.status}`;
-    case 'userMessage': return undefined;
-    default: return `${item.type} done`;
-  }
 }
 
 /**
@@ -292,17 +211,271 @@ export function createCodexBridgeProvider({ EventStream, stateDir, onRequest, on
   function settled(client, threadId, turnId, signal) {
     return new Promise(resolveSettled => {
       let unsubscribe = () => {};
+      const finish = state => {
+        unsubscribe();
+        signal?.removeEventListener('abort', abort);
+        resolveSettled(state);
+      };
+      const abort = () => finish(undefined);
       const check = () => {
+        if (signal?.aborted) return abort();
         const state = client.snapshot(threadId);
         if (!state || (turnId ? state.turnId === turnId && TERMINAL.has(state.status) : state.status !== 'inProgress')) {
-          unsubscribe();
-          resolveSettled(state);
+          finish(state);
         }
       };
       unsubscribe = client.subscribe(event => { if (event.threadId === threadId) check(); });
-      signal?.addEventListener('abort', unsubscribe, { once: true });
+      signal?.addEventListener('abort', abort, { once: true });
       check();
     });
+  }
+
+  async function steerInputs(session, steering, signal, note) {
+    const { client, threadId, turnId } = session;
+    while (steering && !signal.aborted) {
+      await steering.wait(signal);
+      if (signal.aborted) return;
+      const claim = await steering.claim(signal);
+      if (!claim) { await new Promise(resolveDelay => setTimeout(resolveDelay, 50)); continue; }
+      let ids, input, text;
+      try {
+        ids = claim.messages.map(inputId);
+        input = claim.messages.flatMap(inputBlocks);
+        text = claim.messages.map(textOf).filter(part => part.trim()).join('\n\n');
+      } catch (error) {
+        // OMP owns undeliverable input again; every claimed batch must settle exactly once.
+        claim.reject();
+        note(`steering rejected before submission: ${error.message}`);
+        continue;
+      }
+      // A full record cannot hold the steer: OMP delivers it with the next request, which then stops.
+      if (!input.length || signal.aborted || session.sent.size + ids.length > SENT_LIMIT) { claim.reject(); continue; }
+      // Recorded first: if OMP requeues this input after an abort, it is not sent again.
+      for (const id of ids) session.sent.add(id);
+      try { saveSession(stateDir, session); } catch {
+        // Unrecorded input is never steered; OMP delivers it with the next request.
+        for (const id of ids) session.sent.delete(id);
+        claim.reject();
+        continue;
+      }
+      try {
+        await client.steer({ threadId, turnId, input });
+        claim.accept();
+        note(`steered: ${text}`);
+      } catch (error) {
+        if (error?.outcomeUnknown) {
+          // It may already be in the native turn: never send it again.
+          claim.accept();
+          note(`steer outcome unknown, not resent: ${error.message}`);
+        } else {
+          for (const id of ids) session.sent.delete(id);
+          // ponytail: if this rewrite fails, only the on-disk record still lists the unsent steer; a later revive then refuses it as "already submitted" (fail closed, never a duplicate).
+          try { saveSession(stateDir, session); } catch { /* fail closed: see above */ }
+          claim.reject();
+        }
+      }
+    }
+  }
+
+  async function watchTurn(stream, output, session, options) {
+    const { client, threadId, turnId } = session;
+    const { signal } = options;
+    // Progress stays in a bounded thinking block; the native footer summarizes active workers.
+    let progress;
+    let progressChars = 0;
+    let logTruncated = false;
+    let lines = 0;
+    let activity = null;
+    let plan = null;
+    const publish = (state = client.snapshot(threadId)) => {
+      if (state?.latestPlan) plan = planLine(state.latestPlan);
+      reportProgress(options.sessionId, {
+        threadId, turnId, status: state?.status ?? 'unknown', activity, plan,
+        execution: state?.execution ?? {
+          model: state?.model ?? null, cwd: state?.cwd ?? null, requestedReasoningEffort: null,
+        },
+        logTruncated,
+      });
+    };
+    const append = (delta) => {
+      if (!progress) {
+        progress = { type: 'thinking', thinking: '' };
+        output.content.push(progress);
+        stream.push({ type: 'thinking_start', contentIndex: 0, partial: output });
+      }
+      progressChars += delta.length;
+      progress.thinking += delta;
+      stream.push({ type: 'thinking_delta', contentIndex: 0, delta, partial: output });
+    };
+    const note = (line) => {
+      if (!line || logTruncated) return;
+      const delta = `${progress?.thinking ? '\n' : ''}[codex ${++lines}] ${clip(line, LINE_CHARS)}`;
+      // Reserve the explicit ceiling notice; never grow the transcript beyond its original cap.
+      if (progressChars + delta.length > PROGRESS_CHARS - PROGRESS_LIMIT_NOTICE.length) {
+        logTruncated = true;
+        append(PROGRESS_LIMIT_NOTICE);
+        return;
+      }
+      append(delta);
+    };
+    const sink = (method, params) => {
+      if ((params?.turnId ?? params?.turn?.id) !== turnId) return;
+      try {
+        const state = client.snapshot(threadId);
+        const line = progressLine(method, params, state);
+        if (line) activity = clip(line, LINE_CHARS);
+        if (method === 'turn/plan/updated') plan = planLine(params);
+        note(line);
+        publish(state);
+      } catch { /* malformed item: no progress line */ }
+    };
+    const initial = client.snapshot(threadId);
+    // Snapshot activity initializes replay only; a newer live event must never be replaced by an older snapshot field.
+    if (initial?.latestActivity) {
+      const latest = initial.latestActivity;
+      const line = progressLine(latest.method, latest.params, initial);
+      if (line) activity = clip(line, LINE_CHARS);
+    }
+    const execution = initial?.execution ?? initial;
+    note(`native execution: model ${nativeLabel(execution?.model, 200)}; cwd ${nativeLabel(execution?.cwd, 1000)}; requested effort ${nativeLabel(execution?.requestedReasoningEffort, 32)}`);
+    // Replay the bounded event window, then recover semantic state even when its event was evicted.
+    for (const event of initial?.events ?? []) sink(event.method, event.params);
+    if (initial?.latestPlan && !(initial.events ?? []).some(event => event.method === 'turn/plan/updated' && event.params?.turnId === turnId)) {
+      note(planLine(initial.latestPlan));
+    }
+    if (initial?.commandFailure && !(initial.events ?? []).some(event => event.params?.item?.id === initial.commandFailure.itemId && event.method === 'item/completed')) {
+      note(commandLine({
+        id: initial.commandFailure.itemId, command: initial.commandFailure.command,
+        status: 'failed', exitCode: initial.commandFailure.exitCode,
+      }, initial.commandFailure));
+    }
+    session.sink = sink;
+    publish(initial);
+
+    const ended = new AbortController();
+    let abortDetail;
+    const interrupted = new Promise(resolveAbort => {
+      const interrupt = async () => {
+        try {
+          await client.cancel(threadId);
+          abortDetail = `Codex interrupt requested for turn ${turnId}`;
+        } catch (error) {
+          abortDetail = `Codex interrupt of turn ${turnId} failed: ${error?.message ?? error}`;
+        }
+        resolveAbort();
+      };
+      if (signal?.aborted) void interrupt();
+      else signal?.addEventListener('abort', interrupt, { once: true, signal: ended.signal });
+    });
+    void steerInputs(session, options.liveSteering, ended.signal, note).catch(() => {});
+
+    try {
+      const result = await Promise.race([settled(client, threadId, turnId, ended.signal), interrupted.then(() => undefined)]);
+      if (progress) stream.push({ type: 'thinking_end', contentIndex: 0, content: progress.thinking, partial: output });
+      return { result, abortDetail };
+    } finally {
+      ended.abort();
+      reportProgress(options.sessionId, undefined);
+      if (session.sink === sink) session.sink = undefined;
+    }
+  }
+
+  async function submitInputs(session, fresh, request) {
+    const { client } = session;
+    const { options, serviceTier, outputSchema, taskName, systemPrompt } = request;
+    const { signal } = options;
+    let effectiveModel = session.model;
+    // A full record cannot hold these ids; checked before any native request, including reads.
+    const ids = fresh.map(inputId);
+    if (session.sent.size + ids.length > SENT_LIMIT) {
+      throw new Error(`codex-bridge sent-input record is full (${SENT_LIMIT} inputs); nothing sent. Start a new task`);
+    }
+    // An interrupted turn may still be winding down; new input starts a turn, never steers it.
+    if (session.threadId && client.snapshot(session.threadId)?.status === 'inProgress') {
+      await settled(client, session.threadId, undefined, signal);
+      if (signal?.aborted) throw Object.assign(new Error('Cancelled while the previous native turn was ending; no native turn started'), { stopReason: 'aborted' });
+    }
+    // New input only follows a turn confirmed finished: after a crash the new client knows
+    // nothing, and resume/reconcile would otherwise steer into, or race, a still-running turn.
+    // status() is read-only (persisted last turn on a new client, reconcile on a live one).
+    // ponytail: a turn a dead server left inProgress in history stops this child for good; start a new task.
+    if (session.threadId) {
+      let last;
+      try { last = await client.status(session.threadId); }
+      catch (error) { throw new Error(`Previous Codex turn on ${session.threadId} could not be confirmed finished (${error?.message ?? error}); nothing sent`); }
+      if (last?.outcomeUnknown || !['idle', 'completed', 'failed', 'interrupted'].includes(last?.status)) {
+        throw new Error(`Previous Codex turn ${last?.turnId ?? session.turnId ?? '(unconfirmed)'} on ${session.threadId} is ${last?.status ?? 'unknown'}; not confirmed finished, nothing sent. Interrupt or inspect it with codex_bridge status, or start a new task`);
+      }
+      effectiveModel ??= last.model;
+      // An earlier submission's outcome is unconfirmed (crash or unknown RPC outcome). Only a new,
+      // finished native turn proves it was admitted; otherwise its input could be lost or doubled.
+      if (session.failure) {
+        if (!last?.turnId || last.turnId === session.turnId || !['completed', 'failed', 'interrupted'].includes(last.status)) {
+          throw new Error(`An earlier input's Codex submission on ${session.threadId} is unconfirmed (${session.failure}); not resent, nothing sent. Inspect it with codex_bridge status, or start a new task`);
+        }
+        Object.assign(session, { turnId: last.turnId, admitted: true, failure: undefined });
+        try { saveSession(stateDir, session); } catch (error) {
+          throw new Error(`codex-bridge could not write its session record (${error?.message ?? error}); nothing sent to Codex`);
+        }
+      }
+    }
+    // Only a fresh native thread gets developerInstructions. Existing records already hold the old user-text delegation.
+    const system = !session.threadId ? (systemPrompt ?? []).join('\n\n').trim() : '';
+    const input = fresh.flatMap(inputBlocks);
+    const effort = await nativeEffort(client, effectiveModel, options);
+    // Recorded before any native mutation: from here on these inputs are never sent again.
+    for (const id of ids) session.sent.add(id);
+    // Until admission is confirmed the record says so; the previous turn id stays as the baseline.
+    Object.assign(session, { failure: 'Codex submission in flight; outcome unknown', inFlight: true });
+    try { saveSession(stateDir, session); } catch (error) {
+      for (const id of ids) session.sent.delete(id);
+      Object.assign(session, { failure: undefined, inFlight: false });
+      throw new Error(`codex-bridge could not write its session record (${error?.message ?? error}); nothing sent to Codex`);
+    }
+    let snapshot;
+    try {
+      snapshot = await client.run({
+        threadId: session.threadId, input, cwd: options.cwd, model: session.model,
+        effort, serviceTier, outputSchema, developerInstructions: system || undefined, signal,
+        // A thread whose ID cannot be recorded gets no turn.
+        onThread: (threadId) => {
+          if (session.threadId !== threadId) {
+            session.threadId = threadId;
+            session.threads.add(threadId);
+            saveSession(stateDir, session);
+          }
+          if (taskName && (session.nativeName?.threadId !== threadId || session.nativeName.name !== taskName)) {
+            session.nativeName = { threadId, name: taskName };
+            // Titles are optional metadata; their RPC must not delay or replay task input.
+            void client.setThreadName(threadId, taskName).catch(error => {
+              try { onNotice?.(`Codex task name could not be saved: ${clip(error.message, 300)}`, 'warning'); } catch { /* UI only. */ }
+            });
+          }
+        },
+      });
+      session.inFlight = false;
+    } catch (error) {
+      session.inFlight = false;
+      session.threadId ??= typeof error?.threadId === 'string' ? error.threadId : undefined;
+      const message = `Codex native submission failed${error?.code ? ` (${error.code})` : ''}: ${error?.message ?? error}`;
+      // Without a confirmed thread ID no turn/start was ever sent (an unknown thread/start at most
+      // leaves an empty orphan thread), so only then are the inputs definitely undelivered.
+      if (error?.outcomeUnknown === true && session.threadId) {
+        // The turn may exist: these inputs stay recorded as sent and are never resubmitted.
+        Object.assign(session, { admitted: true, failure: `${message}; outcome unknown, not resubmitted` });
+      } else {
+        // Definitely not admitted: the inputs were not delivered and go with the next new message.
+        for (const id of ids) session.sent.delete(id);
+        session.failure = undefined;
+      }
+      let recordError = '';
+      try { saveSession(stateDir, session); } catch (saveError) { recordError = `; session record not updated: ${saveError?.message ?? saveError}`; }
+      throw new Error((session.failure ?? message) + recordError);
+    }
+    Object.assign(session, { threadId: snapshot.threadId, turnId: snapshot.turnId, admitted: true, failure: undefined });
+    try { saveSession(stateDir, session); } catch (error) {
+      throw new Error(`Codex admitted turn ${snapshot.turnId} on thread ${snapshot.threadId}, but the session record could not be written (${error?.message ?? error}); the turn keeps running natively and is not observed here. Inspect it with codex_bridge status`);
+    }
   }
 
   async function drive(stream, model, context, options) {
@@ -450,97 +623,10 @@ export function createCodexBridgeProvider({ EventStream, stateDir, onRequest, on
 
     let replayed = false;
     if (fresh.length) {
-      // A full record cannot hold these ids; checked before any native request, including reads.
-      const ids = fresh.map(inputId);
-      if (session.sent.size + ids.length > SENT_LIMIT) {
-        return finish('error', `codex-bridge sent-input record is full (${SENT_LIMIT} inputs); nothing sent. Start a new task`);
-      }
-      // An interrupted turn may still be winding down; new input starts a turn, never steers it.
-      if (session.threadId && client.snapshot(session.threadId)?.status === 'inProgress') {
-        await settled(client, session.threadId, undefined, signal);
-        if (signal?.aborted) return finish('aborted', 'Cancelled while the previous native turn was ending; no native turn started');
-      }
-      // New input only follows a turn confirmed finished: after a crash the new client knows
-      // nothing, and resume/reconcile would otherwise steer into, or race, a still-running turn.
-      // status() is read-only (persisted last turn on a new client, reconcile on a live one).
-      // ponytail: a turn a dead server left inProgress in history stops this child for good; start a new task.
-      if (session.threadId) {
-        let last;
-        try { last = await client.status(session.threadId); }
-        catch (error) { return finish('error', `Previous Codex turn on ${session.threadId} could not be confirmed finished (${error?.message ?? error}); nothing sent`); }
-        if (last?.outcomeUnknown || !['idle', 'completed', 'failed', 'interrupted'].includes(last?.status)) {
-          return finish('error', `Previous Codex turn ${last?.turnId ?? session.turnId ?? '(unconfirmed)'} on ${session.threadId} is ${last?.status ?? 'unknown'}; not confirmed finished, nothing sent. Interrupt or inspect it with codex_bridge status, or start a new task`);
-        }
-        // An earlier submission's outcome is unconfirmed (crash or unknown RPC outcome). Only a new,
-        // finished native turn proves it was admitted; otherwise its input could be lost or doubled.
-        if (session.failure) {
-          if (!last?.turnId || last.turnId === session.turnId || !['completed', 'failed', 'interrupted'].includes(last.status)) {
-            return finish('error', `An earlier input's Codex submission on ${session.threadId} is unconfirmed (${session.failure}); not resent, nothing sent. Inspect it with codex_bridge status, or start a new task`);
-          }
-          Object.assign(session, { turnId: last.turnId, admitted: true, failure: undefined });
-          try { saveSession(stateDir, session); } catch (error) {
-            return finish('error', `codex-bridge could not write its session record (${error?.message ?? error}); nothing sent to Codex`);
-          }
-        }
-      }
-      // Only a fresh native thread gets developerInstructions. Existing records already hold the old user-text delegation.
-      const system = !session.threadId ? (context.systemPrompt ?? []).join('\n\n').trim() : '';
-      const input = fresh.flatMap(inputBlocks);
-      let effort;
-      try { effort = await nativeEffort(client, session.model, options); }
-      catch (error) { return finish('error', error.message); }
-      // Recorded before any native mutation: from here on these inputs are never sent again.
-      for (const id of ids) session.sent.add(id);
-      // Until admission is confirmed the record says so; the previous turn id stays as the baseline.
-      Object.assign(session, { failure: 'Codex submission in flight; outcome unknown', inFlight: true });
-      try { saveSession(stateDir, session); } catch (error) {
-        for (const id of ids) session.sent.delete(id);
-        Object.assign(session, { failure: undefined, inFlight: false });
-        return finish('error', `codex-bridge could not write its session record (${error?.message ?? error}); nothing sent to Codex`);
-      }
-      let snapshot;
       try {
-        snapshot = await client.run({
-          threadId: session.threadId, input, cwd: options.cwd, model: session.model,
-          effort, serviceTier, outputSchema, developerInstructions: system || undefined,
-          // A thread whose ID cannot be recorded gets no turn.
-          onThread: (threadId) => {
-            if (session.threadId !== threadId) {
-              session.threadId = threadId;
-              session.threads.add(threadId);
-              saveSession(stateDir, session);
-            }
-            if (taskName && (session.nativeName?.threadId !== threadId || session.nativeName.name !== taskName)) {
-              session.nativeName = { threadId, name: taskName };
-              // Titles are optional metadata; their RPC must not delay or replay task input.
-              void client.setThreadName(threadId, taskName).catch(error => {
-                try { onNotice?.(`Codex task name could not be saved: ${clip(error.message, 300)}`, 'warning'); } catch { /* UI only. */ }
-              });
-            }
-          },
-        });
-        session.inFlight = false;
+        await submitInputs(session, fresh, { options, serviceTier, outputSchema, taskName, systemPrompt: context.systemPrompt });
       } catch (error) {
-        session.inFlight = false;
-        session.threadId ??= typeof error?.threadId === 'string' ? error.threadId : undefined;
-        const message = `Codex native submission failed${error?.code ? ` (${error.code})` : ''}: ${error?.message ?? error}`;
-        // Without a confirmed thread ID no turn/start was ever sent (an unknown thread/start at most
-        // leaves an empty orphan thread), so only then are the inputs definitely undelivered.
-        if (error?.outcomeUnknown === true && session.threadId) {
-          // The turn may exist: these inputs stay recorded as sent and are never resubmitted.
-          Object.assign(session, { admitted: true, failure: `${message}; outcome unknown, not resubmitted` });
-        } else {
-          // Definitely not admitted: the inputs were not delivered and go with the next new message.
-          for (const id of ids) session.sent.delete(id);
-          session.failure = undefined;
-        }
-        let recordError = '';
-        try { saveSession(stateDir, session); } catch (saveError) { recordError = `; session record not updated: ${saveError?.message ?? saveError}`; }
-        return finish('error', (session.failure ?? message) + recordError);
-      }
-      Object.assign(session, { threadId: snapshot.threadId, turnId: snapshot.turnId, admitted: true, failure: undefined });
-      try { saveSession(stateDir, session); } catch (error) {
-        return finish('error', `Codex admitted turn ${snapshot.turnId} on thread ${snapshot.threadId}, but the session record could not be written (${error?.message ?? error}); the turn keeps running natively and is not observed here. Inspect it with codex_bridge status`);
+        return finish(error.stopReason ?? 'error', error.message);
       }
     } else {
       // Every input was already sent (provider retry, revive after crash/dispose, requeued steer):
@@ -564,161 +650,19 @@ export function createCodexBridgeProvider({ EventStream, stateDir, onRequest, on
     const { threadId, turnId } = session;
     if (!threadId || !turnId) return finish('error', 'Codex native turn identity is unknown; not resubmitted');
 
-    // Progress stays in a bounded thinking block; the native footer summarizes active workers.
-    let progress;
-    let progressChars = 0;
-    let logTruncated = false;
-    let lines = 0;
-    let activity = null;
-    let plan = null;
-    const publish = (state = client.snapshot(threadId)) => {
-      if (state?.latestPlan) plan = planLine(state.latestPlan);
-      reportProgress(options.sessionId, {
-        threadId, turnId, status: state?.status ?? 'unknown', activity, plan,
-        execution: state?.execution ?? {
-          model: state?.model ?? null, cwd: state?.cwd ?? null, requestedReasoningEffort: null,
-        },
-        logTruncated,
-      });
-    };
-    const append = (delta) => {
-      if (!progress) {
-        progress = { type: 'thinking', thinking: '' };
-        output.content.push(progress);
-        stream.push({ type: 'thinking_start', contentIndex: 0, partial: output });
-      }
-      progressChars += delta.length;
-      progress.thinking += delta;
-      stream.push({ type: 'thinking_delta', contentIndex: 0, delta, partial: output });
-    };
-    const note = (line) => {
-      if (!line || logTruncated) return;
-      const delta = `${progress?.thinking ? '\n' : ''}[codex ${++lines}] ${clip(line, LINE_CHARS)}`;
-      // Reserve the explicit ceiling notice; never grow the transcript beyond its original cap.
-      if (progressChars + delta.length > PROGRESS_CHARS - PROGRESS_LIMIT_NOTICE.length) {
-        logTruncated = true;
-        append(PROGRESS_LIMIT_NOTICE);
-        return;
-      }
-      append(delta);
-    };
-    const sink = (method, params) => {
-      if ((params?.turnId ?? params?.turn?.id) !== turnId) return;
-      try {
-        const state = client.snapshot(threadId);
-        const line = progressLine(method, params, state);
-        if (line) activity = clip(line, LINE_CHARS);
-        if (method === 'turn/plan/updated') plan = planLine(params);
-        note(line);
-        publish(state);
-      } catch { /* malformed item: no progress line */ }
-    };
-    const initial = client.snapshot(threadId);
-    // Snapshot activity initializes replay only; a newer live event must never be replaced by an older snapshot field.
-    if (initial?.latestActivity) {
-      const latest = initial.latestActivity;
-      const line = progressLine(latest.method, latest.params, initial);
-      if (line) activity = clip(line, LINE_CHARS);
+    const { result, abortDetail } = await watchTurn(stream, output, session, options);
+    if (!result) return finish('aborted', `${abortDetail}; native completion is not confirmed`);
+    applyUsage(output, result);
+    if (result.status === 'completed') return complete(result.text ?? '', turnId, result);
+    const detail = result.error ? `: ${result.error}` : '';
+    if (result.status === 'interrupted') {
+      if (replayed && !signal?.aborted) return finish('error', `This input was already delivered into interrupted Codex turn ${turnId}; send a new message to continue`);
+      return finish(signal?.aborted ? 'aborted' : 'error', `Codex native turn ${turnId} was interrupted${detail}`);
     }
-    const execution = initial?.execution ?? initial;
-    note(`native execution: model ${nativeLabel(execution?.model, 200)}; cwd ${nativeLabel(execution?.cwd, 1000)}; requested effort ${nativeLabel(execution?.requestedReasoningEffort, 32)}`);
-    // Replay the bounded event window, then recover semantic state even when its event was evicted.
-    for (const event of initial?.events ?? []) sink(event.method, event.params);
-    if (initial?.latestPlan && !(initial.events ?? []).some(event => event.method === 'turn/plan/updated' && event.params?.turnId === turnId)) {
-      note(planLine(initial.latestPlan));
+    if (result.status === 'disconnected') {
+      return finish('error', `Codex app-server disconnected; outcome of native turn ${turnId} is unknown and was not resubmitted${detail}`);
     }
-    if (initial?.commandFailure && !(initial.events ?? []).some(event => event.params?.item?.id === initial.commandFailure.itemId && event.method === 'item/completed')) {
-      note(commandLine({
-        id: initial.commandFailure.itemId, command: initial.commandFailure.command,
-        status: 'failed', exitCode: initial.commandFailure.exitCode,
-      }, initial.commandFailure));
-    }
-    session.sink = sink;
-    publish(initial);
-
-    const ended = new AbortController();
-    let abortDetail;
-    const interrupted = new Promise(resolveAbort => {
-      const interrupt = async () => {
-        try {
-          await client.cancel(threadId);
-          abortDetail = `Codex interrupt requested for turn ${turnId}`;
-        } catch (error) {
-          abortDetail = `Codex interrupt of turn ${turnId} failed: ${error?.message ?? error}`;
-        }
-        resolveAbort();
-      };
-      if (signal?.aborted) void interrupt();
-      else signal?.addEventListener('abort', interrupt, { once: true, signal: ended.signal });
-    });
-    // Live steering: user input typed while this turn runs goes into the same native turn.
-    void (async () => {
-      const steering = options.liveSteering;
-      while (steering && !ended.signal.aborted) {
-        await steering.wait(ended.signal);
-        if (ended.signal.aborted) return;
-        const claim = await steering.claim(ended.signal);
-        if (!claim) { await new Promise(resolveDelay => setTimeout(resolveDelay, 50)); continue; }
-        let ids, input, text;
-        try {
-          ids = claim.messages.map(inputId);
-          input = claim.messages.flatMap(inputBlocks);
-          text = claim.messages.map(textOf).filter(part => part.trim()).join('\n\n');
-        } catch (error) {
-          // OMP owns undeliverable input again; every claimed batch must settle exactly once.
-          claim.reject();
-          note(`steering rejected before submission: ${error.message}`);
-          continue;
-        }
-        // A full record cannot hold the steer: OMP delivers it with the next request, which then stops.
-        if (!input.length || ended.signal.aborted || session.sent.size + ids.length > SENT_LIMIT) { claim.reject(); continue; }
-        // Recorded first: if OMP requeues this input after an abort, it is not sent again.
-        for (const id of ids) session.sent.add(id);
-        try { saveSession(stateDir, session); } catch {
-          // Unrecorded input is never steered; OMP delivers it with the next request.
-          for (const id of ids) session.sent.delete(id);
-          claim.reject();
-          continue;
-        }
-        try {
-          await client.steer({ threadId, turnId, input });
-          claim.accept();
-          note(`steered: ${text}`);
-        } catch (error) {
-          if (error?.outcomeUnknown) {
-            // It may already be in the native turn: never send it again.
-            claim.accept();
-            note(`steer outcome unknown, not resent: ${error.message}`);
-          } else {
-            for (const id of ids) session.sent.delete(id);
-            // ponytail: if this rewrite fails, only the on-disk record still lists the unsent steer; a later revive then refuses it as "already submitted" (fail closed, never a duplicate).
-            try { saveSession(stateDir, session); } catch { /* fail closed: see above */ }
-            claim.reject();
-          }
-        }
-      }
-    })().catch(() => {});
-
-    try {
-      const result = await Promise.race([settled(client, threadId, turnId, ended.signal), interrupted.then(() => undefined)]);
-      if (progress) stream.push({ type: 'thinking_end', contentIndex: 0, content: progress.thinking, partial: output });
-      if (!result) return finish('aborted', `${abortDetail}; native completion is not confirmed`);
-      applyUsage(output, result);
-      if (result.status === 'completed') return complete(result.text ?? '', turnId, result);
-      const detail = result.error ? `: ${result.error}` : '';
-      if (result.status === 'interrupted') {
-        if (replayed && !signal?.aborted) return finish('error', `This input was already delivered into interrupted Codex turn ${turnId}; send a new message to continue`);
-        return finish(signal?.aborted ? 'aborted' : 'error', `Codex native turn ${turnId} was interrupted${detail}`);
-      }
-      if (result.status === 'disconnected') {
-        return finish('error', `Codex app-server disconnected; outcome of native turn ${turnId} is unknown and was not resubmitted${detail}`);
-      }
-      return finish('error', `Codex native turn ${turnId} failed${detail || ': no error message'}`);
-    } finally {
-      ended.abort();
-      reportProgress(options.sessionId, undefined);
-      if (session.sink === sink) session.sink = undefined;
-    }
+    return finish('error', `Codex native turn ${turnId} failed${detail || ': no error message'}`);
   }
 
   function streamSimple(model, context, options = {}) {

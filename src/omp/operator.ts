@@ -204,6 +204,19 @@ export function registerOperator(pi: ExtensionAPI, access: {
   const forkOptions = z.object({ lastTurnId: z.string().min(1).optional(), name: z.string().min(1).optional() }).strict();
   const tierChoices = ["inherit", "default", "flex", "scale", "priority", "ultrafast", "auto"] as const;
   const tiers = z.enum(tierChoices);
+  async function selectTier(input: string, ctx: ExtensionContext) {
+    const current = pi.getServiceTiers().openai;
+    const selected = input || (ctx.hasUI ? await ctx.ui.select(
+      `OpenAI-family service tier for this OMP session (current: ${current ?? "inherit"}). Native account/model availability applies.`,
+      [...tierChoices]) : undefined);
+    if (selected === undefined) {
+      return { readOnly: true, serviceTier: current ?? "inherit", scope: "OpenAI-family setting for this OMP session", ...(ctx.hasUI ? { cancelled: true } : {}) };
+    }
+    const tier = tiers.parse(selected);
+    await pi.setServiceTier("openai", tier === "inherit" ? undefined : tier);
+    return { readOnly: false, serviceTier: tier, scope: "OpenAI-family setting for this OMP session", note: "Native tier availability, quota use and charges depend on the account/model. auto/inherit preserve native defaults; direct-tool serviceTier is per-call." };
+  }
+
   pi.registerCommand("codex", {
     description: "Codex doctor, status, saved history picker, details and explicit direct-thread fork; /codex for help",
     handler: async (args, ctx) => {
@@ -215,48 +228,51 @@ export function registerOperator(pi: ExtensionAPI, access: {
         const rest = raw ? input.slice(6).trim() : input;
         let result: unknown;
         let label = command;
-        if (command === "doctor") {
-          if (rest) throw new Error("doctor takes no arguments");
-          result = await readOnlyAction("diagnose", {}, await access.getClient(), pi, ctx);
-        } else if (command === "history") {
-          const params = history.parse(rest ? JSON.parse(rest) : {});
-          const client = await access.getClient();
-          result = ctx.hasUI && !raw ? await pickHistory(params, client, pi, ctx, access.fork) : await readOnlyAction("history", params, client, pi, ctx);
-        } else if (command === "fork") {
-          const [threadId, options = ""] = rest.trim().split(/\s+(.*)/s);
-          if (!threadId) throw new Error("fork requires THREAD_ID");
-          selectedThreadId = threadId;
-          result = await access.fork({ threadId, ...forkOptions.parse(options ? JSON.parse(options) : {}) });
-        } else if (command === "tier") {
-          const current = pi.getServiceTiers().openai;
-          const selected = rest || (ctx.hasUI ? await ctx.ui.select(
-            `OpenAI-family service tier for this OMP session (current: ${current ?? "inherit"}). Native account/model availability applies.`,
-            [...tierChoices]) : undefined);
-          if (selected === undefined) {
-            result = { readOnly: true, serviceTier: current ?? "inherit", scope: "OpenAI-family setting for this OMP session", ...(ctx.hasUI ? { cancelled: true } : {}) };
-          } else {
-            const tier = tiers.parse(selected);
-            await pi.setServiceTier("openai", tier === "inherit" ? undefined : tier);
-            result = { readOnly: false, serviceTier: tier, scope: "OpenAI-family setting for this OMP session", note: "Native tier availability, quota use and charges depend on the account/model. auto/inherit preserve native defaults; direct-tool serviceTier is per-call." };
+        switch (command) {
+          case "doctor": {
+            if (rest) throw new Error("doctor takes no arguments");
+            result = await readOnlyAction("diagnose", {}, await access.getClient(), pi, ctx);
+            break;
           }
-        } else if (command === "show") {
-          const [threadId, options = ""] = rest.trim().split(/\s+(.*)/s);
-          if (!threadId) throw new Error("show requires THREAD_ID");
-          selectedThreadId = threadId;
-          const params = details.parse(options ? JSON.parse(options) : {});
-          result = await readOnlyAction("details", { ...params, threadId }, await access.getClient(), pi, ctx);
-          label = "details";
-        } else if (command === "status") {
-          if (/\s/.test(rest.trim())) throw new Error("status accepts one THREAD_ID");
-          selectedThreadId = rest || undefined;
-          result = rest ? await access.status(rest) : {
-            scope: "Locally loaded direct-tool threads only; use history or status THREAD_ID for Hub/saved threads.",
-            threads: await access.status(),
-          };
-        } else {
-          if (command !== "help") throw new Error(`Unknown command: ${command}. Use /codex for help.`);
-          pi.sendMessage({ customType: "codex-bridge-operator", content: HELP, details: { label: "help", raw: false }, display: true }, { triggerTurn: false });
-          return;
+          case "history": {
+            const params = history.parse(rest ? JSON.parse(rest) : {});
+            const client = await access.getClient();
+            result = ctx.hasUI && !raw ? await pickHistory(params, client, pi, ctx, access.fork) : await readOnlyAction("history", params, client, pi, ctx);
+            break;
+          }
+          case "fork": {
+            const [threadId, options = ""] = rest.trim().split(/\s+(.*)/s);
+            if (!threadId) throw new Error("fork requires THREAD_ID");
+            selectedThreadId = threadId;
+            result = await access.fork({ threadId, ...forkOptions.parse(options ? JSON.parse(options) : {}) });
+            break;
+          }
+          case "tier": {
+            result = await selectTier(rest, ctx);
+            break;
+          }
+          case "show": {
+            const [threadId, options = ""] = rest.trim().split(/\s+(.*)/s);
+            if (!threadId) throw new Error("show requires THREAD_ID");
+            selectedThreadId = threadId;
+            const params = details.parse(options ? JSON.parse(options) : {});
+            result = await readOnlyAction("details", { ...params, threadId }, await access.getClient(), pi, ctx);
+            label = "details";
+            break;
+          }
+          case "status": {
+            if (/\s/.test(rest.trim())) throw new Error("status accepts one THREAD_ID");
+            selectedThreadId = rest || undefined;
+            result = rest ? await access.status(rest) : {
+              scope: "Locally loaded direct-tool threads only; use history or status THREAD_ID for Hub/saved threads.",
+              threads: await access.status(),
+            };
+            break;
+          }
+          case "help":
+            pi.sendMessage({ customType: "codex-bridge-operator", content: HELP, details: { label: "help", raw: false }, display: true }, { triggerTurn: false });
+            return;
+          default: throw new Error(`Unknown command: ${command}. Use /codex for help.`);
         }
         const readOnly = !(result && typeof result === "object" && ("forked" in result || ("readOnly" in result && result.readOnly === false)));
         pi.sendMessage({ customType: "codex-bridge-operator", content: `Codex ${label}${readOnly ? " (read-only)" : ""}:\n${JSON.stringify(result, null, 2)}`, details: { label, raw }, display: true }, { triggerTurn: false });

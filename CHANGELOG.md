@@ -1,5 +1,15 @@
 # Changelog
 
+## 0.6.1 — 2026-11-17
+
+- Honor cancellation while direct/native turn admission is pending; interrupt a newly submitted turn when its caller aborts before the admission reply.
+- Keep confirmed input receipts when cancellation follows admission, report interruption refusals separately, and release previous-turn waits and listeners on cancellation.
+- Reserve retained-text capacity for final answers and flag truncation caused by combining multiple messages.
+- Resolve default model capabilities and reasoning support from effective native configuration; accept model-advertised efforts without a fixed bridge allowlist.
+- Preserve valid MCP form answers during field correction and use native multi-select for enumerated arrays, retaining whole-form validation and explicit submission.
+- Offer form correction only for input errors; propagate host UI failures to the native error response.
+- Separate provider submission, turn observation, steering, progress formatting and form handling. Build cards directly from metadata instead of reparsing padded display strings.
+
 ## 0.6.0 — 2026-11-17
 
 - Use the same native cards for direct-tool results and asynchronous completion notices, retaining structured headless responses.

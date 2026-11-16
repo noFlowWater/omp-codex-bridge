@@ -4,7 +4,7 @@ const smoke = fileURLToPath(new URL('./smoke.mjs', import.meta.url));
 const packageCheck = fileURLToPath(new URL('../package.mjs', import.meta.url));
 const modes = [
   'rpc', 'rpc-model', 'rpc-lifecycle', 'rpc-branches', 'rpc-elicitation',
-  'tui-question', 'tui-clear', 'tui-operator', 'tui-progress', 'tui-execution', 'tui-approval',
+  'tui-question', 'tui-clear', 'tui-operator', 'tui-progress', 'tui-execution', 'tui-approval', 'tui-form',
   'tui-progress-many', 'tui-question-secret', 'rpc-question-secret',
 ];
 

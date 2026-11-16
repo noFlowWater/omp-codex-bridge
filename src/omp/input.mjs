@@ -35,11 +35,9 @@ export function anchorOf(message) {
 export async function nativeEffort(client, selectedModel, options) {
   const effort = options.forceReasoningOff || options.disableReasoning || options.reasoning === 'off' ? 'none' : options.reasoning;
   if (effort === undefined) return undefined;
-  if (!['none', 'minimal', 'low', 'medium', 'high', 'xhigh'].includes(effort)) {
-    throw new Error(`OMP reasoning effort ${options.reasoning} has no native Codex equivalent; no native turn started`);
-  }
   const models = await client.listModels();
-  const selected = models.find(entry => selectedModel ? entry.model === selectedModel : entry.isDefault);
+  const configured = selectedModel ?? await client.defaultModel();
+  const selected = models.find(entry => configured ? entry.model === configured : entry.isDefault);
   const supported = selected?.supportedReasoningEfforts?.map(entry => typeof entry === 'string' ? entry : entry.reasoningEffort);
   if (!supported?.includes(effort)) throw new Error(`Native model ${selectedModel ?? '(default)'} does not advertise reasoning effort ${effort}; no native turn started`);
   return effort;

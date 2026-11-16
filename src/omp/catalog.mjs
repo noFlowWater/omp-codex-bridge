@@ -37,7 +37,8 @@ export async function fetchCodexModels({ createClient = options => new CodexAppS
   const client = createClient({ timeoutMs: 5000 });
   try {
     const listed = await client.listModels();
-    const defaultModel = listed.find(entry => entry.isDefault);
+    const configured = await client.defaultModel();
+    const defaultModel = listed.find(entry => configured ? entry.model === configured : entry.isDefault);
     return [
       profile(DEFAULT_MODEL_ID, CODEX_BRIDGE_MODELS[0].name, defaultModel),
       ...listed.filter(entry => entry.model !== DEFAULT_MODEL_ID && parseCodexModelId(entry.model))

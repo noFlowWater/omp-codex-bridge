@@ -88,7 +88,7 @@ export function registerDirectTool(pi: ExtensionAPI, options: { onRateLimits?: (
     return undefined;
   }
 
-  async function run(params: { threadId?: string; prompt?: string; input?: unknown[]; cwd: string; model?: string; effort?: string; outputSchema?: unknown; name?: string; serviceTier?: string }) {
+  async function run(params: { threadId?: string; prompt?: string; input?: unknown[]; cwd: string; model?: string; effort?: string; outputSchema?: unknown; name?: string; serviceTier?: string }, signal?: AbortSignal) {
     // A shutdown/session switch during admission replaces the client; the old continuation
     // must not touch the new session's ownership, delivery or hold state.
     const admissionBarrier = closeBarrier;
@@ -101,8 +101,7 @@ export function registerDirectTool(pi: ExtensionAPI, options: { onRateLimits?: (
     runsInFlight++;
     try {
       const { name, ...native } = params;
-      const result = await active.run(native);
-      if (client === active) reported(result.threadId);
+      const result = await active.run({ ...native, signal });
       const nameWarning = await nameThread(active, result.threadId, name);
       return { ...(client === active ? reported(result.threadId) : summarizeRun(result)), ...(nameWarning ? { nameWarning } : {}) };
     } catch (error) {
@@ -152,7 +151,6 @@ export function registerDirectTool(pi: ExtensionAPI, options: { onRateLimits?: (
         if (client === active) owned.add(threadId);
       },
     });
-    if (client === active) reported(result.threadId);
     const nameWarning = await nameThread(active, result.threadId, params.name);
     return {
       forked: true, threadId: result.threadId, cwd: result.cwd,
@@ -244,7 +242,7 @@ export function registerDirectTool(pi: ExtensionAPI, options: { onRateLimits?: (
               outputSchema: params.outputSchema,
               name: params.name,
               serviceTier: params.serviceTier,
-            });
+            }, signal);
             break;
           case "fork":
             if (!params.threadId) throw new Error("fork requires threadId");

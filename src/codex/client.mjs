@@ -70,6 +70,17 @@ export class CodexAppServerClient {
     return listModels(this);
   }
 
+  async defaultModel() {
+    const override = this._config.model;
+    if (override != null) return nonempty(override, 'config.model');
+    await this.connect();
+    const result = await this._request('config/read', { includeLayers: false });
+    if (!result?.config || typeof result.config !== 'object' || Array.isArray(result.config)) {
+      throw new Error('Codex config/read did not return effective configuration');
+    }
+    return result.config.model == null ? undefined : nonempty(result.config.model, 'config.model');
+  }
+
   inspectConnection() {
     return inspectConnection(this);
   }
@@ -239,7 +250,8 @@ export class CodexAppServerClient {
 
   // onThread(threadId) runs once the thread ID is confirmed and before any turn request, so a
   // caller can record the authoritative native ID first; if it throws, no turn is requested.
-  async run({ threadId, prompt, input, cwd, model, onThread, sandbox, effort, outputSchema, developerInstructions, serviceTier } = {}) {
+  async run({ threadId, prompt, input, cwd, model, onThread, sandbox, effort, outputSchema, developerInstructions, serviceTier, signal } = {}) {
+    checkSignal(signal);
     input = userInput(prompt, input);
     if (effort !== undefined) nonempty(effort, 'effort');
     if (serviceTier != null) nonempty(serviceTier, 'serviceTier');
@@ -248,17 +260,22 @@ export class CodexAppServerClient {
       outputSchema = jsonValue(outputSchema, 'outputSchema');
     }
     validateThreadOptions({ threadId, cwd, model, developerInstructions, onThread, sandbox });
-    return this._serialize(threadId ?? Symbol('new thread'), async () => {
+    let cancellation;
+    let interruptError;
+    const result = await this._serialize(threadId ?? Symbol('new thread'), async () => {
       let state = threadId ? this._threads.get(threadId) : undefined;
       if (threadId && this._compactions.has(threadId)) throw new Error('Native compaction is still in progress; no input sent');
       try {
+        checkSignal(signal);
         state = await this._loadThread({ threadId, cwd, model, developerInstructions });
         const directory = state.cwd;
         if (onThread) await onThread(state.threadId);
+        checkSignal(signal);
         if (state.status === 'inProgress' && (effort !== undefined || outputSchema !== undefined || serviceTier != null)) {
           throw new Error('effort, outputSchema and serviceTier cannot change an active turn through turn/steer');
         }
         if (state.status === 'inProgress' && !state.turnId) await this._reconcile(state);
+        checkSignal(signal);
         if (state.status === 'inProgress') {
           await this._steerTurn(state, input);
         } else {
@@ -267,7 +284,14 @@ export class CodexAppServerClient {
           state.requestedReasoningEffort = effort ?? null;
           state.requestedServiceTier = serviceTier ?? null;
           this._publish(state);
+          const interrupt = () => {
+            cancellation ??= this.cancel(state.threadId);
+            // The serialized run releases its lock before the cancellation is awaited below.
+            cancellation.catch(() => {});
+          };
           try {
+            checkSignal(signal);
+            signal?.addEventListener('abort', interrupt, { once: true });
             await this._request('turn/start', {
               threadId: state.threadId, input, cwd: directory,
               ...(model === undefined ? {} : { model }),
@@ -292,13 +316,21 @@ export class CodexAppServerClient {
               this._publish(state, true);
             }
             throw error;
+          } finally {
+            signal?.removeEventListener('abort', interrupt);
           }
         }
         return this._threadSnapshot(state);
       } catch (error) {
         throw state ? withThread(error, state.threadId) : error;
       }
+    }).finally(async () => {
+      // Interruption cannot undo admission; keep its error separate from the submission result.
+      if (cancellation) await cancellation.catch(error => { interruptError = error; });
     });
+    const state = this._threads.get(result.threadId);
+    if (interruptError && state && !TERMINAL.has(state.status)) state.error = interruptError.message;
+    return cancellation ? this.snapshot(result.threadId) ?? result : result;
   }
   // Forks native history through lastTurnId (inclusive), never submits input or adopts the source.
   async fork({ threadId, lastTurnId, cwd, model, developerInstructions, onThread, sandbox } = {}) {

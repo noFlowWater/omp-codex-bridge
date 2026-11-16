@@ -21,7 +21,7 @@ mock.module('@oh-my-pi/pi-coding-agent/config/settings', () => ({
   findScopedSettings: requestedCwd => requestedCwd === cwd ? currentScopedSettings : undefined,
 }));
 const { registerOperator, errorDetails } = await import('../src/omp/operator.ts');
-const { createProgressDisplay, summarizeRun, operatorCard, operatorMarkdown, operatorContent } = await import('../src/omp/presentation.ts');
+const { createProgressDisplay, summarizeRun, operatorCard, operatorContent } = await import('../src/omp/presentation.ts');
 const cwd = realpathSync(process.cwd());
 const FAKE = fileURLToPath(new URL('./client.test.mjs', import.meta.url));
 const runtime = Bun.which('node') ?? process.execPath;
@@ -89,7 +89,7 @@ test('operator help preserves line breaks and remaining commands render summarie
 });
 
 test('native table text preserves untrusted Markdown as literal cell contents', () => {
-  const markdown = operatorMarkdown(operatorCard('error', { error: '[fake](https://evil) | <script> **bold** `code`', remedy: 'Check login' }));
+  const markdown = operatorCard('error', { error: '[fake](https://evil) | <script> **bold** `code`', remedy: 'Check login' });
   assert.ok(markdown.includes('\\[fake\\](https://evil) \\| \\<script\\> \\*\\*bold\\*\\* \\`code\\`'));
   assert.ok(markdown.includes('| Error |'));
 });

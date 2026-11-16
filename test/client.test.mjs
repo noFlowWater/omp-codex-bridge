@@ -8,6 +8,7 @@ import { createInterface } from 'node:readline';
 import { fileURLToPath } from 'node:url';
 import { setTimeout as delay } from 'node:timers/promises';
 import { CodexAppServerClient } from '../src/codex/client.mjs';
+import { recordItem, threadSnapshot } from '../src/codex/inspection.mjs';
 
 // `node client.test.mjs --fake-app-server` runs the protocol double below instead of the tests.
 // provider.test.mjs starts the same double through a temporary `codex` executable.
@@ -323,8 +324,8 @@ export function fakeServer() {
       admit();
       return;
     }
-    if (mode === 'slow-admit') {
-      later(800, () => { admit(); later(50, () => complete(thread, turn)); });
+    if (mode === 'slow-admit' || mode === 'slow-admit-hold') {
+      later(800, () => { admit(); if (mode === 'slow-admit') later(50, () => complete(thread, turn)); });
       return;
     }
     if (options.dropTurnReply && attempt === 1) {
@@ -549,7 +550,7 @@ export function fakeServer() {
       return;
     }
     if (method === 'config/read') {
-      reply(id, { config: { model: 'fake-model', model_reasoning_effort: 'medium', sandbox_mode: 'workspace-write',
+      reply(id, { config: { model: options.configModel ?? 'fake-model', model_reasoning_effort: 'medium', sandbox_mode: 'workspace-write',
         approval_policy: 'never', developer_instructions: 'PRIVATE-INSTRUCTIONS',
         model_providers: { private: { api_key: 'PRIVATE-KEY' } } }, origins: {} });
       return;
@@ -1429,6 +1430,72 @@ it('does not equate last model request with current-turn usage on a fresh resume
   const done = await untilSnapshot(client, admitted.threadId, completed);
   assert.equal(done.tokenUsage.last.totalTokens, 90);
   assert.equal(done.turnUsage, null);
+});
+
+it('resolves the configured default model and explicit bridge override without inference', async (t) => {
+  const { client, dir } = makeClient(t, { configModel: 'configured-model' });
+  assert.equal(await client.defaultModel(), 'configured-model');
+  assert.deepEqual(mutations(dir), []);
+  const overridden = makeClient(t, {}, { config: { model: 'bridge-override' } });
+  assert.equal(await overridden.client.defaultModel(), 'bridge-override');
+  assert.equal(spawnedPids(overridden.dir).length, 0);
+});
+
+it('retains the complete final answer when partial prose fills the message budget', () => {
+  const state = { messages: new Map(), textSize: 0, textTruncated: false, events: [], fileChanges: [] };
+  recordItem(state, { type: 'agentMessage', id: 'partial', phase: 'partial_answer', text: 'p'.repeat(600000) });
+  const final = 'f'.repeat(600000) + 'FINAL_END_MARKER';
+  recordItem(state, { type: 'agentMessage', id: 'final', phase: 'final_answer', text: final });
+  const result = threadSnapshot(state);
+  assert.equal(result.finalText, final);
+  assert.ok(result.text.endsWith('FINAL_END_MARKER'));
+  assert.equal(result.textTruncated, true);
+  assert.ok(state.textSize <= 1024 * 1024);
+});
+
+it('includes message separators in the snapshot truncation flag', () => {
+  const state = { messages: new Map(), textSize: 0, textTruncated: false, events: [], fileChanges: [] };
+  recordItem(state, { type: 'agentMessage', id: 'one', text: 'x'.repeat(1024 * 1024 - 1) });
+  recordItem(state, { type: 'agentMessage', id: 'two', text: 'y' });
+  assert.equal(threadSnapshot(state).textTruncated, true);
+});
+
+it('does not submit a turn after cancellation while thread admission is pending', async (t) => {
+  const { client, dir } = makeClient(t, { startDelay: 200, turns: ['hold'] });
+  const controller = new AbortController();
+  const pending = client.run({ prompt: 'cancel before turn', cwd, signal: controller.signal });
+  await until(() => sent(dir, 'thread/start').length === 1);
+  controller.abort();
+  await assert.rejects(pending, /aborted/i);
+  assert.equal(sent(dir, 'turn/start').length, 0);
+  assert.equal(sent(dir, 'turn/interrupt').length, 0);
+});
+
+it('interrupts a new turn when cancellation arrives before its admission reply', async (t) => {
+  const { client, dir } = makeClient(t, { turns: ['slow-admit'] });
+  const controller = new AbortController();
+  const pending = client.run({ prompt: 'cancel admitted turn', cwd, signal: controller.signal });
+  await until(() => sent(dir, 'turn/start').length === 1);
+  controller.abort();
+  const admitted = await pending;
+  assert.ok(admitted.turnId, 'a successful admission is reported even if its caller aborts');
+  assert.equal(admitted.status, 'interrupted');
+  assert.equal(sent(dir, 'turn/start').length, 1);
+  assert.equal(sent(dir, 'turn/interrupt').length, 1);
+});
+
+it('keeps confirmed admission visible when cancellation is refused', async (t) => {
+  const { client, dir } = makeClient(t, { turns: ['slow-admit-hold'], nativeErrors: { 'turn/interrupt': { code: -32001, message: 'interrupt refused' } } });
+  const controller = new AbortController();
+  const pending = client.run({ prompt: 'accepted input', cwd, signal: controller.signal });
+  await until(() => sent(dir, 'turn/start').length === 1);
+  controller.abort();
+  const admitted = await pending;
+  assert.ok(admitted.turnId);
+  assert.equal(admitted.status, 'inProgress');
+  assert.match(admitted.error, /interrupt refused/);
+  assert.equal(sent(dir, 'turn/start').length, 1);
+  assert.equal(sent(dir, 'turn/interrupt').length, 1);
 });
 
 it('passes native images, effort, output schema and developer instructions without fallback', async (t) => {

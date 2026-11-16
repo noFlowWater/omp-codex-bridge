@@ -16,7 +16,7 @@ import { createInterface } from "node:readline";
 
 const mode = process.argv[2] ?? "tui-steer";
 const QUESTION_MODES = ["rpc-question", "rpc-question-secret", "rpc-question-ask", "rpc-question-cancel", "rpc-question-headless", "rpc-elicitation", "rpc-async-question"];
-const USABILITY_MODES = ["tui-operator", "tui-progress", "tui-execution", "tui-approval"];
+const USABILITY_MODES = ["tui-operator", "tui-progress", "tui-execution", "tui-approval", "tui-form"];
 if (!["tui-steer", "tui-followup", "tui-kill", "tui-revive", "tui-question", "tui-question-secret", "tui-progress-many", "tui-clear", "rpc", "rpc-queued", "rpc-model", "rpc-rich", "rpc-direct-rich", "rpc-lifecycle", "rpc-branches", ...QUESTION_MODES, ...USABILITY_MODES].includes(mode)) throw new Error(`unknown mode ${mode}`);
 const AGENT = "codex-bridge";
 // rpc-model: the task item picks one concrete native model with OMP's per-call `model` selector. The fake
@@ -125,6 +125,9 @@ async function tui() {
     ...(["tui-operator", "tui-progress"].includes(mode) ? { CODEX_HUB_FIXTURE_ROOT_MODEL: "codex-bridge/default" } : {}),
     ...(mode === "tui-execution" ? { CODEX_HUB_FIXTURE_DIRECT_JSON: JSON.stringify({ action: "run", prompt: "fixture execution card", effort: "high" }) } : {}),
     ...(mode === "tui-approval" ? { CODEX_HUB_FIXTURE_DIRECT_JSON: JSON.stringify({ action: "run", prompt: "fixture approval" }), CODEX_HUB_FIXTURE_OPTIONS: '{"turns":["approval"]}' } : {}),
+    ...(mode === "tui-form" ? { CODEX_HUB_FIXTURE_DIRECT_JSON: JSON.stringify({ action: "run", prompt: "fixture form" }), CODEX_HUB_FIXTURE_OPTIONS: JSON.stringify({ turns: ["elicitation"], elicitationSchema: {
+      type: "object", properties: { count: { type: "integer", minimum: 1 }, colors: { type: "array", items: { enum: ["red", "blue"] }, minItems: 2, maxItems: 2 } }, required: ["count", "colors"],
+    } }) } : {}),
   };
   let proc;
   let connection;
@@ -249,6 +252,27 @@ async function tui() {
       return;
     }
     if (USABILITY_MODES.includes(mode)) {
+      if (mode === "tui-form") {
+        await until("numeric form input", async () => { const text = await painted(); return text.includes("count") && text.includes("minimum"); });
+        await ask({ op: "paste", text: "0" });
+        await ask({ op: "keys", keys: "enter" });
+        await until("field correction prompt", async () => (await painted()).includes("Other answers are kept."));
+        await ask({ op: "keys", keys: "enter" });
+        await until("numeric field reopened", async () => { const text = await painted(); return text.includes("count") && text.includes("minimum"); });
+        await ask({ op: "paste", text: "2" });
+        await ask({ op: "keys", keys: "enter" });
+        await until("native multi-select", async () => { const text = await painted(); return text.includes("red") && text.includes("blue") && text.includes("colors"); });
+        await showPainted("native MCP multi-select after correcting one field");
+        await ask({ op: "bytes", data: " " });
+        await ask({ op: "keys", keys: "down" });
+        await ask({ op: "bytes", data: " " });
+        await ask({ op: "keys", keys: "enter" });
+        await until("explicit form submission", async () => (await painted()).includes("Submit these answers?"));
+        await ask({ op: "keys", keys: "enter" });
+        const answer = await until("validated form response", () => trace().find(({ message }) => message?.id === 902 && !message.method)?.message);
+        assert.deepEqual(answer.result, { action: "accept", content: { count: 2, colors: ["red", "blue"] } });
+        return;
+      }
       if (mode === "tui-approval") {
         const prompt = await until("native approval prompt", async () => {
           const text = await painted();

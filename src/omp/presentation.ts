@@ -30,107 +30,120 @@ function quotaWindow(name: string, window: Record<string, unknown>) {
   return { label, value: `${window.usedPercent}% used${reset}` };
 }
 
-// Human diagnostics share the native message renderer; transport responses stay intact.
-export function operatorCard(label: string, value: unknown): string | undefined {
-  const result = objectRecord(value);
-  const line = (name: string, value: unknown) => `${name.padEnd(15)}  ${screenLine(value)}`;
-  const threadSummary = (value: unknown) => {
-    const data = objectRecord(value);
-    const state = objectRecord(data.snapshot ?? data.state ?? data);
-    const thread = objectRecord(data.thread);
-    const execution = objectRecord(state.execution);
-    const failure = objectRecord(state.commandFailure);
-    const tokens = objectRecord(state.usage ?? state.turnUsage).totalTokens;
-    return [line("Thread", state.threadId ?? thread.id), line("Status", state.status ?? (data.forked ? "forked" : "unknown")),
-      ...(state.name || thread.name ? [line("Name", state.name ?? thread.name)] : []),
-      ...(execution.model || state.model ? [line("Model", execution.model ?? state.model)] : []),
-      ...(execution.requestedReasoningEffort ? [line("Requested effort", execution.requestedReasoningEffort)] : []),
-      ...(execution.requestedServiceTier ? [line("Requested tier", execution.requestedServiceTier)] : []),
-      ...(execution.serviceTier ? [line("Effective tier", execution.serviceTier)] : []),
-      ...(execution.cwd || state.cwd || thread.cwd ? [line("Directory", execution.cwd ?? state.cwd ?? thread.cwd)] : []),
-      ...(state.error || data.error ? [line("Error", state.error ?? data.error)] : []),
-      ...(state.commandFailure ? [line("Command failed", `exit ${screenLine(failure.exitCode)}`)] : []),
-      ...(typeof tokens === "number" ? [line("Tokens", tokens.toLocaleString("en-US")), line("Cost", "Not reported")] : []),
-      ...(state.outcomeUnknown || data.outcomeUnknown ? ["Outcome unknown. Do not automatically retry, resume or replay."] : []),
-      ...(data.forked ? ["Created a direct-tool thread. No inference started."] : []),
-      ...(data.nameWarning ? [line("Name warning", data.nameWarning)] : []),
-    ].join("\n");
-  };
-  if (result.cancelled === true) return "Cancelled.";
-  if (label === "error") return [
-    ...(result.state ? [threadSummary(value)] : [line("Error", result.error)]),
-    ...(result.code === undefined ? [] : [line("Code", result.code)]),
-    ...(result.threadId ? [line("Thread", result.threadId)] : []),
-    ...(result.outcomeUnknown ? ["Outcome unknown. Do not automatically retry, resume or replay."] : []),
-    ...(result.remedy ? [screenLine(result.remedy, 1000)] : []),
+function markdownText(value: unknown, limit = 500): string {
+  return screenLine(value, limit).replace(/[\\`*_[\]<>|]/g, "\\$&");
+}
+
+function metadata(rows: [string, unknown][]): string {
+  const present = rows.filter(([, value]) => value !== undefined && value !== null);
+  if (!present.length) return "";
+  return ["| Item | Value |", "| --- | --- |",
+    ...present.map(([name, value]) => `| ${markdownText(name)} | ${markdownText(value)} |`),
   ].join("\n");
-  if (label === "tier") return [line("Service tier", result.serviceTier), screenLine(result.scope),
-    ...(result.note ? [screenLine(result.note)] : [])].join("\n");
-  if (label === "fork" || label === "details" || (label === "history" && result.thread)) {
-    return [threadSummary(value), "Full details: expand or use --json after the subcommand."].join("\n");
-  }
-  if (label === "history" && result.forked) return threadSummary(value);
-  if (label === "history" && Array.isArray(result.data)) return [
-    ...result.data.map(thread => { const row = objectRecord(thread); return `${screenLine(row.id)}  ${screenLine(row.name ?? row.preview ?? "(unnamed)", 120)}`; }),
-    ...(result.nextCursor ? ["More threads available; use --json for the continuation cursor."] : []),
-  ].join("\n") || "No saved threads.";
-  if (label === "status") {
-    if (!Array.isArray(result.threads)) return threadSummary(value);
-    return [...(result.threads.length ? [line("Threads", result.threads.length), ...result.threads.map(threadSummary)] : ["No locally loaded direct-tool threads."]),
-      "Saved / Hub threads: /codex history or /codex status THREAD_ID"].join("\n");
-  }
-  if (label !== "doctor") return undefined;
-  const check = (name: string, detail?: unknown) => {
+}
+
+function threadCard(value: unknown): string {
+  const data = objectRecord(value);
+  const state = objectRecord(data.snapshot ?? data.state ?? data);
+  const thread = objectRecord(data.thread);
+  const execution = objectRecord(state.execution);
+  const failure = objectRecord(state.commandFailure);
+  const tokens = objectRecord(state.usage ?? state.turnUsage).totalTokens;
+  const rows: [string, unknown][] = [
+    ["Thread", state.threadId ?? thread.id],
+    ["Status", state.status ?? (data.forked ? "forked" : "unknown")],
+    ["Name", state.name ?? thread.name],
+    ["Model", execution.model ?? state.model],
+    ["Requested effort", execution.requestedReasoningEffort],
+    ["Requested tier", execution.requestedServiceTier],
+    ["Effective tier", execution.serviceTier],
+    ["Directory", execution.cwd ?? state.cwd ?? thread.cwd],
+    ["Error", state.error ?? data.error],
+  ];
+  if (state.commandFailure) rows.push(["Command failed", `exit ${screenLine(failure.exitCode)}`]);
+  if (typeof tokens === "number") rows.push(["Tokens", tokens.toLocaleString("en-US")], ["Cost", "Not reported"]);
+  const blocks = [metadata(rows)];
+  if (state.outcomeUnknown || data.outcomeUnknown) blocks.push("Outcome unknown. Do not automatically retry, resume or replay.");
+  if (data.forked) blocks.push("Created a direct-tool thread. No inference started.");
+  if (data.nameWarning) blocks.push(metadata([["Name warning", data.nameWarning]]));
+  return blocks.join("\n\n");
+}
+
+function doctorCard(result: Record<string, unknown>): string {
+  const check = (name: string, detail?: string): [string, unknown] => {
     const section = objectRecord(result[name]);
     const error = objectRecord(section.error);
-    return line(name, [section.status ?? "unknown", detail, section.reason ?? error.error, section.remedy].filter(v => v !== undefined && v !== null && v !== "").join(" · "));
+    return [name, [section.status ?? "unknown", detail, section.reason ?? error.error ?? error.message, section.remedy]
+      .filter(value => value !== undefined && value !== null && value !== "").join(" · ")];
   };
   const auth = objectRecord(objectRecord(result.auth).value);
   const config = objectRecord(objectRecord(objectRecord(result.permissions).value).config);
   const settings = objectRecord(config.value);
   const quota = objectRecord(objectRecord(result.rateLimits).value);
   const limits = objectRecord(quota.rateLimits);
-  const lines = [
-    line("Versions", `OMP ${screenLine(result.ompVersion)} · ${screenLine(objectRecord(result.executable).version)}`),
+  let login = "Unknown";
+  if (auth.authenticated === true) login = "Signed in";
+  if (auth.authenticated === false) login = "Not signed in";
+  if (auth.mode) login += ` · ${screenLine(auth.mode)}`;
+  const rows: [string, unknown][] = [
+    ["Versions", `OMP ${screenLine(result.ompVersion)} · ${screenLine(objectRecord(result.executable).version)}`],
     check("connection"),
-    line("Login", `${auth.authenticated === true ? "Signed in" : auth.authenticated === false ? "Not signed in" : "Unknown"}${auth.mode ? ` · ${screenLine(auth.mode)}` : ""}`),
+    ["Login", login],
     check("permissions", `${screenLine(settings.sandboxMode)} · approval=${screenLine(settings.approvalPolicy)} · source=${screenLine(result.permissionSource)}`),
-    line("Configured", `${screenLine(settings.model)} · effort=${screenLine(settings.modelReasoningEffort)}`),
+    ["Configured", `${screenLine(settings.model)} · effort=${screenLine(settings.modelReasoningEffort)}`],
   ];
-  if (objectRecord(result.auth).status !== "available") lines.push(check("auth"));
-  for (const name of ["executable", "models", "steering", "rateLimits"]) {
-    if (objectRecord(result[name]).status !== "available") lines.push(check(name));
+  for (const name of ["auth", "executable", "models", "steering", "rateLimits"]) {
+    if (objectRecord(result[name]).status !== "available") rows.push(check(name));
   }
   for (const name of ["primary", "secondary"]) {
     const window = objectRecord(limits[name]);
     if (typeof window.usedPercent !== "number" || !Number.isFinite(window.usedPercent)) continue;
     const usage = quotaWindow(name, window);
-    lines.push(line(usage.label, usage.value));
+    rows.push([usage.label, usage.value]);
   }
-  if (limits.spendControlReached === true) lines.push("WARNING: spend control reached.");
-  if (quota.ordinaryUsageAllowed === false) lines.push("WARNING: ordinary usage is not allowed.");
-  if (config.status !== "available") lines.push(line("Config", config.status ?? "unknown"));
-  lines.push("Read-only checks do not prove future quota or admission.", "Expand for all checks, models and remedies. /codex doctor --json for raw JSON.");
-  return lines.join("\n");
+  if (config.status !== "available") rows.push(["Config", config.status ?? "unknown"]);
+  const blocks = [metadata(rows)];
+  if (limits.spendControlReached === true) blocks.push("WARNING: spend control reached.");
+  if (quota.ordinaryUsageAllowed === false) blocks.push("WARNING: ordinary usage is not allowed.");
+  blocks.push("Read-only checks do not prove future quota or admission.",
+    "Expand for all checks, models and remedies. /codex doctor --json for raw JSON.");
+  return blocks.join("\n\n");
 }
 
-// Aligned diagnostic rows become native Markdown tables; native data stays literal.
-export function operatorMarkdown(summary: string): string {
-  const escape = (value: string) => value.replace(/[\\`*_[\]<>|]/g, "\\$&");
-  const blocks: string[] = [];
-  let rows: string[] = [];
-  const flush = () => {
-    if (!rows.length) return;
-    blocks.push(["| Item | Value |", "| --- | --- |", ...rows].join("\n"));
-    rows = [];
-  };
-  for (const text of summary.split("\n")) {
-    const row = /^(.+?) {2,}(.*)$/.exec(text);
-    if (row) rows.push(`| ${escape(row[1])} | ${escape(row[2])} |`);
-    else { flush(); blocks.push(escape(text)); }
+// Transport responses retain their data; presentation builds Markdown directly from fields.
+export function operatorCard(label: string, value: unknown): string | undefined {
+  const result = objectRecord(value);
+  if (result.cancelled === true) return "Cancelled.";
+  switch (label) {
+    case "doctor": return doctorCard(result);
+    case "tier": return [metadata([["Service tier", result.serviceTier]]), markdownText(result.scope),
+      ...(result.note ? [markdownText(result.note)] : [])].join("\n\n");
+    case "error": {
+      const blocks = [result.state ? threadCard(value) : metadata([["Error", result.error], ["Thread", result.threadId]]),
+        metadata([["Code", result.code]])];
+      if (result.outcomeUnknown && !result.state) blocks.push("Outcome unknown. Do not automatically retry, resume or replay.");
+      if (result.remedy) blocks.push(markdownText(result.remedy, 1000));
+      return blocks.filter(Boolean).join("\n\n");
+    }
+    case "fork":
+    case "details":
+      return [threadCard(value), "Full details: expand or use --json after the subcommand."].join("\n\n");
+    case "history":
+      if (result.thread || result.forked) return threadCard(value);
+      if (!Array.isArray(result.data)) return undefined;
+      return result.data.map(value => {
+        const thread = objectRecord(value);
+        return `${markdownText(thread.id)} · ${markdownText(thread.name ?? thread.preview ?? "(unnamed)", 120)}`;
+      }).concat(result.nextCursor ? ["More threads available; use --json for the continuation cursor."] : [])
+        .join("\n\n") || "No saved threads.";
+    case "status":
+      if (!Array.isArray(result.threads)) return threadCard(value);
+      return [
+        ...(result.threads.length ? [metadata([["Threads", result.threads.length]]), ...result.threads.map(threadCard)] : ["No locally loaded direct-tool threads."]),
+        "Saved / Hub threads: /codex history or /codex status THREAD_ID",
+      ].join("\n\n");
+    default: return undefined;
   }
-  flush();
-  return blocks.join("\n\n");
 }
 
 function literalBlock(value: string, language = "text", truncated = false) {
@@ -145,7 +158,7 @@ export function operatorContent(label: string, value: unknown): string | undefin
   const data = objectRecord(value);
   const state = objectRecord(data.snapshot ?? data.state ?? data);
   const failure = objectRecord(state.commandFailure);
-  const blocks = [operatorMarkdown(summary)];
+  const blocks = [summary];
   if (state.latestActivity) blocks.push("**Activity**", literalBlock(activityLabel(state.latestActivity)));
   if (state.latestPlan) {
     const plan = objectRecord(state.latestPlan);

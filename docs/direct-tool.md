@@ -14,6 +14,8 @@ A successful `run` acknowledges admission. Terminal results arrive as follow-ups
 {"action":"status","threadId":"<returned-thread-id>"}
 ```
 
+Cancellation during admission is checked before submitting a new turn. If a new turn has already been submitted when its caller aborts, the bridge requests interruption; the interruption request alone does not prove native completion. A confirmed submission still returns its thread/turn identity, with any interruption failure in the snapshot, so cancellation cannot make accepted input look undelivered. Retained text preserves final answers ahead of partial prose at its size limit and reports when content or message separators exceed that limit.
+
 Continue or cancel a thread owned by the current direct-tool server:
 
 ```json

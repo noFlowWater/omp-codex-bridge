@@ -51,9 +51,10 @@ The [official pricing page](https://learn.chatgpt.com/docs/pricing) publishes to
 ## Inputs and lifecycle
 
 - Text, images, model-supported reasoning effort and object-valued JSON Schema output are forwarded to native APIs. Structured task output is validated before delivery. OMP's `forceReasoningOff` takes precedence over a requested effort.
-- Blocking and asynchronous questions use the main OMP UI. Standard and OpenAI extended MCP forms require explicit submission and supported-schema validation. Headless questions, URL flows and unsupported schemas are declined.
+- Blocking and asynchronous questions use the main OMP UI. Standard and OpenAI extended MCP forms keep valid answers while an invalid field is corrected, offer native multi-select for enumerated arrays, and require complete schema validation plus explicit submission. Headless questions, URL flows and unsupported schemas are declined.
 - Native token counters and context-window information are reported. Subscription cost remains unknown.
 - Tree navigation, entry branches and whole-session forks preserve the source history and fork native history at the selected completed boundary. Compaction creates an opaque native checkpoint; Codex exposes no readable summary. An incompatible model cannot consume it.
 - OMP may refuse compaction of a small local transcript before the native hook runs. Focused compaction instructions and unsupported mid-turn branches are rejected.
 - Reload preserves confirmed task lineage. Clear starts a fresh conversation. Unknown mutation outcomes and missing lineage stop processing without replaying work.
+- Cancellation releases previous-turn waits without consuming new input. Once native admission is confirmed, cancellation retains the delivery receipt; a later request cannot replay that input. Host UI failures propagate as native request errors instead of prompting the user to correct an answer.
 - Malformed successful mutation replies retain an unknown outcome, preventing automatic replay. Failed pre-send cancellation and confirmed late interrupt refusal release their cancellation slot; unresolved native mutations remain guarded.

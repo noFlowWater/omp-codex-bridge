@@ -13,9 +13,17 @@ CODEX_HUB_FIXTURE_COLS=80 bun test/hub/smoke.mjs tui-operator
 
 Unit tests and Hub smoke tests use a protocol double, isolated homes and temporary state. They do not run model inference or use stored credentials. Each Hub fixture installs this checkout with the real `omp plugin install` command, then exercises actual RPC/TUI and child-agent behavior without a copied user agent. Hub tests require the supported `omp` executable on `PATH`. Additional modes live in `test/hub/smoke.mjs`; `test/hub/fixture.sh` opens an isolated manual fixture.
 
-Runtime responsibilities live under `src/codex/` (native transport, thread/turn ownership and side-effect-free `inspection.mjs`) and `src/omp/` (provider, receipts, operator commands and `presentation.ts` for cards and footer status). Byte budgets and screen-line limits stay separate. Codex owns durable native history outside this package. `extensions/codex-bridge.ts` is the package entrypoint; tests stay under `test/` and are excluded from the package file list.
+Runtime responsibilities live under `src/codex/` (native transport, thread/turn ownership and side-effect-free `inspection.mjs`) and `src/omp/`. The provider keeps one session table and separates input admission, native-turn observation and live steering. `progress.mjs` formats native activity; `forms.ts` owns MCP form parsing and interaction; `dialogs.ts` owns root UI routing and approvals; `presentation.ts` builds cards and footer status. Byte budgets and screen-line limits stay separate. Codex owns durable native history outside this package. `extensions/codex-bridge.ts` is the package entrypoint; tests stay under `test/` and are excluded from the package file list.
 
 CI pins OMP 18.21.0 and runs the unit and isolated package/Hub checks without credentials. Release delivery is the reviewed source commit/tag plus the native local install above. No publishing workflow, registry token, generated bundle or preview channel is required. Re-run these gates before changing the compatibility target.
+
+## JavaScript maintenance conventions
+
+Use named functions for stable operations and modules with one concrete responsibility. Keep the session owner and its mutable maps together; extract formatting and independent form interactions. Prefer guard clauses and ordinary control flow over nested conditionals. Build display tables from structured fields, keeping native payloads separate from their rendering.
+
+Retain the existing per-file syntax and public contracts. Refactoring must preserve receipt fields, ownership checks, error classification, cancellation and the rule against replaying uncertain work. Keep complete schema validation after field-level feedback. Reuse the platform UI and existing validation dependency. Add focused regressions for consumer-visible behavior and run the unit, package and Hub gates before handoff.
+
+These conventions follow the current [Google TS/JS guide](https://google.github.io/styleguide/tsguide.html), [MDN module guidance](https://developer.mozilla.org/en-US/docs/Web/JavaScript/Guide/Modules) and [ESLint complexity guidance](https://eslint.org/docs/latest/rules/complexity). Function complexity informs responsibility boundaries; this project does not introduce a new formatter, lint dependency or arbitrary line-count gate.
 
 ## References
 

@@ -111,6 +111,22 @@ function recordMessage(state, id, value, phase) {
   if (typeof value !== 'string') return;
   const key = typeof id === 'string' ? id : 'agent-message';
   const old = state.messages.get(key);
+  if (phase === 'final_answer') {
+    let needed = Math.min(value.length, MAX_TEXT) - (MAX_TEXT - state.textSize + (old?.text.length ?? 0));
+    for (const [previousId, message] of state.messages) {
+      if (previousId === key || message.phase === 'final_answer') continue;
+      if (needed <= 0 && (old || state.messages.size < 128)) break;
+      const removed = Math.min(message.text.length, Math.max(0, needed));
+      message.text = message.text.slice(0, message.text.length - removed);
+      state.textSize -= removed;
+      needed -= removed;
+      if (!old && state.messages.size >= 128) {
+        state.textSize -= message.text.length;
+        state.messages.delete(previousId);
+      }
+      state.textTruncated = true;
+    }
+  }
   if (!old && state.messages.size >= 128) { state.textTruncated = true; return; }
   const kept = value.slice(0, MAX_TEXT - state.textSize + (old?.text.length ?? 0));
   if (kept.length < value.length) state.textTruncated = true;
@@ -144,12 +160,15 @@ export function threadSnapshot(state) {
   const messages = [...state.messages.values()];
   const answers = messages.filter(message => message.phase == null || message.phase === 'partial_answer' || message.phase === 'final_answer');
   const final = messages.filter(message => message.phase === 'final_answer');
+  const combined = (answers.length ? answers : messages).map(message => message.text).join('\n\n');
+  const finalText = final.length ? final.map(message => message.text).join('\n\n')
+    : messages.findLast(message => message.phase == null)?.text ?? '';
+  const truncated = combined.length > MAX_TEXT || finalText.length > MAX_TEXT;
   return {
     threadId: state.threadId, turnId: state.turnId, status: state.status,
-    text: (answers.length ? answers : messages).map(message => message.text).join('\n\n').slice(0, MAX_TEXT),
-    finalText: final.length ? final.map(message => message.text).join('\n\n').slice(0, MAX_TEXT)
-      : messages.findLast(message => message.phase == null)?.text ?? '',
-    textTruncated: state.textTruncated, events: structuredClone(state.events),
+    text: (combined.length > MAX_TEXT && finalText ? finalText : combined).slice(0, MAX_TEXT),
+    finalText: finalText.slice(0, MAX_TEXT),
+    textTruncated: state.textTruncated || truncated, events: structuredClone(state.events),
     error: state.error, outcomeUnknown: state.outcomeUnknown,
     cwd: state.cwd, model: state.model, name: state.name ?? null, inspection: state.inspection, attached: state.attached,
     permissions: structuredClone(state.permissions ?? null),
