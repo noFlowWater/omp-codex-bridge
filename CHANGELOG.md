@@ -5,6 +5,8 @@
 - Focus the README on installation and first use; move detailed integration, configuration and development guides into `docs/`.
 - Include the documentation guides in the package file list.
 - Shorten native model labels; document token usage and billing limits outside the status line.
+- Show observed native models in the active footer and retain reported turn tokens with unavailable cost in result cards.
+- Distinguish Codex-internal delegation from OMP Agent Hub workers and keep token updates out of the activity transcript.
 
 ## 0.5.1
 

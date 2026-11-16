@@ -32,15 +32,19 @@ Tier selection can change quota consumption or charges. The bridge does not esti
 
 ## Progress and usage
 
-The native OMP footer shows `Codex N active · Alt+A`; Agent Hub owns per-worker progress. Execution context, activity and plans remain in the child's transcript and `codex_bridge status`, including updates beyond the transcript log cap. Failed-command output tails can contain sensitive application output; longer command output and file diffs are not automatically dumped.
+The native OMP footer shows `Codex N active · MODEL · Alt+A` when one observed model is available, or a model count for mixed workers. Agent Hub owns per-worker progress. Execution context, activity and plans remain in the child's transcript and `codex_bridge status`, including updates beyond the transcript log cap. Failed-command output tails can contain sensitive application output; longer command output and file diffs are not automatically dumped.
+
+`Codex internal delegation` identifies child activity inside Codex, separate from OMP Hub workers. The transcript shows observed child status and suppresses repeated token-context updates; native usage remains available in status and OMP usage counters.
 
 Native quota events generate one warning on exhaustion and an informational notice on observed recovery, shared across concurrent workers. Reset times appear when reported. Sparse or unavailable fields do not imply recovery; there is no quota polling or automatic retry.
 
 ### Tokens and cost
 
-Model labels show only the native provider and selected model. Native token counts appear when reported.
+Model labels show only the native provider and selected model. The active footer identifies the model reported by Codex without changing the selected OMP model. Result cards show reported turn tokens with `Cost: not reported`; compact result JSON uses `cost: null`. Missing usage stays unavailable.
 
 The [app-server API](https://learn.chatgpt.com/docs/app-server) reports token usage and account limits, not a per-turn billed amount. Its model catalog does not include prices. OMP's zero-valued price fields are placeholders for unavailable pricing, not a claim that execution is free.
+
+OMP 18.21 requires numeric response costs and does not expose unknown billing through its public provider registration API. Its built-in total therefore cannot represent this missing charge. Use the native account dashboard for billing; the bridge's `cost: null` applies to its own result summaries.
 
 The [official pricing page](https://learn.chatgpt.com/docs/pricing) publishes token-based credit rates and links to API pricing. Those rates can support estimates; included subscription usage, purchased credits, processing tier and plan-specific billing determine the actual charge. Check the native usage dashboard for account usage.
 

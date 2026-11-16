@@ -72,10 +72,38 @@ function commandLine(item, failure) {
 }
 
 
-function progressLine(method, params, state) {
-  if (method === 'thread/tokenUsage/updated' && params.tokenUsage?.modelContextWindow != null) {
-    return `native context ${params.tokenUsage.last.totalTokens}/${params.tokenUsage.modelContextWindow} tokens`;
+const nativeLabel = (value, limit = 120) => typeof value === 'string' && value
+  ? clip(stripANSI(value).replace(/[\u0000-\u001f\u007f-\u009f]/g, ' '), limit) : 'unknown';
+
+function delegationLine(item) {
+  const prefix = 'Codex internal delegation';
+  if (item.type === 'subAgentActivity') {
+    return `${prefix}: child ${nativeLabel(item.kind, 32)}; thread ${nativeLabel(item.agentThreadId, 80)}; path ${nativeLabel(item.agentPath, 160)}`
+      + (item.model ? `; model ${nativeLabel(item.model)}` : '')
+      + (item.reasoningEffort ? `; effort ${nativeLabel(item.reasoningEffort, 32)}` : '');
   }
+  const operation = {
+    spawnAgent: 'spawn', sendInput: 'send input', resumeAgent: 'resume', wait: 'wait',
+    closeAgent: 'close', sendMessage: 'send message', followupTask: 'follow-up',
+    interruptAgent: 'interrupt', listAgents: 'list',
+  }[item.tool] ?? 'operation unknown';
+  const states = item.agentsStates && typeof item.agentsStates === 'object' && !Array.isArray(item.agentsStates)
+    ? item.agentsStates : null;
+  const receivers = Array.isArray(item.receiverThreadIds) ? item.receiverThreadIds : null;
+  const children = new Set([...(receivers ?? []), ...Object.keys(states ?? {})].filter(id => typeof id === 'string' && id));
+  const counts = new Map();
+  for (const id of children) {
+    const status = states?.[id]?.status;
+    const label = ['pendingInit', 'running', 'interrupted', 'completed', 'errored', 'shutdown', 'notFound'].includes(status) ? status : 'unknown';
+    counts.set(label, (counts.get(label) ?? 0) + 1);
+  }
+  const statuses = [...counts].map(([status, count]) => `${count} ${status}`).join(', ');
+  return `${prefix}: ${operation} ${nativeLabel(item.status, 32)}; observed children ${states || receivers ? children.size : 'unknown'}${statuses ? ` (${statuses})` : ''}`;
+}
+
+function progressLine(method, params, state) {
+  // Native context stays in snapshots and assistant usage, not the append-only activity log.
+  if (method === 'thread/tokenUsage/updated') return undefined;
   if (method === 'turn/started') return `turn ${params.turn?.id ?? ''} started`;
   if (method === 'turn/completed') return `turn ${params.turn?.id ?? ''} ${params.turn?.status ?? 'ended'}`;
   if (method === 'turn/plan/updated') return planLine(params);
@@ -83,6 +111,8 @@ function progressLine(method, params, state) {
   if (method === 'model/rerouted') return `model rerouted ${params.fromModel} → ${params.toModel} (${params.reason})`;
   const item = params.item;
   if (!item) return undefined;
+  if ((method === 'item/started' || method === 'item/completed')
+    && (item.type === 'subAgentActivity' || item.type === 'collabAgentToolCall')) return delegationLine(item);
   if (method === 'item/started') {
     if (item.type === 'commandExecution') return `$ ${item.command}`;
     if (item.type === 'mcpToolCall') return `mcp ${item.server}.${item.tool} started`;
@@ -577,7 +607,7 @@ export function createCodexBridgeProvider({ EventStream, stateDir, onRequest, on
       try {
         const state = client.snapshot(threadId);
         const line = progressLine(method, params, state);
-        if (line && method !== 'thread/tokenUsage/updated') activity = clip(line, LINE_CHARS);
+        if (line) activity = clip(line, LINE_CHARS);
         if (method === 'turn/plan/updated') plan = planLine(params);
         note(line);
         publish(state);
@@ -591,7 +621,7 @@ export function createCodexBridgeProvider({ EventStream, stateDir, onRequest, on
       if (line) activity = clip(line, LINE_CHARS);
     }
     const execution = initial?.execution ?? initial;
-    note(`native execution: model ${clip(execution?.model ?? 'unknown (Codex default)', 200)}; cwd ${clip(execution?.cwd ?? 'unknown', 1000)}; requested reasoning effort ${execution?.requestedReasoningEffort ?? 'unknown (Codex default request)'}; effective reasoning effort unknown`);
+    note(`native execution: model ${nativeLabel(execution?.model, 200)}; cwd ${nativeLabel(execution?.cwd, 1000)}; requested effort ${nativeLabel(execution?.requestedReasoningEffort, 32)}`);
     // Replay the bounded event window, then recover semantic state even when its event was evicted.
     for (const event of initial?.events ?? []) sink(event.method, event.params);
     if (initial?.latestPlan && !(initial.events ?? []).some(event => event.method === 'turn/plan/updated' && event.params?.turnId === turnId)) {
@@ -604,9 +634,6 @@ export function createCodexBridgeProvider({ EventStream, stateDir, onRequest, on
       }, initial.commandFailure));
     }
     session.sink = sink;
-    if (initial?.tokenUsageTurnId === turnId && initial.tokenUsage) {
-      note(progressLine('thread/tokenUsage/updated', { tokenUsage: initial.tokenUsage }));
-    }
     publish(initial);
 
     const ended = new AbortController();

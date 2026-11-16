@@ -1437,7 +1437,6 @@ test('native usage sums the agentic turn while context uses only the last reques
         reasoningTokens: 5, contextTokens: 90,
         cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
       });
-      assert.match(result.message.content.filter(block => block.type === 'thinking').map(block => block.thinking).join('\n'), /native context 90\/200000 tokens/);
     }
   });
 }, TIMEOUT);
@@ -2768,7 +2767,9 @@ test('provider recovers evicted semantic plan and failed command tail without po
   const thinking = message.content.find(block => block.type === 'thinking').thinking;
   assert.equal(thinking.match(/native execution:/g).length, 1);
   assert.match(thinking, /turn U-progress completed/);
-  assert.match(thinking, /model gpt-6\.1-sol; cwd .*; requested reasoning effort high; effective reasoning effort unknown/);
+  assert.ok(thinking.includes('gpt-6.1-sol') && thinking.includes(cwd));
+  assert.match(thinking, /requested[^;\n]*high/);
+  assert.doesNotMatch(thinking, /effective[^;\n]*high/);
   assert.match(thinking, /\[completed\] Inspect\n\[inProgress\] Fix/);
   assert.match(thinking, /command output tail \(truncated\); may contain sensitive data:/);
   assert.match(thinking, /DECISIVE FAILURE/);
@@ -2813,7 +2814,7 @@ test('provider explicitly caps append log while replacing latest activity and pl
   const thinking = message.content.find(block => block.type === 'thinking').thinking;
   assert.ok(thinking.length <= 64 * 1024);
   assert.equal(thinking.match(/64K-character append log limit reached/g).length, 1);
-  assert.match(thinking, /requested reasoning effort unknown \(Codex default request\)/);
+  assert.match(thinking, /requested[^;\n]*unknown/);
   assert.doesNotMatch(thinking, /LATEST PLAN|LATEST NATIVE ACTIVITY|FOREIGN ACTIVITY|model rerouted/);
   assert.ok(statuses.some(status => status?.logTruncated && status.activity?.includes('LATEST NATIVE ACTIVITY') && status.plan?.includes('LATEST PLAN')));
   assert.ok(statuses.every(status => !status || (status.activity?.length ?? 0) <= 2000 && (status.plan?.length ?? 0) <= 2000));
@@ -2827,6 +2828,110 @@ test('provider explicitly caps append log while replacing latest activity and pl
   assert.equal(textOf(message), 'partial answer\n{"ok":true}');
   assert.deepEqual(message.content.find(block => block.type === 'toolCall').arguments, { data: { ok: true } });
   assert.equal(statuses.at(-1), undefined);
+});
+
+test('native delegation progress separates child lifecycle from call completion and OMP tools', async () => {
+  const statuses = [];
+  const params = item => ({ threadId: 'T-progress', turnId: 'U-progress', item });
+  const started = {
+    type: 'subAgentActivity', id: 'native-start', kind: 'started', agentThreadId: 'native-child-a',
+    agentPath: 'native/research', model: 'gpt-6.1-sol', reasoningEffort: 'high',
+  };
+  const initial = { events: [{ method: 'item/completed', params: params(started) }] };
+  const updates = [
+    { method: 'item/started', params: params({
+      type: 'collabAgentToolCall', id: 'spawn', tool: 'spawnAgent', status: 'inProgress',
+      receiverThreadIds: [], agentsStates: {}, prompt: 'PRIVATE NATIVE PROMPT',
+    }) },
+    { method: 'item/completed', params: params({
+      type: 'collabAgentToolCall', id: 'spawn', tool: 'spawnAgent', status: 'completed',
+      receiverThreadIds: ['native-child-a', 'native-child-b', 'native-child-c', 'native-child-b'],
+      agentsStates: {
+        'native-child-a': { status: 'running', message: 'PRIVATE CHILD OUTPUT' },
+        'native-child-b': { status: 'errored', message: 'PRIVATE CHILD ERROR' },
+      },
+    }) },
+    { method: 'item/completed', params: params({
+      ...started, id: 'native-interrupt', kind: 'interrupted', model: null, reasoningEffort: null,
+    }) },
+  ];
+  const original = structuredClone({ initial, updates });
+  const { events, message, final } = await progressConsumer({ initial, updates, onProgress: (_session, status) => statuses.push(structuredClone(status)) });
+  assert.equal(final.type, 'done', message.errorMessage);
+  const thinking = message.content.find(block => block.type === 'thinking').thinking;
+  const childStart = thinking.split('\n').find(line => line.includes('native-child-a') && line.includes('started'));
+  assert.ok(childStart?.includes('native/research') && childStart.includes('gpt-6.1-sol') && childStart.includes('high'));
+  assert.doesNotMatch(childStart, /completed|effective/);
+  const callEnd = statuses.find(status => /3/.test(status?.activity) && status.activity.includes('running'))?.activity;
+  assert.match(callEnd, /Codex.*internal.*delegat/i);
+  assert.match(callEnd, /completed/);
+  assert.match(callEnd, /1 running/);
+  assert.match(callEnd, /1 errored/);
+  assert.match(callEnd, /1 unknown/);
+  assert.ok(statuses.some(status => status?.activity?.includes('interrupted') && status.activity.includes('native-child-a')));
+  assert.doesNotMatch(thinking, /subAgentActivity done|collabAgentToolCall done|PRIVATE/);
+  assert.deepEqual(toolCalls(events), ['yield']);
+  assert.deepEqual({ initial, updates }, original, 'display never rewrites native event data');
+});
+
+test('native execution and partial delegation records keep unknown identity and bounded safe labels', async () => {
+  const statuses = [];
+  const initial = { execution: { model: null, cwd: null, requestedReasoningEffort: null } };
+  const updates = [
+    { method: 'item/completed', params: { threadId: 'T-progress', turnId: 'U-progress', item: {
+      type: 'collabAgentToolCall', id: 'old-collaboration',
+    } } },
+    { method: 'item/completed', params: { threadId: 'T-progress', turnId: 'U-progress', item: {
+      type: 'subAgentActivity', id: 'long-child', kind: 'completed', agentThreadId: 'native-child-long',
+      agentPath: `\u001b[31mnative/path\u001b[0m\n${'x'.repeat(4000)}`, model: 'gpt-6.1-sol', reasoningEffort: null,
+    } } },
+  ];
+  const { message, final } = await progressConsumer({ initial, updates, onProgress: (_session, status) => statuses.push(structuredClone(status)) });
+  assert.equal(final.type, 'done', message.errorMessage);
+  const thinking = message.content.find(block => block.type === 'thinking').thinking;
+  const header = thinking.split('\n')[0];
+  assert.equal(header.match(/unknown/g)?.length, 3, 'model, cwd and requested effort remain unknown');
+  assert.doesNotMatch(header, /gpt-|default|effective/);
+  const partial = statuses.find(status => status?.activity?.includes('delegation') && !status.activity.includes('native-child-long'))?.activity;
+  assert.match(partial, /unknown/);
+  assert.doesNotMatch(partial, /\b0\b|done|completed/);
+  assert.ok(statuses.some(status => status?.activity?.includes('native/path') && status.activity.includes('completed')));
+  assert.ok(statuses.every(status => !status?.activity || status.activity.length <= 2000 && !/[\u0000-\u001f\u007f-\u009f]/.test(status.activity)));
+  assert.ok(statuses.every(status => !status || status.execution.model === null && status.execution.requestedReasoningEffort === null));
+});
+
+test('repeated native context updates preserve usage and failure activity without append log spam', async () => {
+  const statuses = [];
+  const usage = {
+    total: { inputTokens: 300, cachedInputTokens: 60, outputTokens: 90, reasoningOutputTokens: 15, totalTokens: 390 },
+    last: { inputTokens: 40, cachedInputTokens: 5, outputTokens: 20, reasoningOutputTokens: 3, totalTokens: 60 },
+    modelContextWindow: 1000,
+  };
+  const initial = { tokenUsage: usage, tokenUsageTurnId: 'U-progress', turnUsage: usage.total };
+  const updates = [
+    { method: 'error', params: { threadId: 'T-progress', turnId: 'U-progress', error: { message: 'NATIVE DIAGNOSTIC RETAINED' } } },
+    { method: 'item/completed', params: { threadId: 'T-progress', turnId: 'U-progress', item: {
+      type: 'commandExecution', id: 'usage-failure', command: 'check', status: 'failed', exitCode: 17, aggregatedOutput: 'FAILURE DETAIL RETAINED',
+    } } },
+    ...Array.from({ length: 30 }, () => ({
+      method: 'thread/tokenUsage/updated',
+      params: { threadId: 'T-progress', turnId: 'U-progress', tokenUsage: usage },
+      semantic: { tokenUsage: usage, tokenUsageTurnId: 'U-progress', turnUsage: usage.total },
+    })),
+  ];
+  const { events, message, final } = await progressConsumer({ initial, updates, onProgress: (_session, status) => statuses.push(structuredClone(status)) });
+  assert.equal(final.type, 'done', message.errorMessage);
+  const thinking = message.content.find(block => block.type === 'thinking').thinking;
+  assert.match(thinking, /NATIVE DIAGNOSTIC RETAINED/);
+  assert.match(thinking, /FAILURE DETAIL RETAINED/);
+  assert.doesNotMatch(thinking, /native context|60\/1000/);
+  assert.ok(events.filter(event => event.type === 'thinking_delta').length < 10, 'usage notifications do not append thinking deltas');
+  assert.ok(statuses.filter(status => status?.activity?.includes('FAILURE DETAIL RETAINED')).length >= 30, 'usage keeps latest failure activity visible');
+  assert.equal(message.usage.input, 240);
+  assert.equal(message.usage.cacheRead, 60);
+  assert.equal(message.usage.output, 90);
+  assert.equal(message.usage.totalTokens, 390);
+  assert.equal(message.usage.contextTokens, 60);
 });
 
 test('progress never relaxes structured final JSON validation', async () => {

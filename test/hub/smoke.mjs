@@ -248,6 +248,7 @@ async function tui() {
           const text = await painted();
           return text.includes("Codex 1 active") && text.includes("Alt+A") ? text : undefined;
         });
+        assert.match(live, /Codex 1 active · fake-model · Alt\+A/, "footer identifies the observed native model");
         assert.ok(!live.includes("Codex activity ["));
         assert.ok(!live.includes("Plan: unknown"));
         console.log(`--- compact native progress footer (painted) ---\n${live}`);
@@ -360,7 +361,7 @@ async function tui() {
         return text.includes("native execution:") ? text : undefined;
       });
       const logText = visibleText(log);
-      for (const text of ["model fake-model", "effective reasoning effort unknown", "[completed] Inspect native output",
+      for (const text of ["model fake-model", "[completed] Inspect native output",
         "[inProgress] Fix failing command", "files completed: old.txt", "native-usability-command", "exit 17",
         "command output tail (truncated); may contain sensitive data:", "FAILURE TAIL", "second failure line",
         "64K-character append log limit reached"]) assert.ok(logText.includes(text), `native progress log omitted ${text}`);

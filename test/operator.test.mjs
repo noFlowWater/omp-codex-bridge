@@ -468,3 +468,34 @@ test('history picker forks the latest failed or interrupted turn rather than an 
     });
   }
 });
+
+test('footer reflects observed models and keeps mixed workers distinct without exposing task data', () => {
+  const painted = [];
+  const display = createProgressDisplay();
+  display.capture({ agent: { kind: 'main' }, hasUI: true, sessionManager: { getSessionId: () => 'model-root' }, ui: { setStatus: (_key, text) => painted.push(text) } });
+  const status = model => ({ threadId: 'private-id', turnId: 'turn', status: 'inProgress', activity: 'private-command', plan: null, execution: { model, cwd, requestedReasoningEffort: null }, logTruncated: false });
+  display.update('a', status(null));
+  assert.doesNotMatch(painted.at(-1), /unknown|default|private/);
+  display.update('a', status('observed-one'));
+  assert.ok(painted.at(-1).includes('observed-one'));
+  display.update('b', status('observed-two'));
+  assert.match(painted.at(-1), /2 active.*2 models/);
+  display.update('a');
+  assert.ok(painted.at(-1).includes('observed-two'));
+  display.update('b');
+  assert.equal(painted.at(-1), undefined);
+});
+
+test('result usage retains native tokens and distinguishes unavailable billing from free execution', () => {
+  const usage = { inputTokens: 1000, cachedInputTokens: 200, outputTokens: 250, totalTokens: 1250 };
+  const summary = summarizeRun({ threadId: 'usage-thread', turnId: 'turn', status: 'completed', turnUsage: usage });
+  assert.deepEqual(summary.usage, usage);
+  assert.equal(summary.cost, null);
+  const card = executionCard(summary);
+  assert.match(card, /1,250/);
+  assert.doesNotMatch(card, /\$0|free/i);
+  const missing = summarizeRun({ threadId: 'no-usage', turnId: 'turn', status: 'completed' });
+  assert.equal(missing.usage, null);
+  assert.equal(missing.cost, null);
+  assert.doesNotMatch(executionCard(missing), /Tokens:/);
+});

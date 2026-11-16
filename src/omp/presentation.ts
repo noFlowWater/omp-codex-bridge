@@ -39,7 +39,7 @@ export type RunSnapshot = {
   threadId: string; turnId: string | null; status: string; name?: string | null;
   text?: string; textTruncated?: boolean; error?: string | null; outcomeUnknown?: boolean;
   model?: string | null; execution?: unknown; latestActivity?: unknown; latestPlan?: unknown;
-  fileChanges?: unknown; commandFailure?: unknown;
+  fileChanges?: unknown; commandFailure?: unknown; turnUsage?: unknown;
 };
 
 // The explicit status/details response retains native data. Automatic admissions/follow-ups stay small.
@@ -57,6 +57,7 @@ export function summarizeRun(state: RunSnapshot) {
   const activity = state.latestActivity as { method?: string; at?: number } | null | undefined;
   const latestActivity = activity ? { method: activity.method, at: activity.at, summary: activityLabel(activity) } : null;
   const latestPlan = bounded(state.latestPlan, budget);
+  const usage = bounded(state.turnUsage ?? null, budget);
   const changes = Array.isArray(state.fileChanges) ? state.fileChanges : [];
   const fileChanges = changes.slice(0, 5).map(change => bounded(changeMetadata(change), budget))
     .filter(change => change && typeof change === "object");
@@ -64,7 +65,7 @@ export function summarizeRun(state: RunSnapshot) {
     threadId: state.threadId, turnId: state.turnId, status: state.status,
     name: utf8Preview(state.name, 256).text || null,
     outcomeUnknown: Boolean(state.outcomeUnknown), model: utf8Preview(state.model, 256).text || null,
-    execution, latestActivity, latestPlan, fileChanges, commandFailure,
+    execution, latestActivity, latestPlan, fileChanges, commandFailure, usage, cost: null,
     fileChangesOmitted: changes.length - fileChanges.length,
     error: error && (error.truncated ? `${error.text}…` : error.text), text: text.text,
     truncated: text.truncated || Boolean(state.textTruncated) || Boolean(error?.truncated),
@@ -73,7 +74,7 @@ export function summarizeRun(state: RunSnapshot) {
   };
   // Include JSON escaping/indentation in the budget; reserve 4 KiB for host envelopes.
   const encoder = new TextEncoder();
-  for (const field of ["text", "latestPlan", "fileChanges", "latestActivity", "commandFailure", "execution", "error"] as const) {
+  for (const field of ["text", "latestPlan", "fileChanges", "latestActivity", "commandFailure", "execution", "usage", "error"] as const) {
     const excess = encoder.encode(JSON.stringify(result, null, 2)).length - 20 * 1024;
     if (excess <= 0) break;
     if (field === "text" || field === "error") {
@@ -108,6 +109,9 @@ export function executionCard(result: unknown, expanded = false): string {
     lines.push(`Requested tier: ${screenLine(execution.requestedServiceTier)} · Effective tier: ${screenLine(execution.serviceTier)}`);
   }
   if (state.threadId) lines.push(`Thread: ${screenLine(state.threadId)} Turn: ${screenLine(state.turnId)}`);
+  const usage = objectRecord(state.usage ?? state.turnUsage);
+  if (typeof usage.totalTokens === "number") lines.push(`Tokens: ${usage.totalTokens.toLocaleString("en-US")} · Cost: not reported`);
+  else if (expanded) lines.push("Cost: not reported by Codex");
   if (data.forked) lines.push(`Source: ${screenLine(data.sourceThreadId)} through ${screenLine(data.lastTurnId)} · direct tool · no inference started`);
   if (data.nameWarning) lines.push(`Name warning: ${screenLine(data.nameWarning, 300)}`);
   if (state.latestActivity) lines.push(`Activity: ${activityLabel(state.latestActivity)}`);
@@ -140,13 +144,15 @@ export type ProgressStatus = {
 
 // Agent Hub owns per-worker activity. The native footer only summarizes active Codex work.
 export function createProgressDisplay() {
-  const active = new Set<string>();
+  const active = new Map<string, string | null>();
   const quotas = new Map<string, Record<string, unknown>>();
   let root: ExtensionContext | undefined;
   let rendered: string | undefined;
   function render() {
     if (!root?.hasUI) return;
-    const text = active.size ? `Codex ${active.size} active · Alt+A` : undefined;
+    const models = new Set([...active.values()].filter((model): model is string => Boolean(model)));
+    const model = models.size === 1 ? ` · ${screenLine([...models][0], 48)}` : models.size > 1 ? ` · ${models.size} models` : "";
+    const text = active.size ? `Codex ${active.size} active${model} · Alt+A` : undefined;
     if (text === rendered) return;
     root.ui.setStatus("codex-bridge", text);
     rendered = text;
@@ -184,7 +190,7 @@ export function createProgressDisplay() {
       notify(`Codex ${screenLine(current.limitName ?? id, 80)}: ${reached ? "limit reached" : "usage window recovered"}${detail ? ` · ${detail}` : ""}`, reached ? "warning" : "info");
     },
     update(sessionId: string, status?: ProgressStatus) {
-      if (status) active.add(sessionId);
+      if (status) active.set(sessionId, status.execution?.model ?? null);
       else active.delete(sessionId);
       render();
     },
