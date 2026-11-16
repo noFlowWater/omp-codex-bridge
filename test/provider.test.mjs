@@ -131,13 +131,14 @@ async function withHost(options, store, body) {
     const tools = new Map();
     const providers = new Map();
     const handlers = new Map();
+    const commands = new Map();
     const followUps = [];
     const renderers = new Map();
     const api = {
       zod,
       registerTool: (tool) => tools.set(tool.name, tool),
       registerMessageRenderer: (name, renderer) => renderers.set(name, renderer),
-      registerCommand: () => {},
+      registerCommand: (name, command) => commands.set(name, command),
       getServiceTiers: () => options.ompServiceTier ? { openai: options.ompServiceTier } : {},
       registerProvider: (name, config) => providers.set(name, config),
       // Several registrations of one event all run, as in the host.
@@ -148,7 +149,7 @@ async function withHost(options, store, body) {
       sendMessage: (message, options) => followUps.push({
         message, options,
         bytes: Buffer.byteLength(message.content),
-        summary: JSON.parse(message.content.slice(message.content.indexOf('\n') + 1)),
+        summary: message.details?.result ?? JSON.parse(message.content.slice(message.content.indexOf('\n') + 1)),
       }),
     };
     // Host surfaces this harness does not model are inert.
@@ -169,7 +170,7 @@ async function withHost(options, store, body) {
       const text = result.content[0].text;
       return { isError: result.isError === true, bytes: Buffer.byteLength(text), json: JSON.parse(text) };
     };
-    const instance = { call, tool, followUps, renderers, handlers, providers, ctx, ready: Promise.resolve(handlers.get('session_start')?.({ type: 'session_start' }, ctx)) };
+    const instance = { call, tool, followUps, renderers, handlers, commands, providers, ctx, ready: Promise.resolve(handlers.get('session_start')?.({ type: 'session_start' }, ctx)) };
     bound.push(instance);
     return instance;
   };
@@ -343,6 +344,51 @@ test('direct print cancellation interrupts its native turn and releases the wait
     assert.equal(result.details.code, 'ABORT_ERR');
     assert.equal(sentParams(dir, 'turn/interrupt').length, 1);
     assert.equal(followUps.length, 0);
+  });
+}, TIMEOUT);
+
+test('jobs enumeration is read-only and cancelling one direct job leaves the other running', async () => {
+  await withHost({ turns: ['hold', 'hold'] }, undefined, async ({ call, commands, ctx, followUps, dir }) => {
+    const invoke = async args => {
+      await commands.get('codex').handler(args, ctx);
+      return followUps.findLast(entry => entry.message.customType === 'codex-bridge-operator').summary;
+    };
+    const empty = await invoke('jobs --json');
+    assert.deepEqual(empty.value, []);
+    assert.equal(spawns(dir), 0, 'listing jobs does not launch a native inspection server');
+    const first = await call({ action: 'run', prompt: 'first job' });
+    const second = await call({ action: 'run', prompt: 'second job' });
+    const jobs = await invoke('jobs --json');
+    assert.equal(jobs.value.length, 2);
+    assert.ok(jobs.value.every(job => job.kind === 'direct' && job.canCancel));
+    ctx.hasUI = true;
+    ctx.ui.select = async (title, choices) => title.startsWith('Codex jobs') ? choices[0] : 'Interrupt';
+    await invoke('jobs');
+    await until(() => sentParams(dir, 'turn/interrupt').length === 1);
+    assert.equal(sentParams(dir, 'turn/interrupt')[0].threadId, first.json.threadId);
+    assert.equal((await call({ action: 'status', threadId: second.json.threadId })).json.status, 'inProgress');
+  });
+}, TIMEOUT);
+
+test('a jobs picker message cannot reach a replacement turn and its draft is retained', async () => {
+  await withHost({ turns: ['hold', 'hold'] }, undefined, async ({ call, commands, ctx, followUps, dir }) => {
+    const first = await call({ action: 'run', prompt: 'original target' });
+    ctx.hasUI = true;
+    ctx.ui.select = async (title, choices) => {
+      if (title.startsWith('Codex jobs')) return choices[0];
+      await call({ action: 'cancel', threadId: first.json.threadId });
+      await until(async () => (await call({ action: 'status', threadId: first.json.threadId })).json.status === 'interrupted');
+      await call({ action: 'run', threadId: first.json.threadId, prompt: 'replacement target' });
+      return 'Send message';
+    };
+    ctx.ui.input = async () => 'keep this unsent message';
+    await commands.get('codex').handler('jobs', ctx);
+    const result = followUps.findLast(entry => entry.message.customType === 'codex-bridge-operator').summary;
+    assert.match(result.error.error, /changed since selection/);
+    assert.equal(result.draft, 'keep this unsent message');
+    assert.equal(sentParams(dir, 'turn/start').length, 2);
+    assert.equal(sentParams(dir, 'turn/steer').length, 0);
+    assert.equal((await call({ action: 'status', threadId: first.json.threadId })).json.status, 'inProgress');
   });
 }, TIMEOUT);
 
@@ -2851,6 +2897,56 @@ for (const mode of ['openai/form', 'openaiForm']) {
     });
   }, TIMEOUT);
 }
+
+test('history initialization aborts malformed intents and incompatible providers before native work', async () => {
+  await withHost({}, undefined, async ({ providers, dir }) => {
+    const { config, model } = providerModel(providers);
+    for (const [data, selectedModel, expected] of [
+      [{ threadId: 'saved', cwd }, model, /Invalid saved-history/],
+      [{ threadId: 'saved', lastTurnId: 'finished', cwd }, { provider: 'other', id: 'other' }, /requires the codex-bridge provider/],
+    ]) {
+      const ctx = lifecycleContext(`invalid-history-${selectedModel.provider}`, selectedModel,
+        [{ id: 'intent', type: 'custom', customType: 'codex-bridge-history-fork', data }]);
+      assert.throws(() => config.streamSimple.context({}, ctx), expected);
+      assert.equal(ctx.aborted, true);
+    }
+    assert.deepEqual(mutations(dir), []);
+  });
+});
+
+test('a trusted history initialization forks inside its Hub provider and survives revival without replay', async () => {
+  const source = { threadId: 'history-source', lastTurnId: 'source-turn', cwd };
+  const store = { nextThread: 0, nextTurn: 10, threads: { 'history-source': { id: 'history-source', cwd,
+    turns: [nativeTurn('source-turn', 'completed')] } } };
+  await withHost({ turns: ['finish-later', 'finish-later'] }, store, async ({ providers, call, dir }) => {
+    const { config, model } = providerModel(providers);
+    const entries = [{ id: 'history-init', type: 'session_init' },
+      { id: 'history-ref', parentId: 'history-init', type: 'custom', customType: 'codex-bridge-history-fork', data: source }];
+    const ctx = lifecycleContext('history-journal', model, entries);
+    sessionContexts.set('history-provider', ctx);
+    const question = at('only the new question', 90001);
+    const first = await stream(providers, { messages: [question] }, { sessionId: 'history-provider' });
+    assert.equal(first.final.type, 'done', first.message.errorMessage);
+    const [fork] = sentParams(dir, 'thread/fork');
+    assert.equal(fork.threadId, source.threadId);
+    assert.equal(fork.lastTurnId, source.lastTurnId);
+    const [turn] = sentParams(dir, 'turn/start');
+    assert.notEqual(turn.threadId, source.threadId);
+    assert.match(inputText(turn), /only the new question/);
+    assert.doesNotMatch(inputText(turn), /answer of source-turn/);
+    assert.equal(readRecord('history-provider').historyFork.completed, true);
+    const denied = await call({ action: 'run', threadId: turn.threadId, prompt: 'must not duplicate ownership' });
+    assert.equal(denied.json.code, 'THREAD_NOT_OWNED');
+    await closeSessions('history-provider');
+    const next = at('one later question', 90002);
+    const second = await stream(providers, { messages: [question, first.message, next] }, { sessionId: 'history-provider' });
+    assert.equal(second.final.type, 'done', second.message.errorMessage);
+    assert.equal(sentParams(dir, 'thread/fork').length, 1);
+    assert.equal(sentParams(dir, 'turn/start').length, 2);
+    assert.doesNotMatch(inputText(sentParams(dir, 'turn/start')[1]), /only the new question|answer of source-turn/);
+    assert.equal(config.streamSimple.inspectSession('history-journal').threadId, turn.threadId);
+  });
+}, TIMEOUT);
 
 for (const transition of ['branch', 'fork', 'whole-fork']) {
   test(`official ${transition} lifecycle forks native history without replaying source receipts`, async () => {

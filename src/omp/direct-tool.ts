@@ -3,8 +3,9 @@ import { CustomMessageComponent } from "@oh-my-pi/pi-tui/chat/custom-message";
 import { CodexAppServerClient } from "../codex/client.mjs";
 import { TERMINAL as NATIVE_TERMINAL } from "../codex/protocol.mjs";
 import { onRequest } from "./dialogs.ts";
-import { errorDetails, readOnlyAction, registerOperator } from "./operator.ts";
+import { errorDetails, readOnlyAction } from "./operator.ts";
 import { operatorContent, summarizeRun } from "./presentation.ts";
+import type { Job, JobsAccess } from "./jobs.ts";
 
 const TERMINAL = new Set(["completed", "failed", "interrupted", "disconnected"]);
 
@@ -111,7 +112,7 @@ export function registerDirectTool(pi: ExtensionAPI, options: { onRateLimits?: (
     });
   }
 
-  async function run(params: { threadId?: string; prompt?: string; input?: unknown[]; cwd: string; model?: string; effort?: string; outputSchema?: unknown; name?: string; serviceTier?: string }, signal?: AbortSignal, waitForCompletion = false) {
+  async function run(params: { threadId?: string; prompt?: string; input?: unknown[]; cwd: string; model?: string; effort?: string; outputSchema?: unknown; name?: string; serviceTier?: string; onThread?: (threadId: string) => void }, signal?: AbortSignal, waitForCompletion = false) {
     // A shutdown/session switch during admission replaces the client; the old continuation
     // must not touch the new session's ownership, delivery or hold state.
     const admissionBarrier = closeBarrier;
@@ -228,7 +229,57 @@ export function registerDirectTool(pi: ExtensionAPI, options: { onRateLimits?: (
     return client ? client.status() : [];
   }
 
-  registerOperator(pi, { getClient, status, fork });
+  function ownedState(job: Job) {
+    if (job.kind !== "direct" || !job.threadId || job.id !== `direct:${job.threadId}` || !owned.has(job.threadId)) {
+      throw new Error("Direct job is not owned by this session; nothing sent");
+    }
+    const state = client?.snapshot(job.threadId);
+    if (!state) throw new Error("Direct job is no longer available; nothing sent");
+    return state;
+  }
+
+  function observedState(job: Job) {
+    const state = ownedState(job);
+    if ((state.turnId ?? undefined) !== job.turnId || state.status !== job.status || state.outcomeUnknown) {
+      throw new Error("Direct job changed since selection or its outcome is unknown; refresh before submitting. Nothing sent");
+    }
+    return state;
+  }
+
+  function directJob(state: ReturnType<CodexAppServerClient["snapshot"]>): Job {
+    const known = !state.outcomeUnknown && state.status !== "disconnected";
+    const active = state.status === "inProgress" && Boolean(state.turnId);
+    return {
+      id: `direct:${state.threadId}`, kind: "direct", name: state.name?.trim() || state.threadId,
+      status: state.status, cwd: state.cwd ?? "", threadId: state.threadId, turnId: state.turnId ?? undefined,
+      activity: state.latestActivity?.method,
+      canSend: known && Boolean(state.cwd) && (active || ["idle", "completed", "failed", "interrupted"].includes(state.status)),
+      canCancel: known && active,
+    };
+  }
+
+  const directJobs: JobsAccess = {
+    async list() {
+      return client ? client.snapshot().filter(state => owned.has(state.threadId)).map(directJob) : [];
+    },
+    async details(job) { return ownedState(job); },
+    async send(job, text) {
+      const state = observedState(job);
+      if (!directJob(state).canSend) throw new Error("Direct job cannot receive input in its current state; nothing sent");
+      if (state.status === "inProgress") return steer({ threadId: state.threadId, turnId: state.turnId!, prompt: text });
+      const active = client;
+      return run({ threadId: state.threadId, cwd: state.cwd!, prompt: text, onThread() {
+        if (client !== active) throw new Error("Session changed before native admission; nothing sent");
+        observedState(job);
+      } });
+    },
+    async cancel(job) {
+      const state = observedState(job);
+      if (!directJob(state).canCancel) throw new Error("Direct job has no confirmed active turn to interrupt; nothing sent");
+      return summarizeRun(await client!.cancel(state.threadId, state.turnId!));
+    },
+  };
+
   pi.registerMessageRenderer("codex-bridge-result", (message, options) => {
     if (options.expanded || typeof message.content !== "string") return undefined;
     const result = JSON.parse(message.content.slice(message.content.indexOf("\n") + 1));
@@ -331,5 +382,5 @@ export function registerDirectTool(pi: ExtensionAPI, options: { onRateLimits?: (
     },
   });
 
-  return shutdown;
+  return { shutdown, access: { getClient, status, fork, directJobs } };
 }

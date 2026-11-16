@@ -436,21 +436,31 @@ export class CodexAppServerClient {
   }
 
 
-  async cancel(threadId) {
+  // Optional identity pins an operator cancellation to the turn the operator inspected.
+  async cancel(threadId, expectedTurnId) {
     nonempty(threadId, 'threadId');
+    if (expectedTurnId !== undefined) nonempty(expectedTurnId, 'expectedTurnId');
+    const checkTurn = state => {
+      if (expectedTurnId !== undefined && state?.turnId !== expectedTurnId) {
+        throw new Error(`Turn ${expectedTurnId} is not the current turn of thread ${threadId}; not interrupted`);
+      }
+    };
     const interrupted = this._threads.get(threadId);
+    checkTurn(interrupted);
     let requested;
     if (interrupted && (interrupted.status === 'inProgress' || interrupted.outcomeUnknown)) {
       requested = interrupted.interruptRequested ??= { turnId: interrupted.turnId };
     }
     if (requested?.promise) return requested.promise;
-    this._abortRequests(threadId);
+    this._abortRequests(threadId, expectedTurnId);
     const task = this._serialize(threadId, async () => {
       const state = this._threads.get(threadId);
       if (!state) throw new Error(`Unknown local thread: ${threadId}`);
       try {
+        checkTurn(state);
         await this.connect();
         if (state.outcomeUnknown || (state.status === 'inProgress' && !state.turnId)) await this._reconcile(state);
+        checkTurn(state);
       } catch (error) {
         // No interrupt was sent. Its coalescing slot must not block a later confirmed active turn.
         if (state.interruptRequested === requested) state.interruptRequested = null;

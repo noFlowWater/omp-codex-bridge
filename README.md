@@ -14,6 +14,7 @@ The bridge connects OMP to `codex app-server --stdio`. Codex handles inference, 
 - Continue conversations, interrupt work and steer running turns.
 - Use native models, reasoning effort, images and structured output.
 - Browse saved history and fork a finished turn into a new conversation.
+- Manage current workers with `/codex jobs`; continue saved history as a new Hub worker on a host with Agent Hub controls.
 - Keep native Codex configuration and authentication.
 
 ## Quick start
@@ -43,9 +44,11 @@ The installed plugin links to this checkout. Keep it in place. For version pinni
 | --- | --- |
 | Agent Hub: `codex-bridge` | Delegating tasks with live child transcripts and follow-ups |
 | Tool: `codex_bridge` | Starting, inspecting and cancelling direct native threads |
-| Command: `/codex` | Diagnostics, saved history, forks and processing tier |
+| Command: `/codex` | Worker picker, diagnostics, saved history, forks and processing tier |
 
 Start with `/codex doctor` to check the connection without model inference. Use `/codex history` to browse saved conversations.
+
+`/codex jobs` lists current direct workers and offers details, messages and interruption without copying IDs. Hub controls and **Continue in Agent Hub** require the host API supplied by the [optional OMP patch](patches/README.md). Stock OMP 18.21.0 keeps direct-worker controls and existing Agent Hub delegation; doctor reports the missing API. The plugin never silently replaces your host.
 
 Hub workers use `codex-bridge/default` unless a native model selector is chosen. Per-task model selection requires OMP's operator grants. Running-turn steering requires `providers.openaiLiveSteering`; otherwise messages wait for the next turn. See [Agent Hub](docs/agent-hub.md).
 

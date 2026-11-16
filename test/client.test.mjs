@@ -2054,6 +2054,90 @@ it('coalesces concurrent and admitted interrupts until the same native turn ends
   await untilSnapshot(client, active.threadId, value => value.status === 'interrupted' && value.turnId === next.turnId);
 });
 
+it('validates an expected cancellation turn before connecting', async (t) => {
+  const { client, dir } = makeClient(t);
+  for (const expected of ['', null, 7, 'bad\0turn']) {
+    await assert.rejects(client.cancel('thread', expected), /expectedTurnId must be a nonempty string without NUL/);
+  }
+  await assert.rejects(client.cancel('thread', 'missing'), /not the current turn.*not interrupted/);
+  assert.deepEqual(trace(dir), []);
+});
+
+it('stale cancellation preserves pending questions and cannot join a different turn interrupt', async (t) => {
+  let signal;
+  const { client, dir } = makeClient(t, { interruptCompletionDelay: 100 }, { onRequest: request => {
+    signal = request.signal;
+    return new Promise(() => {});
+  } });
+  const previous = await client.run({ prompt: 'hold', cwd });
+  await client.cancel(previous.threadId);
+  await untilSnapshot(client, previous.threadId, value => value.status === 'interrupted');
+  const active = await client.run({ threadId: previous.threadId, prompt: 'question', cwd });
+  await until(() => signal);
+  await assert.rejects(client.cancel(active.threadId, previous.turnId), /not the current turn.*not interrupted/);
+  assert.equal(signal.aborted, false);
+  assert.equal(sent(dir, 'turn/interrupt').length, 1);
+  const pending = client.cancel(active.threadId, active.turnId);
+  await assert.rejects(client.cancel(active.threadId, previous.turnId), /not the current turn.*not interrupted/);
+  const [first, second] = await Promise.all([pending, client.cancel(active.threadId, active.turnId)]);
+  assert.equal(first.turnId, active.turnId);
+  assert.equal(second.turnId, active.turnId);
+  assert.equal(signal.aborted, true);
+  assert.deepEqual(sent(dir, 'turn/interrupt').map(({ turnId }) => turnId), [previous.turnId, active.turnId]);
+});
+
+it('refuses a stale cancellation queued behind a replacement turn', async (t) => {
+  const { client, dir } = makeClient(t);
+  const previous = await client.run({ prompt: 'hold', cwd });
+  await client.cancel(previous.threadId);
+  await untilSnapshot(client, previous.threadId, value => value.status === 'interrupted');
+  let release;
+  let entered;
+  const gate = new Promise(resolve => { release = resolve; });
+  const ready = new Promise(resolve => { entered = resolve; });
+  const next = client.run({ threadId: previous.threadId, prompt: 'hold', cwd,
+    onThread: async () => { entered(); await gate; },
+  });
+  await ready;
+  const stale = client.cancel(previous.threadId, previous.turnId);
+  const rejected = assert.rejects(stale, /not the current turn.*not interrupted/);
+  release();
+  const active = await next;
+  await rejected;
+  assert.equal(client.snapshot(active.threadId).status, 'inProgress');
+  assert.deepEqual(sent(dir, 'turn/interrupt').map(({ turnId }) => turnId), [previous.turnId]);
+  await client.cancel(active.threadId, active.turnId);
+  assert.deepEqual(sent(dir, 'turn/interrupt').map(({ turnId }) => turnId), [previous.turnId, active.turnId]);
+});
+
+for (const operation of ['connect', '_reconcile']) {
+  it(`rechecks expected cancellation identity after ${operation} awaits`, async (t) => {
+    const { client, dir } = makeClient(t);
+    const active = await client.run({ prompt: 'hold', cwd });
+    let entered;
+    let release;
+    const ready = new Promise(resolve => { entered = resolve; });
+    const gate = new Promise(resolve => { release = resolve; });
+    const original = client[operation].bind(client);
+    if (operation === '_reconcile') client._threads.get(active.threadId).outcomeUnknown = true;
+    client[operation] = async (...args) => {
+      entered();
+      await gate;
+      if (operation === 'connect') await original(...args);
+      client._handleNotification('turn/started', {
+        threadId: active.threadId, turn: { id: 'replacement-turn', status: 'inProgress', items: [] },
+      });
+    };
+    const pending = assert.rejects(client.cancel(active.threadId, active.turnId), /not the current turn.*not interrupted/);
+    await ready;
+    release();
+    await pending;
+    assert.equal(client.snapshot(active.threadId).turnId, 'replacement-turn');
+    assert.equal(client.snapshot(active.threadId).status, 'inProgress');
+    assert.equal(sent(dir, 'turn/interrupt').length, 0);
+  });
+}
+
 it('negotiates extended MCP forms before forwarding them to the host', async (t) => {
   for (const mode of ['openai/form', 'openaiForm']) {
     let seen;

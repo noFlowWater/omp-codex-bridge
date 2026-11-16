@@ -7,6 +7,7 @@ import { CODEX_BRIDGE_PROVIDER, CODEX_BRIDGE_API, CODEX_BRIDGE_MODELS, DEFAULT_M
 import { inputId, inputBlocks, textOf, nativeInputs, nativeEffort, nativeOutputSchema, responseId, anchorOf } from './input.mjs';
 import { LINE_CHARS, PROGRESS_CHARS, PROGRESS_LIMIT_NOTICE, clip, planLine, commandLine, nativeLabel, progressLine } from './progress.mjs';
 import { loadSession, saveSession, sessionFile, readSessionRecord } from './session-store.mjs';
+import { HISTORY_ENTRY, historyEntry, bootstrapHistory } from './history.mjs';
 
 export { CODEX_BRIDGE_PROVIDER, CODEX_BRIDGE_API, CODEX_BRIDGE_MODELS, DEFAULT_MODEL_ID, parseCodexModelId, fetchCodexModels };
 export { inputId, nativeInputs } from './input.mjs';
@@ -153,10 +154,13 @@ export function createCodexBridgeProvider({ EventStream, stateDir, onRequest, on
     }
     return session;
   }
-  function boundary(entries) {
+  function boundary(entries, session) {
     for (let i = entries.length - 1; i >= 0; i--) {
       const entry = entries[i];
       if (entry.type === 'reset_boundary') return null;
+      if (entry.type === 'custom' && entry.customType === HISTORY_ENTRY && session?.historyFork?.completed) {
+        return { threadId: session.historyFork.forkedThreadId, turnId: session.historyFork.forkedTurnId };
+      }
       if (entry.type === 'compaction' && entry.preserveData?.codexNative) return entry.preserveData.codexNative;
       if (entry.type !== 'message') continue;
       const message = entry.message;
@@ -522,6 +526,7 @@ export function createCodexBridgeProvider({ EventStream, stateDir, onRequest, on
     if (!options.cwd) return finish('error', 'codex-bridge requires the session cwd; no native turn started');
     if (signal?.aborted) return finish('aborted', 'Cancelled before submission; no native turn started');
     let taskName;
+    let history;
     let serviceTier = options.serviceTier;
     if (options.onPayload) {
       const payload = { api: CODEX_BRIDGE_API, sessionId: options.sessionId };
@@ -536,6 +541,7 @@ export function createCodexBridgeProvider({ EventStream, stateDir, onRequest, on
         }
         if (!request.captured) return finish('error', 'Native request hooks did not supply authoritative session context; no native turn started');
         taskName = request.taskName;
+        history = request.history;
         serviceTier ??= request.serviceTier;
       } finally {
         payloadRequests.delete(payload);
@@ -595,6 +601,11 @@ export function createCodexBridgeProvider({ EventStream, stateDir, onRequest, on
       const label = (name) => name ? `native model ${name}` : 'the Codex default model';
       return finish('error', `This session's native thread uses ${label(session.model)}; start a new task for ${label(nativeModel)}. Native model changes are not applied mid-session; no native turn started`);
     }
+    if (history) {
+      try { await bootstrapHistory(session, history, value => saveSession(stateDir, value), signal); }
+      catch (error) { return finish(signal?.aborted ? 'aborted' : 'error', error.message); }
+    }
+    if (session.historyFork && !session.historyFork.completed) return finish('error', session.failure || 'History fork is unconfirmed; not retried');
     // This transcript already talked to Codex, but no record of what was sent exists (deleted,
     // or a rotated provider session id): replaying could rerun native work, so stop.
     if ((!session.recorded || !session.threadId && session.threads.size > 0) && lastAssistant(context.messages, model.provider)) {
@@ -754,6 +765,12 @@ export function createCodexBridgeProvider({ EventStream, stateDir, onRequest, on
   function captureContext(_event, ctx, sessionId) {
     const branch = ctx.sessionManager.getBranch();
     const entries = branchEntries(ctx, branch);
+    let history;
+    try { history = historyEntry(entries); } catch (error) { ctx.abort(); throw error; }
+    if (history && ctx.model?.provider !== CODEX_BRIDGE_PROVIDER) {
+      ctx.abort();
+      throw new Error('This history continuation requires the codex-bridge provider; no native input sent');
+    }
     const opaque = entries.findLast(entry => entry.type === 'compaction' && entry.preserveData?.codexNative)?.preserveData.codexNative;
     const journalId = ctx.sessionManager.getSessionId();
     sessionId ??= providerSessionIds.get(journalId) ?? opaque?.providerSessionId ?? journalId;
@@ -794,7 +811,7 @@ export function createCodexBridgeProvider({ EventStream, stateDir, onRequest, on
         const leaf = event.reason === 'branch' ? target.parentId : target.id;
         entries = leaf ? branchEntries(ctx, ctx.sessionManager.getBranch(leaf)) : [];
       }
-      const anchor = boundary(entries);
+      const anchor = boundary(entries, source);
       if (anchor && !source.threads.has(anchor.threadId)) throw new Error('The selected native thread is not owned by this session');
       return {
         sourceId, anchor,
@@ -819,6 +836,14 @@ export function createCodexBridgeProvider({ EventStream, stateDir, onRequest, on
     branchedSessions.set(journalId, session);
   };
   streamSimple.context = (event, ctx) => captureContext(event, ctx);
+  streamSimple.inspectSession = journalId => {
+    const id = providerSessionIds.get(journalId) ?? journalId;
+    const session = sessions.get(id);
+    if (session?.threadId) return session.client.snapshot(session.threadId);
+    const record = loadSession(stateDir, id, undefined, '');
+    return record.recorded && record.threadId ? { threadId: record.threadId, turnId: record.turnId, cwd: record.cwd,
+      model: record.model, status: 'history', outcomeUnknown: Boolean(record.failure), failure: record.failure } : undefined;
+  };
   streamSimple.beforeProviderRequest = (event, ctx, metadata = {}) => {
     const request = payloadRequests.get(event.payload);
     if (!request) return;
@@ -838,6 +863,7 @@ export function createCodexBridgeProvider({ EventStream, stateDir, onRequest, on
       : ctx.agent?.kind === 'sub' && typeof ctx.agent.id === 'string' ? ctx.agent.id : undefined;
     request.serviceTier = metadata.serviceTier;
     request.captured = true;
+    request.history = historyEntry(branchEntries(ctx));
     branchedSessions.delete(journalId);
     return event.payload;
   };
@@ -910,7 +936,7 @@ export function createCodexBridgeProvider({ EventStream, stateDir, onRequest, on
       const rewind = target?.type === 'custom_message'
         || target?.type === 'message' && target.message.role === 'user';
       const leaf = rewind ? target.parentId : target?.id;
-      const anchor = boundary(leaf ? ctx.sessionManager.getBranch(leaf) : []);
+      const anchor = boundary(leaf ? ctx.sessionManager.getBranch(leaf) : [], lifecycleSession(ctx));
       if (anchor && !lifecycleSession(ctx).threads.has(anchor.threadId)) throw new Error('The selected native thread is not owned by this session');
     } catch (error) {
       ctx.ui.notify(error.message, 'error');
@@ -920,7 +946,7 @@ export function createCodexBridgeProvider({ EventStream, stateDir, onRequest, on
   streamSimple.afterTree = (_event, ctx) => {
     const session = lifecycleSession(ctx);
     if (!session) return;
-    session.rewrite = boundary(branchEntries(ctx));
+    session.rewrite = boundary(branchEntries(ctx), session);
     saveSession(stateDir, session);
     streamSimple.context(_event, ctx);
   };

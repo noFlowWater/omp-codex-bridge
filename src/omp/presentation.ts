@@ -96,6 +96,7 @@ function doctorCard(result: Record<string, unknown>): string {
   for (const name of ["auth", "executable", "models", "steering", "rateLimits"]) {
     if (objectRecord(result[name]).status !== "available") rows.push(check(name));
   }
+  if (objectRecord(result.hubControls).status !== "available") rows.push(["Agent Hub controls", check("hubControls")[1]]);
   for (const name of ["primary", "secondary"]) {
     const window = objectRecord(limits[name]);
     if (typeof window.usedPercent !== "number" || !Number.isFinite(window.usedPercent)) continue;
@@ -116,6 +117,27 @@ export function operatorCard(label: string, value: unknown): string | undefined 
   const result = objectRecord(value);
   if (result.cancelled === true) return "Cancelled.";
   switch (label) {
+    case "jobs": {
+      if (result.error) return [operatorCard("error", result.error), result.draft ? "Message draft retained; delivery is not confirmed." : ""].filter(Boolean).join("\n\n");
+      if (result.action === "list") {
+        const jobs = Array.isArray(result.value) ? result.value : [];
+        return [markdownText(result.scope ?? "Current session jobs"), jobs.length ? ["| Job | Type | Status | Directory |", "| --- | --- | --- | --- |",
+          ...jobs.map(value => { const job = objectRecord(value); return `| ${markdownText(job.name)} | ${markdownText(job.kind)} | ${markdownText(job.status)} | ${markdownText(job.cwd)} |`; }),
+        ].join("\n") : "No current jobs."].join("\n\n");
+      }
+      const job = objectRecord(result.job);
+      const returned = objectRecord(result.value);
+      return [metadata([["Action", result.action], ["Job", job.name], ["Type", job.kind], ["Selected status", job.status],
+        ["Observed status", returned.status], ["Directory", job.cwd], ["Activity", job.activity]]),
+        result.action === "send" ? "Message submitted; check the worker for delivery and completion." :
+          result.action === "cancel" ? "Interruption requested; refresh to confirm the outcome." : ""].filter(Boolean).join("\n\n");
+    }
+    case "continuation": {
+      if (result.error) return [operatorCard("error", result.error), "Question draft retained; delivery is not confirmed."].join("\n\n");
+      const child = objectRecord(result.child);
+      const source = objectRecord(result.source);
+      return metadata([["Action", "Continue saved history in a new Hub child"], ["Child", child.agentId ?? child.jobId], ["Status", child.status], ["Directory", source.cwd], ["Source", source.threadId], ["Boundary", source.lastTurnId]]);
+    }
     case "doctor": return doctorCard(result);
     case "tier": return [metadata([["Service tier", result.serviceTier]]), markdownText(result.scope),
       ...(result.note ? [markdownText(result.note)] : [])].join("\n\n");
@@ -157,6 +179,12 @@ export function operatorContent(label: string, value: unknown): string | undefin
   const summary = operatorCard(label, value);
   if (summary === undefined) return undefined;
   const data = objectRecord(value);
+  if (label === "jobs" && data.action === "details") {
+    const detail = objectRecord(data.value);
+    const native = objectRecord(detail.native ?? detail);
+    return native.threadId ? `${summary}\n\n${operatorContent("details", native)}` : summary;
+  }
+  if ((label === "jobs" || label === "continuation") && typeof data.draft === "string") return `${summary}\n\n${literalBlock(data.draft)}`;
   const state = objectRecord(data.snapshot ?? data.state ?? data);
   const failure = objectRecord(state.commandFailure);
   const blocks = [summary];

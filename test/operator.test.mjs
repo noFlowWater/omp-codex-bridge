@@ -22,10 +22,44 @@ mock.module('@oh-my-pi/pi-coding-agent/config/settings', () => ({
 }));
 const { registerOperator, errorDetails } = await import('../src/omp/operator.ts');
 const { createProgressDisplay, summarizeRun, operatorCard, operatorContent } = await import('../src/omp/presentation.ts');
+const { pickHistory } = await import('../src/omp/history-picker.ts');
 const cwd = realpathSync(process.cwd());
 const FAKE = fileURLToPath(new URL('./client.test.mjs', import.meta.url));
 const runtime = Bun.which('node') ?? process.execPath;
 const MUTATIONS = new Set(['thread/start', 'thread/resume', 'thread/fork', 'thread/compact/start', 'turn/start', 'turn/steer', 'turn/interrupt']);
+
+test('history continuation pages finished boundaries and cancels without sending a question', async () => {
+  for (const submit of [false, true]) {
+    const inspected = [];
+    const submitted = [];
+    const firstPage = { data: [{ id: 'newest', status: 'completed' }], nextCursor: 'older-turns' };
+    const client = {
+      listThreads: async () => ({ data: [{ id: 'saved', cwd } ] }),
+      async getThreadDetails(threadId, options) {
+        inspected.push({ threadId, cursor: options.cursor });
+        return { thread: { id: threadId, cwd }, turns: options.cursor
+          ? { data: [{ id: 'older-finished', status: 'interrupted' }] } : firstPage };
+      },
+    };
+    let turnPage = 0;
+    const ctx = { cwd, ui: {
+      async select(title, choices) {
+        if (title.startsWith('Source')) return 'Continue in Agent Hub';
+        if (!title.startsWith('Continue through')) return choices[0];
+        turnPage++;
+        return turnPage === 1 ? 'Next page' : submit ? choices[0] : 'Cancel';
+      },
+      async input() { return 'explicit question'; },
+    } };
+    const result = await pickHistory({}, client, ctx, () => assert.fail('no direct fork'), async (source, question) => {
+      submitted.push({ source, question });
+      return { id: 'new-child' };
+    });
+    assert.deepEqual(inspected, [{ threadId: 'saved', cursor: undefined }, { threadId: 'saved', cursor: 'older-turns' }]);
+    assert.deepEqual(submitted, submit ? [{ source: { threadId: 'saved', lastTurnId: 'older-finished', cwd }, question: 'explicit question' }] : []);
+    assert.equal(submit ? result.continued : result.cancelled, true);
+  }
+});
 
 test('operator summary preserves diagnostic failures, quota warnings and terminal safety', () => {
   const card = operatorCard('doctor', {
@@ -106,6 +140,54 @@ test('operator help preserves line breaks and remaining commands render summarie
     assert.doesNotMatch(render(), /Usage:|Fork options/);
     await invoke('show --json saved-one');
     assert.equal(renderers.get('codex-bridge-operator')(messages.at(-1).message, { expanded: false }, {}), undefined);
+  });
+});
+
+test('history continues only after an explicit question and passes the finished boundary without replay', async () => {
+  for (const question of [undefined, 'continue this work']) {
+    const starts = [];
+    await withOperator({ ui: {
+      select: async (title, choices) => title.startsWith('Codex saved history') ? choices[0]
+        : title.startsWith('Source') ? 'Continue in Agent Hub' : choices[0],
+      input: async () => question,
+    }, continueHistory: () => async (source, text) => {
+      starts.push({ source, text });
+      return { agentId: 'new-child', jobId: 'new-job', status: 'running' };
+    } }, async ({ invoke, messages, trace, renderers }) => {
+      const result = await invoke('history {"limit":1}');
+      if (question === undefined) {
+        assert.equal(result.cancelled, true);
+        assert.deepEqual(starts, []);
+      } else {
+        assert.equal(result.continued, true);
+        assert.deepEqual(starts, [{ source: { threadId: 'saved-one', lastTurnId: 'old-turn', cwd }, text: question }]);
+        assert.match(renderers.get('codex-bridge-operator')(messages.at(-1).message, { expanded: false }, {}).text, /new-child/);
+      }
+      assert.deepEqual(trace().filter(entry => MUTATIONS.has(entry.message?.method)), [], 'inspection client never forks or owns the Hub copy');
+    });
+  }
+});
+
+test('jobs raw output never opens a picker and preserves action errors and message drafts', async () => {
+  const job = { id: 'direct:t', kind: 'direct', name: 'Parser review', cwd, status: 'inProgress', threadId: 't', turnId: 'u', canSend: true, canCancel: true };
+  let sends = 0;
+  const access = { list: async () => [job], details: async () => job,
+    send: async () => { sends++; throw new Error('Selected turn changed'); }, cancel: async () => assert.fail('must not interrupt') };
+  await withOperator({ jobs: () => access, ui: {
+    select: async (title, choices) => title.startsWith('Codex jobs') ? choices[0] : 'Send message', input: async () => 'my preserved draft',
+  } }, async ({ invoke, renderers, messages, trace }) => {
+    const raw = await invoke('jobs --json');
+    assert.deepEqual(raw.value, [job]);
+    assert.equal(sends, 0);
+    const failed = await invoke('jobs');
+    assert.equal(sends, 1);
+    assert.equal(failed.draft, 'my preserved draft');
+    assert.match(failed.error.error, /Selected turn changed/);
+    const card = renderers.get('codex-bridge-operator')(messages.at(-1).message, { expanded: false }, {}).text;
+    assert.match(card, /Selected turn changed/);
+    assert.match(card, /my preserved draft/);
+    assert.doesNotMatch(card, /\"stack\"|\"draft\"\s*:/);
+    assert.equal(trace().length, 0);
   });
 });
 
@@ -197,6 +279,8 @@ async function withOperator(options, body) {
   };
   registerOperator(pi, {
     getClient,
+    jobs: options.jobs,
+    continueHistory: options.continueHistory,
     status: async threadId => threadId ? (await getClient()).status(threadId) : client?.snapshot() ?? [],
     fork: options.fork ?? (async params => {
       const result = await (await getClient()).fork({ threadId: params.threadId, lastTurnId: params.lastTurnId, cwd });

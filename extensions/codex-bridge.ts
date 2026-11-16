@@ -5,6 +5,9 @@ import { CODEX_BRIDGE_API, CODEX_BRIDGE_MODELS, CODEX_BRIDGE_PROVIDER, createCod
 import { captureRoot, releaseRoot, createRequestParsers, onRequest } from "../src/omp/dialogs.ts";
 import { registerDirectTool } from "../src/omp/direct-tool.ts";
 import { createProgressDisplay } from "../src/omp/presentation.ts";
+import { registerOperator } from "../src/omp/operator.ts";
+import { jobActions } from "../src/omp/job-actions.ts";
+import { hubControls, hubJobs, continueInHub } from "../src/omp/hub.ts";
 
 const progressDisplay = createProgressDisplay();
 
@@ -35,7 +38,13 @@ export default function (pi: ExtensionAPI) {
   });
 
   const parsers = createRequestParsers(pi.zod);
-  const shutdown = registerDirectTool(pi, { onRateLimits: progressDisplay.rateLimits });
+  const direct = registerDirectTool(pi, { onRateLimits: progressDisplay.rateLimits });
+  const { shutdown } = direct;
+  registerOperator(pi, {
+    ...direct.access,
+    jobs: ctx => jobActions(direct.access.directJobs, hubJobs(ctx, streamSimple.inspectSession)),
+    continueHistory: ctx => hubControls(ctx) ? (source, question) => continueInHub(source, question, ctx) : undefined,
+  });
   let preparedBranch;
 
   pi.on("session_start", (_event, ctx) => {

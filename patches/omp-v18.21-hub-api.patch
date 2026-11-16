@@ -1,0 +1,1208 @@
+diff --git a/docs/extensions.md b/docs/extensions.md
+index c1198e5..118fe73 100644
+--- a/docs/extensions.md
++++ b/docs/extensions.md
+@@ -399,6 +399,7 @@ Handlers and tool `execute` receive `ctx` with:
+ - `getSystemPrompt()`
+ - `isProjectTrusted()` — always `true`; OMP does not ask for per-directory trust before loading project inputs
+ - `agent` — the agent this session runs: `{ kind: "main" | "sub", id, name, depth, parentId? }`. Factories are rebound to every subagent session (task tool, eval `agent()`, `/tan` clones), so a handler can check `ctx.agent.kind === "sub"` or the lowercased agent definition `name` (for example `"explore"`) to act only in subagents. Use `kind`, not `depth`: `depth` counts `task` nesting only, so `/tan` clones are subagents at depth 0 and report `name: "sub"`. An advisor's own tool calls reach the session's `tool_call`/`tool_result` handlers with `{ kind: "sub", id: "advisor", name: "advisor", depth: 0, parentId }`, so `kind === "main"` also excludes advisor activity
++- `agents` (optional; interactive owner session only; see below)
+ - `runEphemeralTurn(...)` (optional; see below)
+ - `startLive(...)` (optional; interactive mode only; see below)
+ - `memory` (optional structured memory runtime — status/search/save across the configured backend)
+@@ -494,6 +495,19 @@ const current = ctx.models.current();
+ const contrasting = ctx.models.list().find(m => current && ctx.models.family(m) !== ctx.models.family(current));
+ ```
+ 
++### Native Agent Hub children (`ctx.agents`)
++
++Interactive host extensions can use `ctx.agents` to manage native task children without an LLM dispatch step. It is undefined in print, JSON, RPC, subagent, and collab guest contexts.
++
++- `list()` returns owned descendant task jobs with native job/agent status, cwd, model, last activity and optional live `sessionId`.
++- `spawn({ agent, task, name?, model?, cwd?, initialization? })` returns a managed job promptly through the enabled native task tool. Normal spawn policy, async settings, concurrency, model grants and lifecycle still apply. Operator-origin spawn and send results remain in the native job/Hub views and do not wake the parent model; ordinary model-origin task completion delivery is unchanged. Blocking agent types and disabled async jobs are rejected. A fresh persistent parent journal is materialized with the native `ensureOnDisk`/`flush` path, so spawning can be the first command without a chat turn; `--no-session` remains unsupported. Optional `cwd` asserts that the source workspace matches the parent; cross-workspace continuations are rejected.
++- `focus(handle)`, `interrupt(handle)` and `cancel(handle)` use the native focus, abort and lifecycle paths. Cancel preserves the child's transcript as a killed agent.
++- `send(handle, message, { streamingBehavior? })` returns a managed follow-up job. It awaits native revival and rechecks the selected handle before admitting the job, so stale selections reject without submitting input. The model turn completes asynchronously; a failed job exposes its native `error`. Its prompt uses the native Hub delivery path; streaming behavior is `steer` by default or `followUp`.
++
++Keep the full returned handle: `agentId`, `jobId`, `jobStartedAt`, `runStartedAt`, `sessionFile`, `generation`, and optional `sessionId`. Refresh with `list()` after a queued child starts, after sending, or after any turn changes. Old job rows remain readable; mutations reject stale root sessions, newer runs/jobs, replaced child generations and foreign roots.
++
++`initialization` is an array of trusted extension-authored `{ customType, data }` custom entries. These are persisted and flushed before the child's extension `session_start` handlers run, and before its first prompt. This field is not accepted by the LLM-facing task parameter schema. A child extension can read its entry from `ctx.sessionManager.getBranch()` during `session_start` and await its provider-specific bootstrap with the child's actual `ctx.sessionManager.getSessionId()`. Initialization metadata is not replayed as conversation text. Bootstrap extensions must reject provider turns until their own required initialization has succeeded.
++
+ ## 3) Command context (`ExtensionCommandContext`)
+ 
+ Command handlers additionally get:
+diff --git a/packages/coding-agent/CHANGELOG.md b/packages/coding-agent/CHANGELOG.md
+index e238d83..de350fe 100644
+--- a/packages/coding-agent/CHANGELOG.md
++++ b/packages/coding-agent/CHANGELOG.md
+@@ -2,6 +2,10 @@
+ 
+ ## [Unreleased]
+ 
++### Added
++
++- Interactive extensions can manage their session’s native Agent Hub children with guarded job handles and trusted initialization metadata.
++
+ ## [18.21.0] - 2026-11-16
+ 
+ ### Breaking Changes
+diff --git a/packages/coding-agent/src/extensibility/extensions/runner.ts b/packages/coding-agent/src/extensibility/extensions/runner.ts
+index a4c59be..a690b63 100644
+--- a/packages/coding-agent/src/extensibility/extensions/runner.ts
++++ b/packages/coding-agent/src/extensibility/extensions/runner.ts
+@@ -630,6 +630,7 @@ export class ExtensionRunner {
+ 	#getPendingPlanReviewFn: NonNullable<ExtensionContextActions["getPendingPlanReview"]> = () => undefined;
+ 	#openPlanReviewFn: NonNullable<ExtensionContextActions["openPlanReview"]> = async () => false;
+ 	#sessionModes?: ExtensionContextActions["sessionModes"];
++	#agents?: ExtensionContextActions["agents"];
+ 	#keybindings?: ExtensionContextActions["keybindings"];
+ 	#getMemoryFn?: () => MemoryRuntimeContext | undefined;
+ 	#createAnnotations?: ExtensionAnnotationsFactory;
+@@ -957,6 +958,7 @@ export class ExtensionRunner {
+ 		if (contextActions.openPlanReview) this.#openPlanReviewFn = contextActions.openPlanReview;
+ 		// Assigned unconditionally: a headless rebind must not inherit a previous host's controls.
+ 		this.#sessionModes = contextActions.sessionModes;
++		this.#agents = contextActions.agents;
+ 		this.#keybindings = contextActions.keybindings;
+ 		this.#getContextUsageFn = contextActions.getContextUsage;
+ 		this.#compactFn = contextActions.compact;
+@@ -1813,6 +1815,7 @@ export class ExtensionRunner {
+ 			modelRegistry: this.modelRegistry,
+ 			isProjectTrusted: () => true,
+ 			agent,
++			agents: this.#agents,
+ 			get model() {
+ 				return getModel();
+ 			},
+diff --git a/packages/coding-agent/src/extensibility/extensions/types.ts b/packages/coding-agent/src/extensibility/extensions/types.ts
+index 99c0739..1b985b8 100644
+--- a/packages/coding-agent/src/extensibility/extensions/types.ts
++++ b/packages/coding-agent/src/extensibility/extensions/types.ts
+@@ -789,6 +789,62 @@ export interface ExtensionLiveSession {
+ 	stop(): Promise<void>;
+ }
+ 
++/** Trusted host-authored data persisted before the child's session_start handlers run. */
++export interface ExtensionAgentInitialization {
++	customType: string;
++	data: unknown;
++}
++
++/** Refresh with list() before acting on a queued or replaced child. */
++export interface ExtensionAgentHandle {
++	agentId: string;
++	jobId: string;
++	jobStartedAt: number;
++	/** Current native run identity; guards turns started from a focused child editor too. */
++	runStartedAt?: number;
++	sessionFile: string | null;
++	/** Actual native provider/session identity, when the child is live. */
++	sessionId?: string;
++	generation?: number;
++}
++
++export interface ExtensionAgentJob extends ExtensionAgentHandle {
++	name: string;
++	status: "running" | "completed" | "failed" | "cancelled";
++	agentStatus?: string;
++	cwd: string;
++	model?: string;
++	lastActivity: number;
++	/** Native async-job failure, when present. */
++	error?: string;
++}
++
++export interface ExtensionAgentSpawnOptions {
++	agent: string;
++	task: string;
++	name?: string;
++	/** Source workspace assertion; cross-workspace children are unsupported. */
++	cwd?: string;
++	/** Exact operator-approved model; uses the task tool's normal per-call grants. */
++	model?: string;
++	/** Host-only metadata: never accepted from the LLM-facing task schema. */
++	initialization?: ExtensionAgentInitialization[];
++}
++
++/** Native managed children of this interactive session; unavailable in other run modes. */
++export interface ExtensionAgentsAPI {
++	list(): ExtensionAgentJob[];
++	spawn(options: ExtensionAgentSpawnOptions): Promise<ExtensionAgentJob>;
++	focus(handle: ExtensionAgentHandle): Promise<void>;
++	send(
++		handle: ExtensionAgentHandle,
++		message: string,
++		options?: { streamingBehavior?: "steer" | "followUp" },
++	): Promise<ExtensionAgentJob>;
++	interrupt(handle: ExtensionAgentHandle): Promise<void>;
++	cancel(handle: ExtensionAgentHandle): Promise<void>;
++}
++
+ export interface ExtensionContext {
+ 	/** UI methods for user interaction */
+ 	ui: ExtensionUIContext;
+@@ -854,6 +910,8 @@ export interface ExtensionContext {
+ 	 * only: `undefined` in print, JSON, RPC, and ACP modes and in subagents.
+ 	 */
+ 	sessionModes?: ExtensionSessionModes;
++	/** Host-bound Agent Hub controls; undefined outside the interactive owner session. */
++	agents?: ExtensionAgentsAPI;
+ 	/** Identity of the agent this session runs: the top-level session or a subagent. */
+ 	agent: ExtensionAgentIdentity;
+ 	/**
+@@ -2455,6 +2513,7 @@ export interface ExtensionActions {
+ 
+ /** Actions for ExtensionContext (ctx.* in event handlers). */
+ export interface ExtensionContextActions {
++	agents?: ExtensionAgentsAPI;
+ 	getModel: () => Model | undefined;
+ 	isIdle: () => boolean;
+ 	abort: () => void;
+diff --git a/packages/coding-agent/src/modes/controllers/extension-ui-controller.ts b/packages/coding-agent/src/modes/controllers/extension-ui-controller.ts
+index 203e5f1..eb7b954 100644
+--- a/packages/coding-agent/src/modes/controllers/extension-ui-controller.ts
++++ b/packages/coding-agent/src/modes/controllers/extension-ui-controller.ts
+@@ -1,3 +1,6 @@
++import { createExtensionAgents } from "../extension-agents";
++import { AgentRegistry } from "../../registry/agent-registry";
++import { AgentLifecycleManager } from "../../registry/agent-lifecycle";
+ import type { AgentMessage } from "@oh-my-pi/pi-agent-core";
+ import type { Component, OverlayHandle, TUI } from "@oh-my-pi/pi-tui";
+ import { Container, Spacer, Text } from "@oh-my-pi/pi-tui";
+@@ -288,6 +291,15 @@ export class ExtensionUiController {
+ 			setSessionName: name => this.#updateSessionName(name),
+ 		};
+ 		const contextActions: ExtensionContextActions = {
++			agents: this.ctx.collabGuest
++				? undefined
++				: createExtensionAgents({
++						session: this.ctx.session,
++						getCurrentSession: () => this.ctx.session,
++						registry: AgentRegistry.global(),
++						lifecycle: AgentLifecycleManager.global(),
++						focusAgent: (id, expected) => this.ctx.focusAgentSession(id, expected),
++					}),
+ 			getModel: () => this.ctx.session.model,
+ 			isIdle: () => !this.ctx.session.isStreaming,
+ 			abort: () => this.ctx.session.abort({ reason: USER_INTERRUPT_LABEL }),
+@@ -513,6 +525,15 @@ export class ExtensionUiController {
+ 			setSessionName: name => this.#updateSessionName(name),
+ 		};
+ 		const contextActions: ExtensionContextActions = {
++			agents: this.ctx.collabGuest
++				? undefined
++				: createExtensionAgents({
++						session: this.ctx.session,
++						getCurrentSession: () => this.ctx.session,
++						registry: AgentRegistry.global(),
++						lifecycle: AgentLifecycleManager.global(),
++						focusAgent: (id, expected) => this.ctx.focusAgentSession(id, expected),
++					}),
+ 			getModel: () => this.ctx.session.model,
+ 			isIdle: () => !this.ctx.session.isStreaming,
+ 			abort: () => this.ctx.session.abort({ reason: USER_INTERRUPT_LABEL }),
+diff --git a/packages/coding-agent/src/modes/controllers/session-focus-controller.ts b/packages/coding-agent/src/modes/controllers/session-focus-controller.ts
+index 59674bd..998751d 100644
+--- a/packages/coding-agent/src/modes/controllers/session-focus-controller.ts
++++ b/packages/coding-agent/src/modes/controllers/session-focus-controller.ts
+@@ -92,13 +92,21 @@ export class SessionFocusController {
+ 		return this.#attachedSession;
+ 	}
+ 	/** Focus the main view on an agent's live session. Throws an Error with a user-displayable message. */
+-	async focusAgent(id: string): Promise<void> {
++	async focusAgent(id: string, expected?: { sessionFile: string | null; generation: number }): Promise<void> {
+ 		if (this.ctx.collabGuest) throw new Error("Viewing agents is unavailable in a collab session.");
+ 		if (id === MAIN_AGENT_ID) return this.unfocus();
++		const assertExpected = (): void => {
++			const ref = this.registry.get(id);
++			if (expected && (ref?.generation !== expected.generation || ref.sessionFile !== expected.sessionFile)) {
++				throw new Error("Agent changed before focus; refresh the job list.");
++			}
++		};
++		assertExpected();
+ 		const request = ++this.#focusRequestSeq;
+ 		let session: AgentViewSession;
+ 		try {
+ 			const live = await this.lifecycle().ensureLive(id);
++			assertExpected();
+ 			// Main-thread handles are local sessions or mirrors of worker-homed ones, both viewable; only a
+ 			// worker's peer handle (a session homed on another thread, seen from a worker) is not.
+ 			if (!isAgentViewSession(live)) {
+diff --git a/packages/coding-agent/src/modes/interactive-mode.ts b/packages/coding-agent/src/modes/interactive-mode.ts
+index 01e11cf..d990d8e 100644
+--- a/packages/coding-agent/src/modes/interactive-mode.ts
++++ b/packages/coding-agent/src/modes/interactive-mode.ts
+@@ -1969,8 +1969,8 @@ export class InteractiveMode implements InteractiveModeContext {
+ 	get sessionName(): string | undefined {
+ 		return this.session.sessionName;
+ 	}
+-	focusAgentSession(id: string): Promise<void> {
+-		return this.#focusController.focusAgent(id);
++	focusAgentSession(id: string, expected?: { sessionFile: string | null; generation: number }): Promise<void> {
++		return this.#focusController.focusAgent(id, expected);
+ 	}
+ 	focusParentSession(): Promise<void> {
+ 		return this.#focusController.focusParent();
+diff --git a/packages/coding-agent/src/modes/types.ts b/packages/coding-agent/src/modes/types.ts
+index 9d38f98..1822fff 100644
+--- a/packages/coding-agent/src/modes/types.ts
++++ b/packages/coding-agent/src/modes/types.ts
+@@ -226,7 +226,7 @@ export interface InteractiveModeContext {
+ 	/** The mounted dialog that currently hands typing to the composer, if any. */
+ 	composerOwner?: ComposerOwner;
+ 	/** Focus the main view on an agent's live session (delegates to SessionFocusController.focusAgent). */
+-	focusAgentSession(id: string): Promise<void>;
++	focusAgentSession(id: string, expected?: { sessionFile: string | null; generation: number }): Promise<void>;
+ 	/** Focus the focused agent's parent session, falling back to main (delegates to focusParent). */
+ 	focusParentSession(): Promise<void>;
+ 	/** Return the view to the main session (delegates to SessionFocusController.unfocus). */
+diff --git a/packages/coding-agent/src/task/executor.ts b/packages/coding-agent/src/task/executor.ts
+index 78d88e0..2b6211b 100644
+--- a/packages/coding-agent/src/task/executor.ts
++++ b/packages/coding-agent/src/task/executor.ts
+@@ -5,6 +5,7 @@
+  * `../thread/services/executor`; else the calling thread) and forwards AgentEvents for
+  * progress tracking.
+  */
++import type { ExtensionAgentInitialization } from "../extensibility/extensions/types";
+ 
+ import * as fs from "node:fs/promises";
+ import path from "node:path";
+@@ -444,6 +445,8 @@ export function collectIrcPeerRoster(
+ 
+ /** Options for subagent execution */
+ export interface ExecutorOptions {
++	/** Trusted extension metadata persisted before session_start. */
++	initialization?: ExtensionAgentInitialization[];
+ 	cwd: string;
+ 	/** Cost gate of the parent session tree; the subagent's requests count toward it. */
+ 	costGate?: CostGateApi;
+@@ -5440,6 +5443,11 @@ async function runSubprocessOnThisThread(options: ExecutorOptions): Promise<Sing
+ 			// No closure in this block may capture `session`: JSC gives every closure in a
+ 			// block one shared scope object, so the lifecycle reviver built above would
+ 			// then pin the parked, disposed session for the life of the process.
++			for (const entry of options.initialization ?? []) {
++				session.sessionManager.appendCustomEntry(entry.customType, entry.data);
++			}
++			if (options.initialization?.length) await awaitAbortable(session.sessionManager.flush());
++
+ 			const pendingExtensionMessages: Array<Promise<unknown>> = [];
+ 			await awaitAbortable(
+ 				initializeExtensions(session, {
+diff --git a/packages/coding-agent/src/task/index.ts b/packages/coding-agent/src/task/index.ts
+index 72c0a28..aa31553 100644
+--- a/packages/coding-agent/src/task/index.ts
++++ b/packages/coding-agent/src/task/index.ts
+@@ -1,3 +1,4 @@
++import type { ExtensionAgentInitialization, ExtensionAgentSpawnOptions } from "../extensibility/extensions/types";
+ import { subprocessToolRegistry } from "./subprocess-tool-registry";
+ import { isTaskToolDetails } from "@oh-my-pi/pi-tui/tools/task";
+ import { taskSubprocessRenderer } from "@oh-my-pi/pi-tui/tools/subprocess";
+@@ -935,6 +936,7 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
+ 		index: number;
+ 		agentId?: string;
+ 		detached: boolean;
++		initialization?: ExtensionAgentInitialization[];
+ 	}): SpawnRun {
+ 		return new SpawnRun(
+ 			this.#permit,
+@@ -950,6 +952,7 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
+ 					run.timing,
+ 					spawn.detached ? run.onArtifactsRetained : undefined,
+ 					run.tools,
++					spawn.initialization,
+ 				),
+ 			{ agentId: spawn.agentId, detached: spawn.detached },
+ 		);
+@@ -1051,12 +1054,26 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
+ 		}
+ 	}
+ 
++	/** Trusted extension entry: all ordinary task preflight, model grants and job ownership apply. */
++	async spawnForExtension(
++		toolCallId: string,
++		options: ExtensionAgentSpawnOptions,
++	): Promise<AgentToolResult<TaskToolDetails>> {
++		if (!cfgAsyncEnabled.get(this.session.settings) || !this.session.asyncJobManager) {
++			throw new Error("Extension children require async jobs and a non-blocking agent.");
++		}
++		const { initialization } = options;
++		const params: TaskParams = { agent: options.agent, task: options.task, name: options.name, model: options.model };
++		return this.#dispatch(toolCallId, params, undefined, undefined, undefined, initialization ?? []);
++	}
++
+ 	async #dispatch(
+ 		toolCallId: string,
+ 		rawParams: unknown,
+ 		launchSession: TaskLaunchSession | undefined,
+ 		signal?: AbortSignal,
+ 		onUpdate?: AgentToolUpdateCallback<TaskToolDetails>,
++		initialization?: ExtensionAgentInitialization[],
+ 	): Promise<AgentToolResult<TaskToolDetails>> {
+ 		// Schema defaults fill `agent` for model calls, but internal callers
+ 		// and stale transcripts can bypass arktype. `spawnParamsFor` resolves each
+@@ -1127,6 +1144,9 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
+ 		const asyncEnabled = cfgAsyncEnabled.get(this.session.settings);
+ 		const manager = asyncEnabled ? this.session.asyncJobManager : undefined;
+ 		const asyncItems = manager ? spawnItems.filter((_, index) => !itemBlocking[index]) : [];
++		if (initialization && (!manager || itemBlocking.some(Boolean))) {
++			throw new Error("Extension children require async jobs and a non-blocking agent.");
++		}
+ 		// Runs started while the call streamed. An item runs detached iff it
+ 		// becomes a background job here; a run launched under the other mode
+ 		// (settings flipped mid-stream) cannot be re-homed and starts over.
+@@ -1298,6 +1318,7 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
+ 					manager,
+ 					toolCallId,
+ 					spawnParams: spawnParamsFor(params, spawn.item, defaultAgent),
++					initialization,
+ 					agentId: spawn.agentId,
+ 					run: spawn.run,
+ 					progress: spawn.progress,
+@@ -1474,6 +1495,7 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
+ 		manager: AsyncJobManagerApi;
+ 		toolCallId: string;
+ 		spawnParams: TaskParams;
++		initialization?: ExtensionAgentInitialization[];
+ 		agentId: string;
+ 		/** Run already started while the call streamed; the job adopts it instead of launching. */
+ 		run?: SpawnRun;
+@@ -1487,6 +1509,7 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
+ 			manager,
+ 			toolCallId,
+ 			spawnParams,
++			initialization,
+ 			agentId,
+ 			run,
+ 			progress,
+@@ -1519,6 +1542,8 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
+ 			"task",
+ 			agentId,
+ 			async ({ jobId, signal: runSignal, reportProgress, markRunning }) => {
++				// Operator commands retain job results for the Hub without waking the parent model.
++				if (initialization !== undefined) manager.acknowledgeDeliveries([jobId]);
+ 				const startedAt = Date.now();
+ 				const forwardSyncProgress: AgentToolUpdateCallback<TaskToolDetails> = async update => {
+ 					const nextProgress = update.details?.progress?.[0];
+@@ -1564,6 +1589,7 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
+ 				const activeRun = (spawnRun ??= this.#launch({
+ 					toolCallId,
+ 					params: spawnParams,
++					initialization,
+ 					index: progress.index,
+ 					agentId,
+ 					detached: true,
+@@ -1845,6 +1871,7 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
+ 		launchTiming?: { invokedAt: number; acquiredAt: number },
+ 		onArtifactsRetained?: (cleanup: () => Promise<void>) => void,
+ 		tools?: TextTap,
++		initialization?: ExtensionAgentInitialization[],
+ 	): Promise<AgentToolResult<TaskToolDetails>> {
+ 		const startTime = Date.now();
+ 		const assignment = spawnAssignment(params);
+@@ -1854,6 +1881,7 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
+ 			const execution = await runStructuredSubagent({
+ 				session: this.session,
+ 				invocationKind: "task",
++				initialization,
+ 				assignment,
+ 				context,
+ 				steps: params.steps,
+diff --git a/packages/coding-agent/src/task/structured-subagent.ts b/packages/coding-agent/src/task/structured-subagent.ts
+index 2c05b85..6fca086 100644
+--- a/packages/coding-agent/src/task/structured-subagent.ts
++++ b/packages/coding-agent/src/task/structured-subagent.ts
+@@ -4,6 +4,7 @@
+  * The two public frontends deliberately retain their presentation concerns, but
+  * every decision that affects what a child may run lives here.
+  */
++import type { ExtensionAgentInitialization } from "../extensibility/extensions/types";
+ import * as fs from "node:fs/promises";
+ import * as os from "node:os";
+ import path from "node:path";
+@@ -125,6 +126,8 @@ export interface StructuredSubagentIdentity {
+ 
+ /** One normalized child invocation. */
+ export interface StructuredSubagentRequest {
++	/** Trusted extension metadata persisted before session_start. */
++	initialization?: ExtensionAgentInitialization[];
+ 	session: ToolSession;
+ 	invocationKind: "task" | "eval";
+ 	assignment: string;
+@@ -801,6 +804,7 @@ function buildExecutorOptions(
+ 		eventBus: session.eventBus,
+ 		subagentEventBus: session.subagentEventBus,
+ 		onProgress: request.onProgress,
++		initialization: request.initialization,
+ 		onToolResult: request.onToolResult,
+ 		authStorage: session.authStorage,
+ 		modelRegistry: session.modelRegistry,
+diff --git a/packages/coding-agent/test/session-focus-controller.test.ts b/packages/coding-agent/test/session-focus-controller.test.ts
+index 13ed909..88e5d32 100644
+--- a/packages/coding-agent/test/session-focus-controller.test.ts
++++ b/packages/coding-agent/test/session-focus-controller.test.ts
+@@ -5,7 +5,7 @@ import {
+ 	SessionFocusController,
+ } from "@oh-my-pi/pi-coding-agent/modes/controllers/session-focus-controller";
+ import type { InteractiveModeContext } from "@oh-my-pi/pi-coding-agent/modes/types";
+-import { AgentLifecycleManager } from "@oh-my-pi/pi-coding-agent/registry/agent-lifecycle";
++import { type AgentLifecycleApi, AgentLifecycleManager } from "@oh-my-pi/pi-coding-agent/registry/agent-lifecycle";
+ import { AgentRegistry, MAIN_AGENT_ID, type AgentRef } from "@oh-my-pi/pi-coding-agent/registry/agent-registry";
+ import type { AgentSession, AgentSessionEvent } from "@oh-my-pi/pi-coding-agent/session/agent-session";
+ import { UiHelpers } from "@oh-my-pi/pi-coding-agent/modes/utils/ui-helpers";
+@@ -182,6 +182,28 @@ describe("SessionFocusController", () => {
+ 		await initTheme(false);
+ 	});
+ 
++	it("does not focus a replaced generation after a guarded revival awaits", async () => {
++		const h = makeHarness();
++		const worker = makeSessionStub();
++		const original = registerSub(h.registry, "Worker", worker.session, MAIN_AGENT_ID);
++		const controller = new SessionFocusController(
++			h.ctx,
++			h.registry,
++			() =>
++				({
++					ensureLive: async () => {
++						h.registry.register({ ...original });
++						return worker.session;
++					},
++				}) as unknown as AgentLifecycleApi,
++		);
++		await expect(
++			controller.focusAgent("Worker", { sessionFile: original.sessionFile, generation: original.generation }),
++		).rejects.toThrow("changed before focus");
++		expect(controller.focusedAgentId).toBeUndefined();
++		expect(h.counts.renderInitialMessages()).toBe(0);
++	});
++
+ 	it("focusAgent retargets subscription, transcript anchors, and status line onto the worker session", async () => {
+ 		const h = makeHarness();
+ 		const worker = makeSessionStub();
+diff --git a/packages/coding-agent/test/task/executor-wall-clock.test.ts b/packages/coding-agent/test/task/executor-wall-clock.test.ts
+index 69d6adc..8c29cba 100644
+--- a/packages/coding-agent/test/task/executor-wall-clock.test.ts
++++ b/packages/coding-agent/test/task/executor-wall-clock.test.ts
+@@ -1,3 +1,4 @@
++import * as runtimeInit from "@oh-my-pi/pi-coding-agent/modes/runtime-init";
+ import { afterEach, describe, expect, it, vi } from "bun:test";
+ import type { ModelRegistry } from "@oh-my-pi/pi-coding-agent/config/model-registry";
+ import { Settings } from "@oh-my-pi/pi-coding-agent/config/settings";
+@@ -130,6 +131,30 @@ describe("runSubprocess wall clock (task.maxRuntimeMs)", () => {
+ 		enableLsp: false,
+ 	};
+ 
++	it("persists trusted child initialization before extension startup and never prompts when setup fails", async () => {
++		const handle = createHangingSession();
++		const events: string[] = [];
++		const entry = { customType: "bridge-bootstrap", data: { threadId: "history-source" } };
++		handle.session.sessionManager.appendCustomEntry = (customType, data) => {
++			expect({ customType, data }).toEqual(entry);
++			events.push("persist");
++			return "custom-entry";
++		};
++		handle.session.sessionManager.flush = async () => {
++			events.push("flush");
++		};
++		mockCreateAgentSession(handle.session);
++		const prompt = vi.spyOn(handle.session, "prompt");
++		vi.spyOn(runtimeInit, "initializeExtensions").mockImplementation(async () => {
++			events.push("session-start");
++			throw new Error("bootstrap failed");
++		});
++		const result = await runSubprocess({ ...baseOptions, initialization: [entry], settings: Settings.isolated({}) });
++		expect(events).toEqual(["persist", "flush", "session-start"]);
++		expect(prompt).not.toHaveBeenCalled();
++		expect(result.exitCode).toBe(1);
++	});
++
+ 	it("aborts a stalled subagent and surfaces a runtime-limit reason", async () => {
+ 		const settings = Settings.isolated({ "task.maxRuntimeMs": 50 });
+ 		const handle = createHangingSession();
+diff --git a/packages/coding-agent/test/task/task-spawn.test.ts b/packages/coding-agent/test/task/task-spawn.test.ts
+index d8d90ee..d5c9336 100644
+--- a/packages/coding-agent/test/task/task-spawn.test.ts
++++ b/packages/coding-agent/test/task/task-spawn.test.ts
+@@ -1,3 +1,4 @@
++import { createExtensionAgents } from "@oh-my-pi/pi-coding-agent/modes/extension-agents";
+ /**
+  * Contracts: task tool spawn routing (rework-contracts.md §3).
+  *
+@@ -123,6 +124,108 @@ describe("task spawn routing", () => {
+ 		IrcBus.resetGlobalForTests();
+ 	});
+ 
++	it("extension spawn forwards trusted initialization into the native run", async () => {
++		vi.spyOn(discoveryModule, "discoverAgents").mockResolvedValue({ agents: [taskAgent], projectAgentsDir: null });
++		const run = vi.spyOn(executorModule, "runSubprocess").mockImplementation(async options => makeResult(options.id));
++		const manager = createManager();
++		const tool = await TaskTool.create(createSession({ manager }));
++		const initialization = [{ customType: "bridge-bootstrap", data: { threadId: "native-history" } }];
++		const result = await tool.spawnForExtension("extension-spawn", {
++			agent: "task",
++			task: "Continue",
++			initialization,
++		});
++		const job = manager.getJob(result.details!.async!.jobId)!;
++		await job.promise;
++		expect(run.mock.calls[0]![0].initialization).toEqual(initialization);
++	});
++
++	it("LLM-facing task parameters cannot inject trusted child initialization", async () => {
++		vi.spyOn(discoveryModule, "discoverAgents").mockResolvedValue({ agents: [taskAgent], projectAgentsDir: null });
++		const run = vi.spyOn(executorModule, "runSubprocess").mockImplementation(async options => makeResult(options.id));
++		const manager = createManager();
++		const tool = await TaskTool.create(createSession({ manager }));
++		const result = await tool.execute("model-spawn", {
++			agent: "task",
++			task: "Continue",
++			initialization: [{ customType: "bridge-bootstrap", data: { injected: true } }],
++		});
++		const jobId = result.details?.async?.jobId;
++		expect(jobId).toBeDefined();
++		await manager.getJob(jobId!)!.promise;
++		expect(run).toHaveBeenCalledTimes(1);
++		expect(run.mock.calls[0]![0].initialization).toBeUndefined();
++	});
++
++	it("keeps queued native children listed across facade rebinds without merging anonymous jobs", async () => {
++		vi.spyOn(discoveryModule, "discoverAgents").mockResolvedValue({ agents: [taskAgent], projectAgentsDir: null });
++		const gate = deferred();
++		const run = vi.spyOn(executorModule, "runSubprocess").mockImplementation(async options => {
++			await gate.promise;
++			return makeResult(options.id);
++		});
++		const manager = createManager();
++		const delivery = vi.fn(async (_jobId: string) => {});
++		manager.registerDeliverySink("Main", delivery);
++		const toolSession = createSession({ manager, settings: { "task.maxConcurrency": 1 } });
++		toolSession.getAgentId = () => "Main";
++		const tool = await TaskTool.create(toolSession);
++		const owner = {
++			sessionManager: {
++				getSessionId: () => "root",
++				getSessionFile: () => "/tmp/root.jsonl",
++				getCwd: () => "/tmp",
++				ensureOnDisk: async () => {},
++				flush: async () => {},
++			},
++			asyncJobManager: manager,
++			getAgentId: () => "Main",
++			getEnabledToolNames: () => ["task"],
++			hasBuiltInTool: () => true,
++			getToolByName: () => tool,
++		};
++		const bind = () =>
++			createExtensionAgents({
++				session: owner,
++				getCurrentSession: () => owner,
++				registry: AgentRegistry.global(),
++				lifecycle: AgentLifecycleManager.global(),
++				focusAgent: async () => {},
++			});
++		const api = bind();
++		const first = await api.spawn({ agent: "task", task: "Hold the permit", name: "First" });
++		const queued = await api.spawn({ agent: "task", task: "Wait behind it", name: "Queued" });
++		manager.publishCompleted("task", "anonymous", { text: "unrelated" }, { id: "anonymous", ownerId: "Main" });
++		expect(manager.getJob(queued.jobId)!.queued).toBe(true);
++		expect(AgentRegistry.global().get(queued.agentId)).toBeUndefined();
++		const rebound = bind();
++		expect(rebound.list().map(row => row.jobId)).toEqual([first.jobId, queued.jobId]);
++		expect(rebound.list().map(row => row.agentId)).toEqual([first.agentId, queued.agentId]);
++		await rebound.cancel(rebound.list().find(row => row.jobId === queued.jobId)!);
++		expect(manager.getJob(queued.jobId)!.status).toBe("cancelled");
++		expect(manager.getJob(first.jobId)!.status).toBe("running");
++		gate.resolve();
++		await Promise.all([manager.getJob(first.jobId)!.promise, manager.getJob(queued.jobId)!.promise]);
++		expect(run).toHaveBeenCalledTimes(1);
++		await manager.drainDeliveries({ timeoutMs: 100 });
++		expect(delivery.mock.calls.map(([jobId]) => jobId)).toEqual(["anonymous"]);
++		expect(manager.isDeliverySuppressed(first.jobId)).toBe(true);
++	});
++
++	it("extension spawn refuses disabled async execution instead of starting an unmanaged child", async () => {
++		const discovery = vi
++			.spyOn(discoveryModule, "discoverAgents")
++			.mockResolvedValue({ agents: [taskAgent], projectAgentsDir: null });
++		const run = vi.spyOn(executorModule, "runSubprocess");
++		const tool = await TaskTool.create(createSession({ settings: { "async.enabled": false } }));
++		discovery.mockClear();
++		await expect(tool.spawnForExtension("extension-spawn", { agent: "task", task: "Continue" })).rejects.toThrow(
++			"require async jobs",
++		);
++		expect(run).not.toHaveBeenCalled();
++		expect(discovery).not.toHaveBeenCalled();
++	});
++
+ 	it("returns immediately on spawn and delivers the follow-up hint when the job completes", async () => {
+ 		vi.spyOn(discoveryModule, "discoverAgents").mockResolvedValue({
+ 			agents: [{ ...taskAgent, model: ["anthropic/claude-sonnet-4"] }],
+diff --git a/packages/coding-agent/src/modes/extension-agents.ts b/packages/coding-agent/src/modes/extension-agents.ts
+new file mode 100644
+index 0000000..0d7bc22
+--- /dev/null
++++ b/packages/coding-agent/src/modes/extension-agents.ts
+@@ -0,0 +1,227 @@
++import * as path from "node:path";
++import { Snowflake } from "@oh-my-pi/pi-utils";
++import type { AsyncJob, AsyncJobManagerApi } from "../async/job-manager";
++import type { ExtensionAgentHandle, ExtensionAgentJob, ExtensionAgentsAPI } from "../extensibility/extensions/types";
++import type { AgentLifecycleApi } from "../registry/agent-lifecycle";
++import { MAIN_AGENT_ID, type AgentRef, type AgentRegistryApi } from "../registry/agent-registry";
++import { sessionFileBelongsToRoot } from "../registry/persisted-agents";
++import type { AgentSessionHandle } from "../session/agent-session-handle";
++import type { SessionManager } from "../session/session-manager";
++import type { TaskTool } from "../task";
++
++interface OwnerSession {
++	readonly sessionManager: Pick<
++		SessionManager,
++		"getSessionFile" | "getSessionId" | "getCwd" | "ensureOnDisk" | "flush"
++	>;
++	readonly asyncJobManager: AsyncJobManagerApi | undefined;
++	getAgentId(): string | undefined;
++	getEnabledToolNames(): string[];
++	hasBuiltInTool(name: string): boolean;
++	getToolByName(name: string): unknown;
++}
++
++/** Native tool wrappers forward public methods while retaining SDK source provenance. */
++function hasNativeSpawn(tool: unknown): tool is Pick<TaskTool, "spawnForExtension"> {
++	return (
++		typeof tool === "object" &&
++		tool !== null &&
++		"spawnForExtension" in tool &&
++		typeof tool.spawnForExtension === "function"
++	);
++}
++
++/** A host-owned facade: extensions never receive registry, lifecycle or raw child sessions. */
++export function createExtensionAgents(options: {
++	session: OwnerSession;
++	getCurrentSession(): OwnerSession;
++	registry: AgentRegistryApi;
++	lifecycle: AgentLifecycleApi;
++	focusAgent(id: string, expected: { sessionFile: string | null; generation: number }): Promise<void>;
++}): ExtensionAgentsAPI {
++	const { session, registry, lifecycle } = options;
++	const ownerId = session.getAgentId() ?? MAIN_AGENT_ID;
++	let rootFile = session.sessionManager.getSessionFile();
++	const rootId = session.sessionManager.getSessionId();
++	const manager = session.asyncJobManager;
++	const assertOwner = (): void => {
++		if (options.getCurrentSession() !== session || session.sessionManager.getSessionId() !== rootId) {
++			throw new Error("Agent Hub context belongs to an earlier session; reopen the command.");
++		}
++	};
++	const isOwned = (job: AsyncJob): boolean => {
++		if (!job.agentId || job.type !== "task") return false;
++		const ref = registry.get(job.agentId);
++		if (
++			ref &&
++			(ref.kind !== "sub" || !rootFile || !ref.sessionFile || !sessionFileBelongsToRoot(ref.sessionFile, rootFile))
++		)
++			return false;
++		const seen = new Set<string>();
++		// Root sessions own distinct managers; queued jobs already carry their native owner and agent ids.
++		let parent = ref?.parentId ?? job.ownerId;
++		while (parent && !seen.has(parent)) {
++			if (parent === ownerId) return true;
++			seen.add(parent);
++			const ancestor = registry.get(parent);
++			if (!ancestor?.sessionFile || !rootFile || !sessionFileBelongsToRoot(ancestor.sessionFile, rootFile))
++				return false;
++			parent = ancestor.parentId;
++		}
++		return false;
++	};
++	const snapshot = (job: AsyncJob): ExtensionAgentJob => {
++		const ref = job.agentId ? registry.get(job.agentId) : undefined;
++		const live = ref?.session;
++		return {
++			agentId: job.agentId!,
++			jobId: job.id,
++			jobStartedAt: job.startTime,
++			runStartedAt: live?.runStartedAt,
++			sessionFile: ref?.sessionFile ?? null,
++			sessionId: live?.sessionManager.getSessionId(),
++			generation: ref?.generation,
++			name: job.label || ref?.displayName || job.agentId!,
++			status: job.status,
++			agentStatus: ref?.status,
++			cwd: live?.sessionManager.getCwd() ?? session.sessionManager.getCwd(),
++			model: live?.model ? `${live.model.provider}/${live.model.id}` : ref?.history?.resolvedModel,
++			lastActivity: ref?.lastActivity ?? job.endTime ?? job.startTime,
++			error: job.errorText,
++		};
++	};
++	const assertHandle = (handle: ExtensionAgentHandle): { job: AsyncJob; ref: AgentRef | undefined } => {
++		assertOwner();
++		const job = manager?.getJob(handle.jobId);
++		const latest = manager
++			?.getAllJobs()
++			.filter(row => row.agentId === handle.agentId)
++			.at(-1);
++		const ref = registry.get(handle.agentId);
++		if (
++			!job ||
++			!isOwned(job) ||
++			job.agentId !== handle.agentId ||
++			job.startTime !== handle.jobStartedAt ||
++			latest !== job
++		) {
++			throw new Error("Agent Hub selection is stale or outside this session; refresh the job list.");
++		}
++		if (
++			(ref?.sessionFile ?? null) !== handle.sessionFile ||
++			ref?.generation !== handle.generation ||
++			ref?.session?.runStartedAt !== handle.runStartedAt ||
++			(handle.sessionId !== undefined && ref?.session?.sessionManager.getSessionId() !== handle.sessionId)
++		) {
++			throw new Error("Agent Hub child session changed; refresh the job list.");
++		}
++		return { job, ref };
++	};
++	const liveFor = async (handle: ExtensionAgentHandle): Promise<AgentSessionHandle> => {
++		const { ref } = assertHandle(handle);
++		if (!ref?.sessionFile) throw new Error("Agent Hub child has not started; refresh the job list.");
++		const live = await lifecycle.ensureLive(ref.id);
++		assertOwner();
++		const current = registry.get(ref.id);
++		if (current !== ref || current?.session !== live || current.sessionFile !== ref.sessionFile) {
++			throw new Error("Agent Hub child was replaced while opening; refresh the job list.");
++		}
++		assertHandle(handle);
++		return live;
++	};
++	return {
++		list: () => {
++			assertOwner();
++			return manager?.getAllJobs().filter(isOwned).map(snapshot) ?? [];
++		},
++		spawn: async request => {
++			assertOwner();
++			if (!manager) throw new Error("Agent Hub children require async jobs.");
++			if (!request.agent.trim() || !request.task.trim()) throw new Error("Agent and task must be non-empty.");
++			if (
++				request.cwd !== undefined &&
++				(!path.isAbsolute(request.cwd) ||
++					path.resolve(request.cwd) !== path.resolve(session.sessionManager.getCwd()))
++			) {
++				throw new Error("Child source cwd must match the current workspace; open that workspace first.");
++			}
++			const initialization = structuredClone(request.initialization ?? []);
++			for (const entry of initialization) {
++				if (!entry.customType?.trim()) throw new Error("Child initialization needs a non-empty customType.");
++			}
++			const tool = session.getToolByName("task");
++			if (
++				!session.getEnabledToolNames().includes("task") ||
++				!session.hasBuiltInTool("task") ||
++				!hasNativeSpawn(tool)
++			) {
++				throw new Error("Agent Hub spawn requires the enabled native task tool.");
++			}
++			await session.sessionManager.ensureOnDisk();
++			await session.sessionManager.flush();
++			assertOwner();
++			rootFile = session.sessionManager.getSessionFile();
++			if (!rootFile) throw new Error("Agent Hub children require a persisted session; --no-session is unsupported.");
++			const result = await tool.spawnForExtension(`extension-${Snowflake.next()}`, { ...request, initialization });
++			assertOwner();
++			const id = result.details?.async?.jobId;
++			const job = id ? manager.getJob(id) : undefined;
++			if (!job || result.isError)
++				throw new Error(result.content.find(part => part.type === "text")?.text ?? "Native child spawn failed.");
++			return snapshot(job);
++		},
++		focus: async handle => {
++			await liveFor(handle);
++			const { ref } = assertHandle(handle);
++			await options.focusAgent(handle.agentId, { sessionFile: ref!.sessionFile, generation: ref!.generation });
++		},
++		send: async (handle, message, sendOptions) => {
++			const { job: previous, ref: selectedRef } = assertHandle(handle);
++			if (!message.trim()) throw new Error("Child message must be non-empty.");
++			if (!handle.sessionFile) throw new Error("Agent Hub child has not started; refresh the job list.");
++			const live = await liveFor(handle);
++			const id = manager!.register(
++				"task",
++				message,
++				async ({ signal, jobId }) => {
++					manager!.acknowledgeDeliveries([jobId]);
++					assertOwner();
++					if (registry.get(handle.agentId) !== selectedRef)
++						throw new Error("Child generation changed before delivery.");
++					const ref = registry.get(handle.agentId);
++					if (
++						signal.aborted ||
++						ref !== selectedRef ||
++						ref?.session !== live ||
++						ref.sessionFile !== handle.sessionFile ||
++						live.runStartedAt !== handle.runStartedAt
++					) {
++						throw new Error("Child changed or follow-up was cancelled before delivery.");
++					}
++					const abort = () => {
++						void live.abort({ reason: "User interrupted" });
++					};
++					signal.addEventListener("abort", abort, { once: true });
++					try {
++						await live.prompt(message, { streamingBehavior: sendOptions?.streamingBehavior ?? "steer" });
++						return "Child input delivered.";
++					} finally {
++						signal.removeEventListener("abort", abort);
++					}
++				},
++				{ agentId: handle.agentId, ownerId: previous.ownerId },
++			);
++			return snapshot(manager!.getJob(id)!);
++		},
++		interrupt: async handle => {
++			const { ref } = assertHandle(handle);
++			if (!ref?.session) throw new Error("Child has no live operation to interrupt.");
++			await ref.session.abort({ reason: "User interrupted" });
++		},
++		cancel: async handle => {
++			const { job, ref } = assertHandle(handle);
++			if (ref) await lifecycle.release(ref.id, ref, { tombstone: true });
++			manager!.cancel(job.id, { ownerId: job.ownerId });
++		},
++	};
++}
+diff --git a/packages/coding-agent/test/extension-agents.test.ts b/packages/coding-agent/test/extension-agents.test.ts
+new file mode 100644
+index 0000000..89cb71e
+--- /dev/null
++++ b/packages/coding-agent/test/extension-agents.test.ts
+@@ -0,0 +1,331 @@
++import * as path from "node:path";
++import { TempDir } from "@oh-my-pi/pi-utils";
++import { ModelRegistry } from "../src/config/model-registry";
++import { Settings } from "../src/config/settings";
++import { createAgentSession } from "../src/sdk";
++import { SessionManager } from "../src/session/session-manager";
++import { TaskTool } from "../src/task";
++import { AgentLifecycleManager } from "../src/registry/agent-lifecycle";
++import { createInMemoryAuthStorage } from "./helpers/agent-session-setup";
++import { afterEach, describe, expect, it, vi } from "bun:test";
++import type { Model } from "@oh-my-pi/pi-ai";
++import { AsyncJobManager } from "../src/async/job-manager";
++import { createExtensionAgents } from "../src/modes/extension-agents";
++import type { AgentLifecycleApi } from "../src/registry/agent-lifecycle";
++import { AgentRegistry } from "../src/registry/agent-registry";
++import type { AgentSessionHandle } from "../src/session/agent-session-handle";
++
++const managers: AsyncJobManager[] = [];
++afterEach(async () => {
++	vi.restoreAllMocks();
++	await Promise.all(managers.splice(0).map(manager => manager.dispose({ timeoutMs: 100 })));
++});
++
++function harness() {
++	const manager = new AsyncJobManager({ onJobComplete: () => {} });
++	managers.push(manager);
++	const registry = new AgentRegistry();
++	let rootId = "root-session";
++	const owner = {
++		sessionManager: {
++			getSessionId: () => rootId,
++			getSessionFile: () => "/tmp/root.jsonl",
++			getCwd: () => "/tmp",
++			ensureOnDisk: async () => {},
++			flush: async () => {},
++		},
++		asyncJobManager: manager,
++		getAgentId: () => "Main",
++		getEnabledToolNames: () => ["task"],
++		hasBuiltInTool: () => true,
++		getToolByName: () => undefined,
++	};
++	const child = {
++		sessionManager: { getSessionId: () => "actual-native-child-session", getCwd: () => "/tmp/child" },
++		model: { provider: "openai", id: "gpt-4.1" } as Model,
++		prompt: vi.fn(async () => true),
++		abort: vi.fn(async () => {}),
++	} as unknown as AgentSessionHandle;
++	const ref = registry.register({
++		id: "child",
++		parentId: "Main",
++		displayName: "Child",
++		kind: "sub",
++		session: child,
++		sessionFile: "/tmp/root/child.jsonl",
++	});
++	const ensureLive = vi.fn(async () => child);
++	const release = vi.fn(async () => true);
++	const focus = vi.fn(async () => {});
++	const api = createExtensionAgents({
++		session: owner,
++		getCurrentSession: () => owner,
++		registry,
++		lifecycle: { ensureLive, release } as unknown as AgentLifecycleApi,
++		focusAgent: focus,
++	});
++	const publish = (id: string, agentId = "child", ownerId = "Main") =>
++		manager.publishCompleted("task", id, { text: "done" }, { id, agentId, ownerId });
++	publish("first");
++	return {
++		api,
++		child,
++		manager,
++		registry,
++		ref,
++		publish,
++		ensureLive,
++		release,
++		focus,
++		switchRoot: () => {
++			rootId = "new-session";
++		},
++	};
++}
++
++describe("extension Agent Hub controls", () => {
++	it("spawns through the real SDK tool wrapper as the first command and materializes only the native journal", async () => {
++		using temp = TempDir.createSync("@omp-extension-first-command-");
++		const authStorage = createInMemoryAuthStorage();
++		const sessionManager = SessionManager.create(temp.path(), path.join(temp.path(), "sessions"));
++		const parentFile = sessionManager.getSessionFile()!;
++		const dispatch = vi.spyOn(TaskTool.prototype, "spawnForExtension").mockImplementation(async () => {
++			expect(await Bun.file(parentFile).exists()).toBe(true);
++			expect(sessionManager.getBranch().filter(entry => entry.type === "message")).toEqual([]);
++			const jobId = session.asyncJobManager!.publishCompleted(
++				"task",
++				"Native child",
++				{ text: "done" },
++				{ id: "first-command-child", ownerId: "Main", agentId: "first-command-child" },
++			);
++			return {
++				content: [],
++				details: {
++					projectAgentsDir: null,
++					results: [],
++					totalDurationMs: 0,
++					async: { state: "completed", jobId, type: "task" },
++				},
++			};
++		});
++		const { session } = await createAgentSession({
++			cwd: temp.path(),
++			agentDir: temp.path(),
++			authStorage,
++			modelRegistry: new ModelRegistry(authStorage, path.join(temp.path(), "models.yml")),
++			settings: Settings.isolated(),
++			sessionManager,
++			disableExtensionDiscovery: true,
++			extensions: [() => {}],
++			skills: [],
++			contextFiles: [],
++			promptTemplates: [],
++			slashCommands: [],
++			rules: [],
++			enableMCP: false,
++			enableLsp: false,
++			skipPythonPreflight: true,
++			preloadedCustomToolPaths: [],
++			toolNames: ["task"],
++		});
++		try {
++			expect(await Bun.file(parentFile).exists()).toBe(false);
++			expect(session.hasBuiltInTool("task")).toBe(true);
++			expect(session.getToolByName("task") instanceof TaskTool).toBe(false);
++			const api = createExtensionAgents({
++				session,
++				getCurrentSession: () => session,
++				registry: AgentRegistry.global(),
++				lifecycle: AgentLifecycleManager.global(),
++				focusAgent: async () => {},
++			});
++			const child = await api.spawn({ agent: "task", task: "User's first command", cwd: temp.path() });
++			expect(dispatch).toHaveBeenCalledTimes(1);
++			expect(child.jobId).toBe("first-command-child");
++		} finally {
++			await session.dispose();
++			authStorage.close();
++		}
++	});
++
++	it("lists descendant jobs with actual native identity and excludes another root's children", () => {
++		const h = harness();
++		h.registry.register({
++			id: "foreign",
++			parentId: "Main",
++			displayName: "Other root",
++			kind: "sub",
++			session: h.child,
++			sessionFile: "/tmp/other/foreign.jsonl",
++		});
++		h.publish("foreign-job", "foreign");
++		h.registry.register({
++			id: "grandchild",
++			parentId: "child",
++			displayName: "Nested",
++			kind: "sub",
++			session: h.child,
++			sessionFile: "/tmp/root/child/grandchild.jsonl",
++		});
++		h.publish("nested", "grandchild", "child");
++		expect(h.api.list().map(row => row.agentId)).toEqual(["child", "grandchild"]);
++		expect(h.api.list()[0]).toMatchObject({
++			sessionId: "actual-native-child-session",
++			cwd: "/tmp/child",
++			model: "openai/gpt-4.1",
++		});
++	});
++
++	it("shows the native question-derived job label instead of the generic agent role", () => {
++		const h = harness();
++		h.ref.displayName = "codex-bridge";
++		h.manager.publishCompleted(
++			"task",
++			"Inspect pump drift",
++			{ text: "done" },
++			{ id: "question-child", agentId: "child", ownerId: "Main" },
++		);
++		expect(h.api.list().at(-1)!.name).toBe("Inspect pump drift");
++	});
++
++	it("rejects every mutation of an older job after a newer turn uses the same child", async () => {
++		const h = harness();
++		const stale = h.api.list()[0]!;
++		h.publish("new-turn");
++		await expect(h.api.focus(stale)).rejects.toThrow("stale");
++		await expect(h.api.send(stale, "follow up")).rejects.toThrow("stale");
++		await expect(h.api.interrupt(stale)).rejects.toThrow("stale");
++		await expect(h.api.cancel(stale)).rejects.toThrow("stale");
++		expect(h.ensureLive).not.toHaveBeenCalled();
++		expect(h.release).not.toHaveBeenCalled();
++		expect(h.child.abort).not.toHaveBeenCalled();
++	});
++
++	it("rejects an old selection when a new turn starts directly in the child editor", async () => {
++		const h = harness();
++		const stale = h.api.list()[0]!;
++		Object.defineProperty(h.child, "runStartedAt", { value: 12345, configurable: true });
++		await expect(h.api.send(stale, "stale input")).rejects.toThrow("changed");
++		await expect(h.api.cancel(stale)).rejects.toThrow("changed");
++		expect(h.release).not.toHaveBeenCalled();
++	});
++
++	it("rejects same-file registry replacements and contexts retained across a root switch", async () => {
++		const h = harness();
++		const stale = h.api.list()[0]!;
++		h.registry.register({ ...h.ref });
++		await expect(h.api.cancel(stale)).rejects.toThrow("changed");
++		const current = h.api.list()[0]!;
++		h.switchRoot();
++		await expect(h.api.send(current, "wrong root")).rejects.toThrow("earlier session");
++		expect(() => h.api.list()).toThrow("earlier session");
++		expect(h.release).not.toHaveBeenCalled();
++	});
++
++	it("owns follow-up delivery as a native job and invalidates the previous selection immediately", async () => {
++		const h = harness();
++		const delivery = vi.fn(async () => {});
++		h.manager.registerDeliverySink("Main", delivery);
++		h.manager.acknowledgeDeliveries(["first"]);
++		const old = h.api.list()[0]!;
++		const next = await h.api.send(old, "Continue here", { streamingBehavior: "followUp" });
++		expect(next.jobId).not.toBe(old.jobId);
++		await h.manager.getJob(next.jobId)!.promise;
++		await h.manager.drainDeliveries({ timeoutMs: 100 });
++		expect(delivery).not.toHaveBeenCalled();
++		expect(h.manager.isDeliverySuppressed(next.jobId)).toBe(true);
++		expect(h.child.prompt).toHaveBeenCalledWith("Continue here", { streamingBehavior: "followUp" });
++		await expect(h.api.interrupt(old)).rejects.toThrow("stale");
++		await h.api.focus(h.api.list().at(-1)!);
++		expect(h.focus).toHaveBeenCalledWith("child", { sessionFile: h.ref.sessionFile, generation: h.ref.generation });
++	});
++
++	it("does not deliver a follow-up to a replacement generation during revival", async () => {
++		const h = harness();
++		const selected = h.api.list()[0]!;
++		h.ensureLive.mockImplementation(async () => {
++			h.registry.register({ ...h.ref });
++			return h.child;
++		});
++		await expect(h.api.send(selected, "must not reach replacement")).rejects.toThrow("replaced");
++		expect(h.child.prompt).not.toHaveBeenCalled();
++		expect(h.manager.getAllJobs().map(job => job.id)).toEqual(["first"]);
++	});
++
++	it("rejects a foreign source cwd before invoking the native task tool", async () => {
++		const h = harness();
++		await expect(h.api.spawn({ agent: "codex-bridge", task: "Continue", cwd: "/tmp/other" })).rejects.toThrow(
++			"cwd must match",
++		);
++	});
++
++	it("revives a valid parked child before delivering its managed follow-up", async () => {
++		const h = harness();
++		h.ref.session = null;
++		h.ref.status = "parked";
++		const selected = h.api.list()[0]!;
++		expect(selected.sessionId).toBeUndefined();
++		h.ensureLive.mockImplementation(async () => {
++			h.registry.attachSession("child", h.child, h.ref.sessionFile, h.ref);
++			h.registry.setStatus("child", "idle", h.ref);
++			return h.child;
++		});
++		const next = await h.api.send(selected, "Resume parked child");
++		await h.manager.getJob(next.jobId)!.promise;
++		expect(h.child.prompt).toHaveBeenCalledWith("Resume parked child", { streamingBehavior: "steer" });
++		expect(h.manager.getJob(next.jobId)!.status).toBe("completed");
++	});
++
++	it("rejects a newer direct child run that begins while revival is awaiting", async () => {
++		const h = harness();
++		const selected = h.api.list()[0]!;
++		const pending = Promise.withResolvers<void>();
++		h.ensureLive.mockImplementation(async () => {
++			await pending.promise;
++			return h.child;
++		});
++		const sending = h.api.send(selected, "stale after await");
++		Object.defineProperty(h.child, "runStartedAt", { value: 77, configurable: true });
++		pending.resolve();
++		await expect(sending).rejects.toThrow("changed");
++		expect(h.child.prompt).not.toHaveBeenCalled();
++		expect(h.manager.getAllJobs().map(job => job.id)).toEqual(["first"]);
++	});
++
++	it("returns an admitted native input job without waiting for the child's model turn to complete", async () => {
++		const h = harness();
++		const completion = Promise.withResolvers<void>();
++		vi.spyOn(h.child, "prompt").mockImplementation(async () => {
++			await completion.promise;
++			return true;
++		});
++		const next = await h.api.send(h.api.list()[0]!, "Continue in background");
++		expect(h.manager.getJob(next.jobId)!.status).toBe("running");
++		completion.resolve();
++		await h.manager.getJob(next.jobId)!.promise;
++		expect(h.manager.getJob(next.jobId)!.status).toBe("completed");
++	});
++
++	it("exposes asynchronous native input failures on the existing job snapshot", async () => {
++		const h = harness();
++		vi.spyOn(h.child, "prompt").mockRejectedValue(new Error("Native input failed"));
++		const next = await h.api.send(h.api.list()[0]!, "Continue");
++		await h.manager.getJob(next.jobId)!.promise;
++		expect(h.api.list().at(-1)).toMatchObject({ status: "failed", error: "Native input failed" });
++	});
++
++	it("does not identify anonymous task jobs as any registered child", () => {
++		const h = harness();
++		h.manager.publishCompleted("task", "anonymous", { text: "unrelated" }, { id: "anonymous", ownerId: "Main" });
++		expect(h.api.list().map(row => row.jobId)).toEqual(["first"]);
++	});
++
++	it("cancels only the selected exact child generation and job", async () => {
++		const h = harness();
++		const cancel = vi.spyOn(h.manager, "cancel");
++		const selected = h.api.list()[0]!;
++		await h.api.cancel(selected);
++		expect(h.release).toHaveBeenCalledWith("child", h.ref, { tombstone: true });
++		expect(cancel).toHaveBeenCalledWith("first", { ownerId: "Main" });
++	});
++});

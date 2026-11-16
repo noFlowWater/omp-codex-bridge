@@ -8,6 +8,8 @@
 - Codex CLI on `PATH`, authenticated with `codex login`. OMP uses its embedded Bun runtime to load the plugin.
 - Development: Node.js 20.19 or newer and Bun 1.4.2 or newer. The standalone client also supports Node.js 20.19+.
 
+Command-driven Hub management and saved-history continuation additionally require `ctx.agents`, supplied by the [optional host patch](../patches/README.md). `/codex doctor` reports availability. Without it, `/codex jobs` manages direct workers and existing assistant-driven Hub delegation is unchanged. Installing the plugin does not install or replace OMP.
+
 ## Install
 
 ```sh

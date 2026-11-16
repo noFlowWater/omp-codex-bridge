@@ -2,6 +2,7 @@
 import { createHash } from 'node:crypto';
 import { mkdirSync, readFileSync, renameSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
+import { historySource } from './history.mjs';
 
 export const sessionFile = (stateDir, sessionId) => join(stateDir, `${createHash('sha256').update(sessionId).digest('hex')}.json`);
 
@@ -24,6 +25,13 @@ export function loadSession(stateDir, sessionId, nativeModel, cwd) {
   if (record && (record.policy !== 'native-config' || Object.hasOwn(record, 'sandbox'))) {
     throw new Error(`codex-bridge session record ${file} used the previous fixed sandbox policy; start a new task or fresh session to inherit native Codex configuration. Nothing sent to Codex`);
   }
+  if (record?.historyFork !== undefined) {
+    historySource(record.historyFork);
+    const fork = record.historyFork;
+    if (typeof fork.completed !== 'boolean' || fork.completed && [fork.forkedThreadId, fork.forkedTurnId].some(id => typeof id !== 'string' || !id)) {
+      throw new Error('Malformed saved-history fork receipt; no native input sent');
+    }
+  }
   // Records without a model retain the Codex default.
   return {
     file, recorded: record !== undefined, policy: 'native-config', cwd: record?.cwd ?? cwd,
@@ -34,18 +42,19 @@ export function loadSession(stateDir, sessionId, nativeModel, cwd) {
     admitted: record?.admitted === true, sent: new Set(record?.sent ?? []), sink: undefined,
     latestResponseId: record?.latestResponseId, opaque: record?.opaque,
     rewrite: record?.rewrite,
+    historyFork: record?.historyFork,
     threads: new Set(record?.threads ?? (record?.threadId ? [record.threadId] : [])),
   };
 }
 
 // Throws on any write failure; callers stop before (or report after) the native mutation.
 export function saveSession(stateDir, session) {
-  const { policy, config, model, cwd, threadId, turnId, admitted, failure, sent, latestResponseId, opaque, rewrite } = session;
+  const { policy, config, model, cwd, threadId, turnId, admitted, failure, sent, latestResponseId, opaque, rewrite, historyFork } = session;
   mkdirSync(stateDir, { recursive: true, mode: 0o700 });
   const temporary = `${session.file}.${process.pid}.tmp`;
   writeFileSync(temporary, JSON.stringify({
     policy, config, model, cwd, threadId, turnId, admitted, failure, sent: [...sent],
-    latestResponseId, opaque, rewrite, threads: [...session.threads],
+    latestResponseId, opaque, rewrite, historyFork, threads: [...session.threads],
   }), { mode: 0o600 });
   renameSync(temporary, session.file);
   session.recorded = true;

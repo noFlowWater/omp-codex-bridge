@@ -12,6 +12,10 @@ Open Agent Hub with `Alt+A` or double left-arrow on an empty editor. Focus the c
 
 Run `/codex` diagnostics and inspection commands in the main session. From a focused child, press double left-arrow on an empty editor to return to the main session first.
 
+Hosts exposing `ctx.agents` also support `/codex jobs` for native worker selection and `/codex history` → **Continue in Agent Hub**. Stock OMP 18.21.0 needs the [optional host patch](../patches/README.md) for these command-driven Hub actions; normal assistant delegation already works without it.
+
+History continuation creates one fresh child in the current workspace. Choose a finished source turn and enter the new question before submission. Only that question becomes new input; the child provider forks native context once and records its ownership before starting inference. An uncertain fork is retained as an error and never automatically replayed. The source is inspected without resuming it, and the direct-tool client never owns the child's fork.
+
 OMP task/session names are copied to native thread names on the next request. Child task identity supplies the name when no session title exists. Naming is metadata-only; a title failure does not replay or reject task input.
 
 Running-turn steering requires OMP's `providers.openaiLiveSteering` setting. With it disabled, a message is queued for the next native turn. Installation does not enable this setting.

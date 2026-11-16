@@ -20,7 +20,7 @@ jobs:
           node-version: "22"
       - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6
         with:
-          bun-version: "1.4.2"
+          bun-version: "1.4.4"
       - name: Install pinned OMP
         shell: bash
         run: |
@@ -36,3 +36,36 @@ jobs:
         run: bun run test
       - name: Isolated native package and Agent Hub checks
         run: bun run test:hub
+      - name: Extract the exact stock native addon without inference
+        shell: bash
+        run: |
+          bootstrap_root="$RUNNER_TEMP/omp-stock-addon"
+          mkdir -p "$bootstrap_root/home"
+          printf '%s\n' '{"id":"native-addon-bootstrap","type":"get_state"}' | \
+            env -i PATH="$PATH" HOME="$bootstrap_root/home" TERM=dumb \
+              PI_CODING_AGENT_DIR="$bootstrap_root/agent" \
+              PI_NATIVES_DIR="$bootstrap_root/natives" \
+              OPENAI_API_KEY=sk-no-inference-bootstrap \
+              "$RUNNER_TEMP/bin/omp" --mode rpc --no-ui --no-session --no-extensions \
+                --model openai/gpt-4o > "$bootstrap_root/state.jsonl"
+      - name: Check out the pinned Agent Hub host source
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          repository: can1357/oh-my-pi
+          ref: 6f03614d761366972e80e84e25d1418ed678d2c7
+          path: .host-source
+          persist-credentials: false
+      - name: Build the patched Agent Hub host
+        shell: bash
+        run: |
+          git -C .host-source apply "$GITHUB_WORKSPACE/patches/omp-v18.21-hub-api.patch"
+          cd .host-source
+          bun install --frozen-lockfile
+          cp "$RUNNER_TEMP/omp-stock-addon/natives/18.21.0"/pi_natives.linux-x64*.node packages/natives/native/
+          bun packages/coding-agent/scripts/build-binary.ts
+      - name: Patched-host history and mixed-worker checks
+        env:
+          CODEX_HUB_API_OMP: ${{ github.workspace }}/.host-source/packages/coding-agent/dist/omp
+        run: |
+          bun test/hub/jobs.mjs history
+          bun test/hub/jobs.mjs mixed

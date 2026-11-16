@@ -67,6 +67,8 @@ These commands run in the main session. If focused on a Hub child, press double 
 ```text
 /codex doctor
 /codex doctor --json
+/codex jobs
+/codex jobs --json
 /codex status
 /codex status --json THREAD_ID
 /codex history {"limit":10,"searchTerm":"parser"}
@@ -83,7 +85,11 @@ These commands run in the main session. If focused on a Hub child, press double 
 
 The presentation follows [GitHub CLI's human-readable output and explicit JSON mode](https://cli.github.com/manual/gh_help_formatting). [Ink](https://github.com/vadimdemedes/ink) provides a React terminal renderer; [Lip Gloss](https://github.com/charmbracelet/lipgloss) provides Go terminal styling. This extension reuses OMP's `CustomMessageComponent`: the same themed message frame and native Markdown tables used by default messages. Command help is a command/purpose table; summaries use item/value tables. Doctor hides successful auxiliary checks while retaining unavailable checks and quota warnings. Native response data remains separate from its display summary.
 
-Interactive `history` opens a paged native OMP picker with source name and cwd. Choose details or explicitly confirm a fork into a new direct-tool thread. Headless `history`, `history --json` and direct-tool history return JSON.
+Interactive `history` opens a paged native OMP picker with source name and cwd. Choose details or explicitly confirm a fork into a new direct-tool thread. On a host with [Agent Hub controls](../patches/README.md), choose **Continue in Agent Hub**, select a finished turn, and submit a question. The new child owns a native fork through that boundary; the source stays unchanged and its transcript is not resent as a prompt. Cancelling before question submission starts no model work. The source must use the current workspace. Headless `history`, `history --json` and direct-tool history return JSON.
+
+`/codex jobs` opens the native worker picker. It lists direct workers owned by the current process and, when the host API is available, Codex Hub workers in the current root session. Choose details, send a message, interrupt, or open a Hub worker. Queued Hub work can be cancelled before a child session exists. Finished workers accept follow-up messages; active workers use steering subject to the host's live-steering setting. It does not list all saved history or convert direct workers into Hub workers.
+
+Actions retain the selected worker and turn snapshot. If work changes while a picker is open, stale actions fail rather than targeting a replacement turn. Failed messages retain their text in the result; nothing is automatically retried. Headless jobs and `jobs --json` list workers without opening a picker or starting inference.
 
 History choices show a shortened name and directory. Selecting one shows its full thread ID and directory before any fork confirmation. Doctor names quota windows by their reported duration and displays reset times in the host's local time zone; missing durations use neutral window numbers. A successful account read is displayed separately from whether the account is signed in.
 
