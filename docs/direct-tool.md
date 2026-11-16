@@ -37,7 +37,9 @@ Use OMP's `/codex` command without starting model work:
 
 ```text
 /codex doctor
+/codex doctor --json
 /codex status
+/codex status --json THREAD_ID
 /codex history {"limit":10,"searchTerm":"parser"}
 /codex show THREAD_ID
 /codex show THREAD_ID {"includeDiff":true,"limit":10}
@@ -48,7 +50,13 @@ Use OMP's `/codex` command without starting model work:
 
 `doctor` reports native connection, authentication availability, model catalog, supported quota information and readable OMP routing settings. Unavailable checks are labelled; credentials and account identifiers are not displayed. It never logs in, changes settings or consumes credits.
 
+`/codex` shows a command/purpose table. Interactive command results, direct-tool results and asynchronous completion notices share OMP's native cards. Answers and failure logs retain their line breaks; truncated native evidence is labelled. Requested diffs use OMP's highlighted diff blocks without requiring JSON mode. Internal flags, model catalogs and pagination data stay out of the default view. Expand the message to see the original JSON, or put `--json` immediately after the subcommand to keep the raw view. Headless output and model-facing message content retain the original structured response. The configured model describes native configuration; it does not prove the effective model of a future run.
+
+The presentation follows [GitHub CLI's human-readable output and explicit JSON mode](https://cli.github.com/manual/gh_help_formatting). [Ink](https://github.com/vadimdemedes/ink) provides a React terminal renderer; [Lip Gloss](https://github.com/charmbracelet/lipgloss) provides Go terminal styling. This extension reuses OMP's `CustomMessageComponent`: the same themed message frame and native Markdown tables used by default messages. Command help is a command/purpose table; summaries use item/value tables. Doctor hides successful auxiliary checks while retaining unavailable checks and quota warnings. Native response data remains separate from its display summary.
+
 Interactive `history` opens a paged native OMP picker with source name and cwd. Choose details or explicitly confirm a fork into a new direct-tool thread. Headless `history`, `history --json` and direct-tool history return JSON.
+
+History choices show a shortened name and directory. Selecting one shows its full thread ID and directory before any fork confirmation. Doctor names quota windows by their reported duration and displays reset times in the host's local time zone; missing durations use neutral window numbers. A successful account read is displayed separately from whether the account is signed in.
 
 `history` supports `cursor`, `limit`, `searchTerm` and `cwd`. `show` supports `includeItems`, `turnId`, `cursor`, `limit` and `includeDiff`. When paging items, retain the returned `turnId` alongside its next cursor. Use small item pages for readable diffs. Inspection does not adopt or resume threads. File changes describe native-reported edits, including rename destinations; shell or generator edits may be absent. Diff content is bounded and returned only when requested. ID-free `status` lists locally loaded direct-tool threads; use history or an explicit thread ID for other saved work.
 

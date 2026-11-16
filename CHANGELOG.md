@@ -1,6 +1,15 @@
 # Changelog
 
-## Unreleased
+## 0.6.0 — 2026-11-17
+
+- Use the same native cards for direct-tool results and asynchronous completion notices, retaining structured headless responses.
+- Preserve multiline answers and failure output, label truncated evidence, and render requested native diffs without requiring JSON mode.
+- Prefer OMP's native approval dialog with complete expandable request scope; retain explicit one-request confirmation and fail-closed cancellation.
+- Label quota windows by duration, show local reset times and readable login state, and shorten history picker labels while retaining full identity in details.
+
+- Reuse OMP's default themed message cards and native tables for operator output; hide successful auxiliary doctor checks.
+- Show multiline `/codex` help and human summaries for errors, saved-thread details, forks and tier results; keep full data in expanded/`--json` views.
+- Render compact native OMP summaries for `/codex doctor` and `/codex status`; preserve expanded/raw JSON with `--json` and unchanged headless responses.
 
 - Focus the README on installation and first use; move detailed integration, configuration and development guides into `docs/`.
 - Include the documentation guides in the package file list.

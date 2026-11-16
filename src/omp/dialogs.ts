@@ -22,6 +22,24 @@ type RequestParsers = {
 };
 type NativeRequest = { method: string; params: unknown; signal: AbortSignal };
 
+export function approvalPrompt(method: string, params: Record<string, unknown>, scope: string) {
+  const clean = (value: string) => value.replace(/[\x00-\x08\x0b\x0c\x0e-\x1f\x7f-\x9f\u202a-\u202e\u2066-\u2069]/g, "");
+  const rows: string[] = [];
+  const visit = (name: string, value: unknown, indent = "") => {
+    if (value === undefined) return;
+    if (value && typeof value === "object") {
+      const entries = Object.entries(value);
+      rows.push(`${indent}${clean(name)}:${entries.length ? "" : Array.isArray(value) ? " (empty list)" : " (empty object)"}`);
+      for (const [key, child] of entries) visit(key, child, `${indent}  `);
+    } else rows.push(`${indent}${clean(name)}: ${clean(String(value))}`);
+  };
+  const { command, commandLine, cwd, reason, ...rest } = params;
+  for (const [key, value] of Object.entries({ command, commandLine, cwd, reason, ...rest })) visit(key, value);
+  const full = `Codex approval · ${method}\n${rows.join("\n")}\n\n${scope}`;
+  const compact = `Codex approval · ${method}\n${rows.slice(0, 6).join("\n")}\n${rows.length > 6 ? "More request details: expand before approving.\n" : ""}${scope}`;
+  return { compact, full };
+}
+
 // Factories are rebound in headless children. Only main-session lifecycle events may own the UI.
 let root: { ctx: ExtensionContext; sessionId: string; controller: AbortController; parsers: RequestParsers } | undefined;
 export function releaseRoot(ctx?: ExtensionContext) {
@@ -61,9 +79,21 @@ export async function onRequest(request: NativeRequest, owner: typeof root | nul
     if (request.method === "item/commandExecution/requestApproval" && params.availableDecisions != null
       && (!Array.isArray(params.availableDecisions) || !params.availableDecisions.includes("accept"))) return empty;
     const scope = permissions ? "Approve these permissions for this turn only?" : "Approve only this request?";
-    const selected = await ui.select(`Native Codex approval: ${request.method}\n${JSON.stringify(params, null, 2)}\n${scope}`,
-      ["Decline", "Approve once"], { signal });
-    if (!current() || selected !== "Approve once") return empty;
+    const prompt = approvalPrompt(request.method, params, scope);
+    let accepted = false;
+    if (ui.approve) accepted = await ui.approve(prompt, { signal }) === "once";
+    else {
+      let full = false;
+      for (;;) {
+        const selected = await ui.select(full ? prompt.full : prompt.compact,
+          ["Decline", "Approve once", "View full details"], { signal });
+        if (!current()) return empty;
+        if (selected === "View full details") { full = true; continue; }
+        accepted = selected === "Approve once";
+        break;
+      }
+    }
+    if (!current() || !accepted) return empty;
     if (permissions) return { permissions: params.permissions, scope: "turn" };
     if (legacy) return { decision: "approved" };
     return { decision: "accept" };

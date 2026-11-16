@@ -16,7 +16,7 @@ import { createInterface } from "node:readline";
 
 const mode = process.argv[2] ?? "tui-steer";
 const QUESTION_MODES = ["rpc-question", "rpc-question-secret", "rpc-question-ask", "rpc-question-cancel", "rpc-question-headless", "rpc-elicitation", "rpc-async-question"];
-const USABILITY_MODES = ["tui-operator", "tui-progress", "tui-execution"];
+const USABILITY_MODES = ["tui-operator", "tui-progress", "tui-execution", "tui-approval"];
 if (!["tui-steer", "tui-followup", "tui-kill", "tui-revive", "tui-question", "tui-question-secret", "tui-progress-many", "tui-clear", "rpc", "rpc-queued", "rpc-model", "rpc-rich", "rpc-direct-rich", "rpc-lifecycle", "rpc-branches", ...QUESTION_MODES, ...USABILITY_MODES].includes(mode)) throw new Error(`unknown mode ${mode}`);
 const AGENT = "codex-bridge";
 // rpc-model: the task item picks one concrete native model with OMP's per-call `model` selector. The fake
@@ -124,6 +124,7 @@ async function tui() {
     ...(mode === "tui-operator" ? { CODEX_HUB_FIXTURE_OPTIONS: '{"turns":["usability","finish-later"]}' } : {}),
     ...(["tui-operator", "tui-progress"].includes(mode) ? { CODEX_HUB_FIXTURE_ROOT_MODEL: "codex-bridge/default" } : {}),
     ...(mode === "tui-execution" ? { CODEX_HUB_FIXTURE_DIRECT_JSON: JSON.stringify({ action: "run", prompt: "fixture execution card", effort: "high" }) } : {}),
+    ...(mode === "tui-approval" ? { CODEX_HUB_FIXTURE_DIRECT_JSON: JSON.stringify({ action: "run", prompt: "fixture approval" }), CODEX_HUB_FIXTURE_OPTIONS: '{"turns":["approval"]}' } : {}),
   };
   let proc;
   let connection;
@@ -140,7 +141,7 @@ async function tui() {
     rmSync(socket, { force: true });
     proc = Bun.spawn([SCRIPT], {
       env,
-      terminal: { cols: 160, rows: 48, data: (_terminal, data) => { output.push(new TextDecoder().decode(data)); } },
+      terminal: { cols: Number(process.env.CODEX_HUB_FIXTURE_COLS ?? 160), rows: 48, data: (_terminal, data) => { output.push(new TextDecoder().decode(data)); } },
     });
     await until("TUI debug socket", () => existsSync(socket));
     connection = createConnection(socket);
@@ -190,16 +191,30 @@ async function tui() {
     const mutationTrace = () => trace().filter(({ message }) =>
       /^(thread\/(start|resume|fork|compact\/start)|turn\/(start|steer|interrupt))$/.test(message?.method ?? "")).map(({ message }) => message);
     if (mode === "tui-operator") {
+      await enter("/codex");
+      await until("multiline command help", async () => (await screen()).includes("Codex commands"));
+      const helpLines = (await screen()).split("\n");
+      assert.ok(helpLines.find(line => line.includes("/codex doctor") && line.includes("Check connection")));
+      assert.ok(helpLines.find(line => line.includes("/codex history") && line.includes("Browse saved")));
+      assert.ok(!helpLines.some(line => line.includes("/codex doctor") && line.includes("/codex history")));
+      const status = await command("/codex status", "status");
+      assert.match(status, /No locally loaded direct-tool threads/);
+      assert.ok(!status.includes('"threads"'), 'collapsed status must not dump JSON');
       const doctor = await command("/codex doctor", "doctor");
       assert.match(doctor, /codex-cli 0\.167\.2 \(test fixture\)/);
-      for (const section of ["connection", "auth", "models", "permissions", "steering", "permissionSource"]) assert.ok(doctor.includes(`"${section}"`), `doctor omitted ${section}`);
-      assert.match(doctor, /"readOnly"\s*:\s*true/);
-      assert.match(doctor, /"authenticated"\s*:\s*true/);
+      for (const section of ["connection", "Login", "Configured", "permissions"]) assert.ok(doctor.includes(section), `doctor omitted ${section}`);
+      assert.ok(doctor.includes("┌") && doctor.includes("│"), "doctor uses OMP's native table layout");
+      assert.match(doctor, /Signed in/);
+      assert.ok(!doctor.includes('"supportedReasoningEfforts"'), 'collapsed doctor must not dump the model catalog');
       assert.ok(doctor.includes("fake-model") && doctor.includes("workspace-write"));
       for (const secret of ["PRIVATE-EMAIL", "PRIVATE-WORKSPACE", "PRIVATE-INSTRUCTIONS", "PRIVATE-KEY", "PRIVATE-REQUIREMENTS-KEY"]) assert.ok(!doctor.includes(secret), `doctor exposed ${secret}`);
       assert.ok(sent("account/read").every(params => params.refreshToken === false), "doctor must not refresh native authentication");
       assert.deepEqual(mutationTrace(), [], "doctor cannot create, attach, fork, steer or interrupt native work");
       await show("read-only native doctor before any turn");
+      await ask({ op: "keys", keys: "C-o" });
+      await until("expanded doctor retains full native catalog", async () => (await screen()).includes('"supportedReasoningEfforts"'));
+      await ask({ op: "keys", keys: "C-o" });
+      await until("collapsed doctor restores summary", async () => !(await screen()).includes('"supportedReasoningEfforts"'));
     }
 
     const clearBefore = "fixture-native-before-clear-29e5";
@@ -234,6 +249,17 @@ async function tui() {
       return;
     }
     if (USABILITY_MODES.includes(mode)) {
+      if (mode === "tui-approval") {
+        const prompt = await until("native approval prompt", async () => {
+          const text = await painted();
+          return text.includes("touch forbidden") ? text : undefined;
+        });
+        assert.ok(!prompt.includes('"threadId"'));
+        await showPainted("native Codex approval");
+        await ask({ op: "keys", keys: "escape" });
+        await until("explicit native denial", () => trace().some(({ message }) => message?.id === 900 && message?.result?.decision === "decline"));
+        return;
+      }
       const threadId = sent("turn/start")[0].threadId;
       const nativeTurn = () => {
         const path = join(FIX, "store.json");
@@ -257,15 +283,17 @@ async function tui() {
       assert.equal(sent("turn/start").length, 1, "failed native work must not silently retry");
       if (mode === "tui-execution") {
         const beforeStatus = mutationTrace();
+        const beforeCards = (await screen()).split("Codex result").length;
         await enter(`fixture-execution-status:${threadId}`);
         const card = await until("completed direct-tool execution card", async () => {
           const text = await screen();
-          const index = text.lastIndexOf("Codex execution [failed]");
-          return index >= 0 ? text.slice(index) : undefined;
+          const index = text.lastIndexOf("Codex result");
+          const body = text.slice(index);
+          return index >= 0 && text.split("Codex result").length > beforeCards && body.includes("Failure output") ? body : undefined;
         });
         const cardText = visibleText(card);
-        for (const text of ["model=fake-model", `cwd=${realpathSync(join(FIX, "work"))}`, "requestedEffort=high", "effectiveEffort=unknown", threadId,
-          "LATEST NATIVE ACTIVITY", "Fix failing command", "old.txt", "new.txt", "Command failed: exit 17", "FAILURE TAIL", "second failure line"]) {
+        for (const text of ["fake-model", realpathSync(join(FIX, "work")), "Requested effort", "high", threadId,
+          "LATEST NATIVE ACTIVITY", "Fix failing command", "old.txt", "new.txt", "Command failed", "exit 17", "FAILURE TAIL", "second failure line"]) {
           assert.ok(cardText.includes(text), `execution card omitted ${text}`);
         }
         assert.deepEqual(mutationTrace(), beforeStatus, "rendering the execution card must not start or resume native work");
@@ -279,13 +307,17 @@ async function tui() {
         await stop();
         await start();
         await until("restarted first paint", async () => (await reply({ op: "text" })).parsed.ok);
-        const doctor = await command("/codex doctor", "doctor");
+        const doctor = await command("/codex doctor --json", "doctor");
         assert.match(doctor, /"readOnly"\s*:\s*true/);
         const history = await command('/codex history --json {"limit":1}', "history");
         assert.ok(history.includes(threadId), "saved native thread is discoverable after an actual OMP restart");
         assert.match(history, /"readOnly"\s*:\s*true/);
         assert.ok(trace().filter(entry => entry.spawn).length > spawns, "history is read by a new native process");
-        const details = await command(`/codex show ${threadId} {"includeItems":true,"includeDiff":true,"limit":3}`, "details");
+        const summary = await command(`/codex show ${threadId} {"includeItems":true,"includeDiff":true,"limit":3}`, "details");
+        assert.ok(summary.includes(threadId) && summary.includes("Command failed") && summary.includes("exit 17"));
+        assert.ok(!summary.includes('"inspectionOnly"') && !summary.includes('"latestPlan"'));
+        assert.ok(summary.includes("NATIVE RENAME DIFF"), "explicitly requested diffs render without raw JSON mode");
+        const details = await command(`/codex show --json ${threadId} {"includeItems":true,"includeDiff":true,"limit":3}`, "details");
         for (const text of [threadId, "native-usability-command", "FAILURE TAIL", "second failure line", "old.txt", "new.txt", "NATIVE RENAME DIFF"]) {
           assert.ok(details.includes(text), `restarted native details omitted ${text}`);
         }
@@ -303,7 +335,7 @@ async function tui() {
         let pages = 0;
         while (nextCursor) {
           assert.ok(++pages <= 5, "native item history pagination must terminate");
-          const next = await command(`/codex show ${threadId} ${JSON.stringify({ includeItems: true, turnId: selectedTurnId, cursor: nextCursor, limit: 100 })}`, "details");
+          const next = await command(`/codex show --json ${threadId} ${JSON.stringify({ includeItems: true, turnId: selectedTurnId, cursor: nextCursor, limit: 100 })}`, "details");
           latestSeen ||= next.includes("LATEST NATIVE ACTIVITY");
           const cursorAfter = /"nextCursor"\s*:\s*"([^"]+)"/.exec(next)?.[1];
           assert.notEqual(cursorAfter, nextCursor, "native history advances its item cursor");
@@ -312,7 +344,8 @@ async function tui() {
         }
         assert.ok(latestSeen, "native history pagination reaches items beyond the progress cap");
         const error = await command("/codex show missing-thread", "error");
-        assert.match(error, /"code"\s*:\s*-32600/, "native numeric RPC error code remains a JSON number");
+        assert.match(error, /Code\s*│\s*-32600/, "native numeric RPC error remains visible");
+        assert.ok(!error.includes('"errorTruncated"'));
         assert.ok(error.includes("thread not found: missing-thread"));
         assert.deepEqual(mutationTrace(), beforeRestart, "doctor/history/details after restart must never create, attach, replay, steer, fork or interrupt a thread");
         assert.equal(readFileSync(join(FIX, "store.json"), "utf8"), savedStore, "read-only inspection leaves native saved history unchanged");
@@ -321,7 +354,7 @@ async function tui() {
         await until("native processing tier picker", async () => (await painted()).includes("OpenAI-family service tier"));
         for (let index = 0; index < 4; index++) await ask({ op: "keys", keys: "down" });
         await ask({ op: "keys", keys: "enter" });
-        await until("priority selection recorded", async () => /"serviceTier"\s*:\s*"priority"/.test(visibleText(await screen())));
+        await until("priority selection recorded", async () => /Service tier\s*│\s*priority/.test(visibleText(await screen())));
         await enter("fixture completed history boundary");
         await until("completed boundary for explicit fork", () => {
           const store = JSON.parse(readFileSync(join(FIX, "store.json"), "utf8"));
@@ -343,7 +376,7 @@ async function tui() {
         await until("explicit fork confirmation", async () => (await painted()).includes("Confirm fork"));
         await ask({ op: "keys", keys: "down" });
         await ask({ op: "keys", keys: "enter" });
-        await until("fork receipt rendered", async () => /"forked"\s*:\s*true/.test(visibleText(await screen())));
+        await until("fork receipt rendered", async () => (await screen()).includes("Created a direct-tool thread. No inference started."));
         const afterFork = JSON.parse(readFileSync(join(FIX, "store.json"), "utf8"));
         assert.deepEqual(afterFork.threads[sourceId], beforeFork);
         assert.equal(sent("thread/fork").length, 1);
@@ -368,7 +401,7 @@ async function tui() {
       assert.ok(!logText.includes("LATEST NATIVE ACTIVITY"), "the append log is capped; newer activity remains available through native status/details");
       console.log(`--- bounded native progress and failure log ---\n${log}`);
       const details = await command(`/codex show ${threadId} {"includeItems":true,"limit":3}`, "details");
-      assert.match(details, /"exitCode"\s*:\s*17/);
+      assert.match(details, /Command failed\s*│\s*exit 17/);
       for (const text of ["FAILURE TAIL", "second failure line", "old.txt", "new.txt"]) assert.ok(details.includes(text), `native details omitted ${text}`);
       assert.ok(!details.includes("NATIVE RENAME DIFF"), "native diffs remain opt-in");
       assert.equal(sent("thread/resume").length, 0);

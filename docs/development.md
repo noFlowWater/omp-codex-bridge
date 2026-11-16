@@ -6,6 +6,7 @@
 bun install --frozen-lockfile
 bun run test
 bun run test:hub # native install, agent grants, branch/fork, dialogs, reload and real TUI /clear
+CODEX_HUB_FIXTURE_COLS=80 bun test/hub/smoke.mjs tui-operator
 ```
 
 `bun run test:package` checks native local install, live-checkout updates, idempotent reinstall and uninstall under a fresh HOME. It verifies that existing operator agent files and permission/steering settings remain unchanged.

@@ -10,17 +10,176 @@ export function utf8Preview(text: unknown, bytes: number): { text: string; trunc
 }
 
 function screenLine(value: unknown, characters = 500): string {
-  return String(value ?? "unknown").replace(/[\x00-\x1f\x7f-\x9f]/g, " ").slice(0, characters);
+  const text = String(value ?? "unknown").replace(/[\x00-\x1f\x7f-\x9f\u202a-\u202e\u2066-\u2069]/g, " ");
+  return text.length > characters ? `${text.slice(0, characters)}… [truncated]` : text;
 }
 
 function objectRecord(value: unknown): Record<string, unknown> {
   return value !== null && typeof value === "object" && !Array.isArray(value) ? value as Record<string, unknown> : {};
 }
 
+function quotaWindow(name: string, window: Record<string, unknown>) {
+  const minutes = window.windowDurationMins;
+  const label = typeof minutes === "number" && minutes > 0
+    ? minutes % 1440 === 0 ? `${minutes / 1440}-day usage` : minutes % 60 === 0 ? `${minutes / 60}-hour usage` : `${minutes}-minute usage`
+    : name === "primary" ? "Usage window 1" : "Usage window 2";
+  const date = typeof window.resetsAt === "number" ? new Date(window.resetsAt * 1000) : undefined;
+  const reset = date && Number.isFinite(date.getTime()) ? ` · resets ${date.toLocaleString(undefined, {
+    month: "short", day: "numeric", hour: "2-digit", minute: "2-digit", timeZoneName: "short",
+  })}` : "";
+  return { label, value: `${window.usedPercent}% used${reset}` };
+}
+
+// Human diagnostics share the native message renderer; transport responses stay intact.
+export function operatorCard(label: string, value: unknown): string | undefined {
+  const result = objectRecord(value);
+  const line = (name: string, value: unknown) => `${name.padEnd(15)}  ${screenLine(value)}`;
+  const threadSummary = (value: unknown) => {
+    const data = objectRecord(value);
+    const state = objectRecord(data.snapshot ?? data.state ?? data);
+    const thread = objectRecord(data.thread);
+    const execution = objectRecord(state.execution);
+    const failure = objectRecord(state.commandFailure);
+    const tokens = objectRecord(state.usage ?? state.turnUsage).totalTokens;
+    return [line("Thread", state.threadId ?? thread.id), line("Status", state.status ?? (data.forked ? "forked" : "unknown")),
+      ...(state.name || thread.name ? [line("Name", state.name ?? thread.name)] : []),
+      ...(execution.model || state.model ? [line("Model", execution.model ?? state.model)] : []),
+      ...(execution.requestedReasoningEffort ? [line("Requested effort", execution.requestedReasoningEffort)] : []),
+      ...(execution.requestedServiceTier ? [line("Requested tier", execution.requestedServiceTier)] : []),
+      ...(execution.serviceTier ? [line("Effective tier", execution.serviceTier)] : []),
+      ...(execution.cwd || state.cwd || thread.cwd ? [line("Directory", execution.cwd ?? state.cwd ?? thread.cwd)] : []),
+      ...(state.error || data.error ? [line("Error", state.error ?? data.error)] : []),
+      ...(state.commandFailure ? [line("Command failed", `exit ${screenLine(failure.exitCode)}`)] : []),
+      ...(typeof tokens === "number" ? [line("Tokens", tokens.toLocaleString("en-US")), line("Cost", "Not reported")] : []),
+      ...(state.outcomeUnknown || data.outcomeUnknown ? ["Outcome unknown. Do not automatically retry, resume or replay."] : []),
+      ...(data.forked ? ["Created a direct-tool thread. No inference started."] : []),
+      ...(data.nameWarning ? [line("Name warning", data.nameWarning)] : []),
+    ].join("\n");
+  };
+  if (result.cancelled === true) return "Cancelled.";
+  if (label === "error") return [
+    ...(result.state ? [threadSummary(value)] : [line("Error", result.error)]),
+    ...(result.code === undefined ? [] : [line("Code", result.code)]),
+    ...(result.threadId ? [line("Thread", result.threadId)] : []),
+    ...(result.outcomeUnknown ? ["Outcome unknown. Do not automatically retry, resume or replay."] : []),
+    ...(result.remedy ? [screenLine(result.remedy, 1000)] : []),
+  ].join("\n");
+  if (label === "tier") return [line("Service tier", result.serviceTier), screenLine(result.scope),
+    ...(result.note ? [screenLine(result.note)] : [])].join("\n");
+  if (label === "fork" || label === "details" || (label === "history" && result.thread)) {
+    return [threadSummary(value), "Full details: expand or use --json after the subcommand."].join("\n");
+  }
+  if (label === "history" && result.forked) return threadSummary(value);
+  if (label === "history" && Array.isArray(result.data)) return [
+    ...result.data.map(thread => { const row = objectRecord(thread); return `${screenLine(row.id)}  ${screenLine(row.name ?? row.preview ?? "(unnamed)", 120)}`; }),
+    ...(result.nextCursor ? ["More threads available; use --json for the continuation cursor."] : []),
+  ].join("\n") || "No saved threads.";
+  if (label === "status") {
+    if (!Array.isArray(result.threads)) return threadSummary(value);
+    return [...(result.threads.length ? [line("Threads", result.threads.length), ...result.threads.map(threadSummary)] : ["No locally loaded direct-tool threads."]),
+      "Saved / Hub threads: /codex history or /codex status THREAD_ID"].join("\n");
+  }
+  if (label !== "doctor") return undefined;
+  const check = (name: string, detail?: unknown) => {
+    const section = objectRecord(result[name]);
+    const error = objectRecord(section.error);
+    return line(name, [section.status ?? "unknown", detail, section.reason ?? error.error, section.remedy].filter(v => v !== undefined && v !== null && v !== "").join(" · "));
+  };
+  const auth = objectRecord(objectRecord(result.auth).value);
+  const config = objectRecord(objectRecord(objectRecord(result.permissions).value).config);
+  const settings = objectRecord(config.value);
+  const quota = objectRecord(objectRecord(result.rateLimits).value);
+  const limits = objectRecord(quota.rateLimits);
+  const lines = [
+    line("Versions", `OMP ${screenLine(result.ompVersion)} · ${screenLine(objectRecord(result.executable).version)}`),
+    check("connection"),
+    line("Login", `${auth.authenticated === true ? "Signed in" : auth.authenticated === false ? "Not signed in" : "Unknown"}${auth.mode ? ` · ${screenLine(auth.mode)}` : ""}`),
+    check("permissions", `${screenLine(settings.sandboxMode)} · approval=${screenLine(settings.approvalPolicy)} · source=${screenLine(result.permissionSource)}`),
+    line("Configured", `${screenLine(settings.model)} · effort=${screenLine(settings.modelReasoningEffort)}`),
+  ];
+  if (objectRecord(result.auth).status !== "available") lines.push(check("auth"));
+  for (const name of ["executable", "models", "steering", "rateLimits"]) {
+    if (objectRecord(result[name]).status !== "available") lines.push(check(name));
+  }
+  for (const name of ["primary", "secondary"]) {
+    const window = objectRecord(limits[name]);
+    if (typeof window.usedPercent !== "number" || !Number.isFinite(window.usedPercent)) continue;
+    const usage = quotaWindow(name, window);
+    lines.push(line(usage.label, usage.value));
+  }
+  if (limits.spendControlReached === true) lines.push("WARNING: spend control reached.");
+  if (quota.ordinaryUsageAllowed === false) lines.push("WARNING: ordinary usage is not allowed.");
+  if (config.status !== "available") lines.push(line("Config", config.status ?? "unknown"));
+  lines.push("Read-only checks do not prove future quota or admission.", "Expand for all checks, models and remedies. /codex doctor --json for raw JSON.");
+  return lines.join("\n");
+}
+
+// Aligned diagnostic rows become native Markdown tables; native data stays literal.
+export function operatorMarkdown(summary: string): string {
+  const escape = (value: string) => value.replace(/[\\`*_[\]<>|]/g, "\\$&");
+  const blocks: string[] = [];
+  let rows: string[] = [];
+  const flush = () => {
+    if (!rows.length) return;
+    blocks.push(["| Item | Value |", "| --- | --- |", ...rows].join("\n"));
+    rows = [];
+  };
+  for (const text of summary.split("\n")) {
+    const row = /^(.+?) {2,}(.*)$/.exec(text);
+    if (row) rows.push(`| ${escape(row[1])} | ${escape(row[2])} |`);
+    else { flush(); blocks.push(escape(text)); }
+  }
+  flush();
+  return blocks.join("\n\n");
+}
+
+function literalBlock(value: string, language = "text", truncated = false) {
+  const clean = value.replace(/[\x00-\x08\x0b\x0c\x0e-\x1f\x7f-\x9f\u202a-\u202e\u2066-\u2069]/g, "");
+  const fence = "`".repeat(Math.max(3, ...Array.from(clean.matchAll(/`+/g), match => match[0].length + 1)));
+  return `${fence}${language}\n${clean}\n${fence}${truncated ? "\n\n[Output truncated; inspect retained native details.]" : ""}`;
+}
+
+export function operatorContent(label: string, value: unknown): string | undefined {
+  const summary = operatorCard(label, value);
+  if (summary === undefined) return undefined;
+  const data = objectRecord(value);
+  const state = objectRecord(data.snapshot ?? data.state ?? data);
+  const failure = objectRecord(state.commandFailure);
+  const blocks = [operatorMarkdown(summary)];
+  if (state.latestActivity) blocks.push("**Activity**", literalBlock(activityLabel(state.latestActivity)));
+  if (state.latestPlan) {
+    const plan = objectRecord(state.latestPlan);
+    const text = typeof state.latestPlan === "string" ? state.latestPlan : Array.isArray(plan.plan)
+      ? plan.plan.map(entry => { const step = objectRecord(entry); return `${screenLine(step.status)} · ${screenLine(step.step)}`; }).join("\n") : "";
+    if (text) blocks.push("**Plan**", literalBlock(text));
+  }
+  if (Array.isArray(state.fileChanges) && state.fileChanges.length) blocks.push("**Native file changes**", literalBlock(state.fileChanges.flatMap(entry => {
+    const change = objectRecord(entry);
+    return Array.isArray(change.changes) ? change.changes.map(raw => { const file = objectRecord(raw); return `${screenLine(file.path)}${file.movePath ? ` → ${screenLine(file.movePath)}` : ""}`; }) : [`${screenLine(change.path)}${change.movePath ? ` → ${screenLine(change.movePath)}` : ""}`];
+  }).join("\n"), "text", Boolean(state.fileChangesOmitted)), "Native events; not a complete audit.");
+  if (state.fileChangesOmitted) blocks.push(`${screenLine(state.fileChangesOmitted)} file-change items omitted; inspect native details.`);
+  if (typeof state.text === "string" && state.text) blocks.push("**Answer**", literalBlock(state.text, "text", state.textTruncated === true || state.truncated === true));
+  if (typeof failure.outputTail === "string" && failure.outputTail) blocks.push("**Failure output**", literalBlock(failure.outputTail, "text", failure.outputTruncated === true));
+  const items = objectRecord(data.items);
+  if (Array.isArray(items.data)) for (const entry of items.data) {
+    const item = objectRecord(objectRecord(entry).item);
+    if (item.type !== "fileChange" || !Array.isArray(item.changes)) continue;
+    for (const raw of item.changes) {
+      const change = objectRecord(raw);
+      if (typeof change.diff !== "string") continue;
+      blocks.push(literalBlock(`${screenLine(change.path)}${change.movePath ? ` → ${screenLine(change.movePath)}` : ""}`),
+        literalBlock(change.diff, "diff", change.diffTruncated === true));
+    }
+  }
+  if (items.nextCursor) blocks.push("More items available. Expand for the turn ID and continuation cursor.");
+  return blocks.join("\n\n");
+}
+
 // Automatic surfaces never render raw native item arguments, results, or successful command output.
 function activityLabel(value: unknown): string {
   if (typeof value === "string") return screenLine(value);
   const activity = objectRecord(value);
+  if (typeof activity.summary === "string") return screenLine(activity.summary);
   const item = objectRecord(objectRecord(activity.params).item ?? activity.item);
   const parts = [screenLine(activity.method ?? "native activity", 100)];
   if (item?.type === "commandExecution" && typeof item.command === "string") parts.push(screenLine(item.command, 256));
@@ -91,51 +250,6 @@ export function summarizeRun(state: RunSnapshot) {
   return result;
 }
 
-// A collapsed result exposes execution identity and failures, including structured admission errors.
-export function executionCard(result: unknown, expanded = false): string {
-  const data = objectRecord(result);
-  const state = objectRecord(data.snapshot ?? data.state ?? data);
-  if (!state.threadId && !data.error) {
-    const json = JSON.stringify(result, null, 2) ?? String(result);
-    return `Codex result\n${json.slice(0, 16 * 1024)}${json.length > 16 * 1024 ? "\n[Rendered preview truncated.]" : ""}`;
-  }
-  const execution = objectRecord(state.execution);
-  const lines = [
-    `Codex execution [${screenLine(state.status ?? (data.forked ? "forked" : data.error ? "error" : "read-only"))}]`,
-    `model=${screenLine(execution.model ?? state.model)} cwd=${screenLine(execution.cwd ?? state.cwd)} requestedEffort=${screenLine(execution.requestedReasoningEffort)} effectiveEffort=unknown`,
-  ];
-  if (state.name) lines.push(`Name: ${screenLine(state.name, 256)}`);
-  if (execution.requestedServiceTier != null || execution.serviceTier != null) {
-    lines.push(`Requested tier: ${screenLine(execution.requestedServiceTier)} · Effective tier: ${screenLine(execution.serviceTier)}`);
-  }
-  if (state.threadId) lines.push(`Thread: ${screenLine(state.threadId)} Turn: ${screenLine(state.turnId)}`);
-  const usage = objectRecord(state.usage ?? state.turnUsage);
-  if (typeof usage.totalTokens === "number") lines.push(`Tokens: ${usage.totalTokens.toLocaleString("en-US")} · Cost: not reported`);
-  else if (expanded) lines.push("Cost: not reported by Codex");
-  if (data.forked) lines.push(`Source: ${screenLine(data.sourceThreadId)} through ${screenLine(data.lastTurnId)} · direct tool · no inference started`);
-  if (data.nameWarning) lines.push(`Name warning: ${screenLine(data.nameWarning, 300)}`);
-  if (state.latestActivity) lines.push(`Activity: ${activityLabel(state.latestActivity)}`);
-  if (state.latestPlan) lines.push(`Plan: ${screenLine(typeof state.latestPlan === "string" ? state.latestPlan : JSON.stringify(state.latestPlan), 1200)}`);
-  if (Array.isArray(state.fileChanges) && state.fileChanges.length) {
-    lines.push(`File changes: ${screenLine(JSON.stringify(state.fileChanges.map(changeMetadata)), 2000)} (native events; not a complete audit)`);
-  }
-  if (state.fileChangesOmitted) lines.push(`${state.fileChangesOmitted} file-change items omitted; inspect status/details.`);
-  if (state.commandFailure) {
-    const failure = objectRecord(state.commandFailure);
-    lines.push(`Command failed: exit ${screenLine(failure.exitCode)}`);
-    lines.push(`Output tail: ${screenLine(String(failure.outputTail ?? "").slice(-2000), 2000)}${failure.outputTruncated ? " [truncated]" : ""}`);
-  }
-  if (state.outcomeUnknown || data.outcomeUnknown) lines.push("Outcome unknown. Inspect status/details; never automatically retry, resume or replay.");
-  if (data.error || state.error) lines.push(`Error${data.code === undefined ? "" : ` (${screenLine(data.code)})`}: ${screenLine(data.error ?? state.error, 1000)}`);
-  if (typeof state.text === "string" && state.text) lines.push(`Answer: ${screenLine(state.text, 2000)}${state.text.length > 2000 ? " [expand for retained preview]" : ""}`);
-  if (data.remedy) lines.push(screenLine(data.remedy, 1000));
-  if (expanded) {
-    const json = JSON.stringify(result, null, 2) ?? String(result);
-    lines.push(json.slice(0, 16 * 1024) + (json.length > 16 * 1024 ? "\n[Rendered preview truncated; inspect explicit native details.]" : ""));
-  }
-  return lines.join("\n");
-}
-
 export type ProgressStatus = {
   threadId: string; turnId: string | null; status: string; activity: string | null; plan: string | null;
   execution: { model: string | null; cwd: string | null; requestedReasoningEffort: string | null };
@@ -183,9 +297,8 @@ export function createProgressDisplay() {
       const detail = ["primary", "secondary"].flatMap(key => {
         const window = objectRecord(current[key]);
         if (typeof window.usedPercent !== "number") return [];
-        const date = typeof window.resetsAt === "number" ? new Date(window.resetsAt * 1000) : undefined;
-        const reset = date && Number.isFinite(date.getTime()) ? `, reset ${date.toISOString()}` : "";
-        return [`${key} ${window.usedPercent}%${reset}`];
+        const usage = quotaWindow(key, window);
+        return [`${usage.label}: ${usage.value}`];
       }).join("; ");
       notify(`Codex ${screenLine(current.limitName ?? id, 80)}: ${reached ? "limit reached" : "usage window recovered"}${detail ? ` · ${detail}` : ""}`, reached ? "warning" : "info");
     },

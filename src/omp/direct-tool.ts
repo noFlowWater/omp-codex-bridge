@@ -1,9 +1,10 @@
 import type { ExtensionAPI } from "@oh-my-pi/pi-coding-agent";
+import { CustomMessageComponent } from "@oh-my-pi/pi-tui/chat/custom-message";
 import { CodexAppServerClient } from "../codex/client.mjs";
 import { TERMINAL as NATIVE_TERMINAL } from "../codex/protocol.mjs";
 import { onRequest } from "./dialogs.ts";
 import { errorDetails, readOnlyAction, registerOperator } from "./operator.ts";
-import { executionCard, summarizeRun } from "./presentation.ts";
+import { operatorContent, summarizeRun } from "./presentation.ts";
 
 const TERMINAL = new Set(["completed", "failed", "interrupted", "disconnected"]);
 
@@ -182,6 +183,11 @@ export function registerDirectTool(pi: ExtensionAPI, options: { onRateLimits?: (
   }
 
   registerOperator(pi, { getClient, status, fork });
+  pi.registerMessageRenderer("codex-bridge-result", (message, options) => {
+    if (options.expanded || typeof message.content !== "string") return undefined;
+    const result = JSON.parse(message.content.slice(message.content.indexOf("\n") + 1));
+    return new CustomMessageComponent({ ...message, customType: "Codex result", content: operatorContent("status", result) ?? "" });
+  });
 
   pi.registerTool({
     name: "codex_bridge",
@@ -212,7 +218,13 @@ export function registerDirectTool(pi: ExtensionAPI, options: { onRateLimits?: (
       turnId: z.string().min(1).optional(),
     }).strict(),
     renderResult(result, options) {
-      return new pi.pi.Text(executionCard(result.details, options.expanded), 0, 0);
+      const value = result.details;
+      if (value === undefined) return new CustomMessageComponent({ role: "custom", customType: "Codex working", content: "Waiting for the native result.", display: true, timestamp: Date.now() });
+      const data = value && typeof value === "object" ? value as Record<string, unknown> : {};
+      const label = data.error && !data.status ? "error" : data.connection ? "doctor" : data.thread ? "details" : Array.isArray(data.data) ? "history" : "status";
+      const content = options.expanded ? `\`\`\`json\n${JSON.stringify(value, null, 2)}\n\`\`\``
+        : data.stopped ? "Codex server stopped." : operatorContent(label, Array.isArray(value) ? { threads: value } : value) ?? "";
+      return new CustomMessageComponent({ role: "custom", customType: "Codex result", content, display: true, timestamp: Date.now() });
     },
     async execute(_id, params, signal, _onUpdate, ctx) {
       try {

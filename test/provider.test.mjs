@@ -70,6 +70,9 @@ process.env.OMP_CODEX_BRIDGE_STATE_DIR = STATE_DIR;
 mock.module('@oh-my-pi/pi-coding-agent', () => ({
   getAgentDir: () => STATE_DIR,
 }));
+mock.module('@oh-my-pi/pi-tui/chat/custom-message', () => ({
+  CustomMessageComponent: class { constructor(message) { this.message = message; this.text = `${message.customType}\n${message.content}`; } },
+}));
 afterAll(() => {
   rmSync(STATE_DIR, { recursive: true, force: true });
   if (previousStateDir === undefined) delete process.env.OMP_CODEX_BRIDGE_STATE_DIR;
@@ -129,9 +132,11 @@ async function withHost(options, store, body) {
     const providers = new Map();
     const handlers = new Map();
     const followUps = [];
+    const renderers = new Map();
     const api = {
       zod,
       registerTool: (tool) => tools.set(tool.name, tool),
+      registerMessageRenderer: (name, renderer) => renderers.set(name, renderer),
       registerCommand: () => {},
       getServiceTiers: () => options.ompServiceTier ? { openai: options.ompServiceTier } : {},
       registerProvider: (name, config) => providers.set(name, config),
@@ -164,7 +169,7 @@ async function withHost(options, store, body) {
       const text = result.content[0].text;
       return { isError: result.isError === true, bytes: Buffer.byteLength(text), json: JSON.parse(text) };
     };
-    const instance = { call, tool, followUps, handlers, providers, ctx, ready: Promise.resolve(handlers.get('session_start')?.({ type: 'session_start' }, ctx)) };
+    const instance = { call, tool, followUps, renderers, handlers, providers, ctx, ready: Promise.resolve(handlers.get('session_start')?.({ type: 'session_start' }, ctx)) };
     bound.push(instance);
     return instance;
   };
@@ -1720,7 +1725,7 @@ test('native command approval reaches root UI from a headless child and grants o
       ctx.ui.select = async (title, options) => {
         asked++;
         assert.match(title, /touch forbidden/);
-        assert.deepEqual(options, ['Decline', 'Approve once']);
+        assert.deepEqual(options, ['Decline', 'Approve once', 'View full details']);
         return selection;
       };
       const worker = await child('codex-bridge');
@@ -1769,7 +1774,10 @@ test('all native approval dialogs fail closed without UI, on dismissal, cancella
       }
       selection = 'Approve once';
       assert.deepEqual(await onRequest(request), granted);
-      assert.ok(lastTitle.includes(JSON.stringify(params, null, 2)), 'all requested permissions and managed-network scope reach the user');
+      const { approvalPrompt } = await import('../src/omp/dialogs.ts');
+      const prompt = approvalPrompt(method, params, 'Approve only this request?');
+      for (const scope of ['example.com', 'https', '/outside-workspace', 'touch requested-file']) assert.ok(prompt.full.includes(scope), scope);
+      assert.doesNotMatch(prompt.full, /"permissions"\s*:/);
     }
     assert.equal(selections, methods.length * 5);
     selections = 0;
@@ -1794,6 +1802,51 @@ test('all native approval dialogs fail closed without UI, on dismissal, cancella
     assert.deepEqual(await pending, { decision: 'decline' });
     await handlers.get('session_before_switch')?.({ type: 'session_before_switch', reason: 'resume' }, ctx);
     assert.deepEqual(await oldClient({ method: methods[0], params, signal: new AbortController().signal }), { decision: 'decline' });
+  });
+}, TIMEOUT);
+
+test('native approval uses full scope and grants only the explicit once answer', async () => {
+  const { onRequest } = await import('../src/omp/dialogs.ts');
+  await withHost({}, undefined, async ({ ctx }) => {
+    ctx.hasUI = true;
+    const params = { command: 'touch requested-file', permissions: { fileSystem: { write: ['/outside/workspace'] } }, unknownScope: { host: 'example.com' } };
+    const request = { method: 'item/commandExecution/requestApproval', params, signal: new AbortController().signal };
+    for (const answer of ['once', 'session', 'deny', undefined, { grant: 'folder', always: true }]) {
+      ctx.ui.approve = async prompt => {
+        for (const detail of ['touch requested-file', '/outside/workspace', 'example.com']) assert.ok(prompt.full.includes(detail));
+        assert.doesNotMatch(prompt.full, /"permissions"\s*:/);
+        return answer;
+      };
+      assert.deepEqual(await onRequest(request), { decision: answer === 'once' ? 'accept' : 'decline' });
+    }
+    delete ctx.ui.approve;
+    const choices = ['View full details', 'Decline'];
+    ctx.ui.select = async title => {
+      if (choices.length === 1) assert.ok(title.includes('/outside/workspace') && title.includes('example.com'));
+      return choices.shift();
+    };
+    assert.deepEqual(await onRequest(request), { decision: 'decline' });
+  });
+}, TIMEOUT);
+
+test('completion notices and direct results render human cards while retaining structured transport', async () => {
+  await withHost({ turns: ['finish-later'] }, undefined, async ({ call, tool, followUps, renderers }) => {
+    const started = await call({ action: 'run', prompt: 'finish' });
+    await until(() => followUps.length > 0);
+    const message = followUps[0].message;
+    const render = renderers.get('codex-bridge-result');
+    const card = render(message, { expanded: false });
+    assert.ok(card.text.includes(started.json.threadId) && card.text.includes('completed'));
+    assert.ok(card.text.includes('**Answer**'));
+    assert.doesNotMatch(card.text, /"threadId"\s*:/);
+    assert.equal(render(message, { expanded: true }), undefined);
+    const status = await call({ action: 'status', threadId: started.json.threadId });
+    const direct = tool.renderResult({ details: status.json }, { expanded: false });
+    assert.ok(direct.text.includes(started.json.threadId) && direct.text.includes('**Answer**'));
+    const failed = tool.renderResult({ details: { threadId: started.json.threadId, status: 'failed', model: 'failed-model', error: 'command failed',
+      commandFailure: { exitCode: 17, outputTail: 'first line\nsecond line' } } }, { expanded: false });
+    for (const expected of ['failed-model', 'failed', 'exit 17', 'first line\nsecond line']) assert.ok(failed.text.includes(expected), expected);
+    assert.ok(JSON.parse(message.content.slice(message.content.indexOf('\n') + 1)).threadId);
   });
 }, TIMEOUT);
 

@@ -4,6 +4,8 @@
 
 Workers inherit Codex's native filesystem, network and approval settings. The default cwd is the parent session's directory; cwd does not define which files the task authorizes editing. Specify the permitted output paths in the task.
 
+Native approval requests use OMP's approval dialog when available. The complete expandable view retains every request field, including additional permissions and network scope. Older hosts use a selector with a full-details action. Only explicit approval of this one request grants it; dismissal, cancellation, session-wide answers and unavailable UI deny it. No remembered or session-wide permission is created by the bridge.
+
 Configure optional access in `~/.codex/config.toml`, for example:
 
 ```toml

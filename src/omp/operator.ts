@@ -1,7 +1,9 @@
 import type { ExtensionAPI, ExtensionContext } from "@oh-my-pi/pi-coding-agent";
+import { CustomMessageComponent } from "@oh-my-pi/pi-tui/chat/custom-message";
+import { basename, dirname, relative } from "node:path";
 import type { CodexAppServerClient } from "../codex/client.mjs";
 import { TERMINAL as NATIVE_TERMINAL } from "../codex/protocol.mjs";
-import { utf8Preview } from "./presentation.ts";
+import { operatorContent, utf8Preview } from "./presentation.ts";
 
 const ERROR_BYTES = 4 * 1024;
 export function errorDetails(error: unknown, threadId?: string) {
@@ -114,11 +116,27 @@ export async function readOnlyAction(action: string, params: OperatorParams, cli
   }
 }
 
-const HELP = "Usage: /codex doctor | status [THREAD_ID] | history [--json] [JSON options] | show THREAD_ID [JSON options] | fork THREAD_ID [JSON options] | tier [inherit|default|flex|scale|priority|ultrafast|auto]. tier reads/sets the OpenAI-family setting for this OMP session. Interactive history offers details or an explicitly confirmed fork; --json and headless history return JSON. Fork options: lastTurnId, name; creates a direct-tool thread, not an Agent Hub worker, without starting inference. Status without ID lists locally loaded direct-tool threads only. History options: cursor, limit, searchTerm, cwd. Show options: includeItems, turnId, cursor, limit, includeDiff. Inspection never resumes, adopts or replays a thread. Diff output may contain secrets.";
+const HELP = `| Command | Purpose |
+| --- | --- |
+| /codex doctor | Check connection, login and quota |
+| /codex status [THREAD_ID] | Inspect thread status |
+| /codex history | Browse saved threads |
+| /codex show THREAD_ID | Inspect a saved thread |
+| /codex fork THREAD_ID | Create a direct thread; no inference |
+| /codex tier | Choose this session's OpenAI tier |
+
+**Raw data** · Add \`--json\` after the subcommand, e.g. \`/codex doctor --json\`.
+
+Status without an ID lists local direct threads. History offers details or a confirmed fork.
+
+Advanced options: docs/direct-tool.md. Requested diffs may contain secrets.`;
 
 // Escape controls and directional overrides before native history enters terminal labels.
-const historyLabel = (value: unknown) => JSON.stringify(utf8Preview(String(value ?? ""), 512).text)
-  .replace(/[\u007f-\u009f\u202a-\u202e\u2066-\u2069]/g, char => `\\u${char.charCodeAt(0).toString(16).padStart(4, "0")}`);
+const historyLabel = (value: unknown, bytes = 512) => {
+  const preview = utf8Preview(String(value ?? ""), bytes);
+  return JSON.stringify(preview.text).slice(1, -1)
+    .replace(/[\u007f-\u009f\u202a-\u202e\u2066-\u2069]/g, char => `\\u${char.charCodeAt(0).toString(16).padStart(4, "0")}`) + (preview.truncated ? "…" : "");
+};
 
 async function pickHistory(params: OperatorParams, client: CodexAppServerClient, pi: ExtensionAPI, ctx: ExtensionContext,
   fork: (params: { threadId: string; lastTurnId?: string; name?: string }) => Promise<unknown>) {
@@ -126,8 +144,11 @@ async function pickHistory(params: OperatorParams, client: CodexAppServerClient,
   const previous: (string | undefined)[] = [];
   for (;;) {
     const page = await client.listThreads({ ...params, cursor });
-    const labels = page.data.map((thread, index) =>
-      `${index + 1}. ${historyLabel(thread.name || thread.preview || thread.id)} | cwd ${historyLabel(thread.cwd)} | ${historyLabel(thread.id)}`);
+    const labels = page.data.map((thread, index) => {
+      const path = relative(ctx.cwd, thread.cwd || ctx.cwd) || ".";
+      const shortPath = path.length > 20 ? `…/${basename(dirname(path))}/${basename(path)}` : path;
+      return `${index + 1}. ${historyLabel(thread.name || thread.preview || "(unnamed)", 36)} · ${historyLabel(shortPath, 24)}`;
+    });
     const choices = [...labels, ...(previous.length ? ["Previous page"] : []),
       ...(page.nextCursor ? ["Next page"] : []), "Cancel"];
     const choice = await ctx.ui.select("Codex saved history — inspection only until you confirm a fork", choices);
@@ -163,6 +184,19 @@ export function registerOperator(pi: ExtensionAPI, access: {
   status(threadId?: string): Promise<unknown>;
   fork(params: { threadId: string; lastTurnId?: string; name?: string }): Promise<unknown>;
 }) {
+  pi.registerMessageRenderer<{ label: string; raw: boolean }>("codex-bridge-operator", (message, options) => {
+    const details = message.details;
+    if (details?.label === "help") return new CustomMessageComponent({ ...message, customType: "Codex commands" });
+    if (!details || details.raw || options.expanded) return undefined;
+    if (typeof message.content !== "string") return undefined;
+    const result = JSON.parse(message.content.slice(message.content.indexOf("\n") + 1));
+    const summary = operatorContent(details.label, result);
+    if (summary === undefined) return undefined;
+    // Reuse OMP's frame, theme and native Markdown tables without nesting custom renderers.
+    return new CustomMessageComponent({ ...message,
+      customType: message.content.slice(0, message.content.indexOf("\n")), content: summary,
+    });
+  });
   const z = pi.zod;
   const page = { cursor: z.string().min(1).optional(), limit: z.number().int().min(1).max(100).optional() };
   const history = z.object({ ...page, searchTerm: z.string().min(1).optional(), cwd: z.string().min(1).optional() }).strict();
@@ -174,17 +208,18 @@ export function registerOperator(pi: ExtensionAPI, access: {
     description: "Codex doctor, status, saved history picker, details and explicit direct-thread fork; /codex for help",
     handler: async (args, ctx) => {
       let selectedThreadId: string | undefined;
+      let raw = false;
       try {
-        const [command = "help", rest = ""] = (args.trim() || "help").split(/\s+(.*)/s);
+        const [command = "help", input = ""] = (args.trim() || "help").split(/\s+(.*)/s);
+        raw = input === "--json" || input.startsWith("--json ");
+        const rest = raw ? input.slice(6).trim() : input;
         let result: unknown;
         let label = command;
         if (command === "doctor") {
           if (rest) throw new Error("doctor takes no arguments");
           result = await readOnlyAction("diagnose", {}, await access.getClient(), pi, ctx);
         } else if (command === "history") {
-          const raw = rest === "--json" || rest.startsWith("--json ");
-          const input = raw ? rest.slice(6).trim() : rest;
-          const params = history.parse(input ? JSON.parse(input) : {});
+          const params = history.parse(rest ? JSON.parse(rest) : {});
           const client = await access.getClient();
           result = ctx.hasUI && !raw ? await pickHistory(params, client, pi, ctx, access.fork) : await readOnlyAction("history", params, client, pi, ctx);
         } else if (command === "fork") {
@@ -219,14 +254,14 @@ export function registerOperator(pi: ExtensionAPI, access: {
             threads: await access.status(),
           };
         } else {
-          if (command !== "help") throw new Error(HELP);
-          pi.sendMessage({ customType: "codex-bridge-operator", content: HELP, display: true }, { triggerTurn: false });
+          if (command !== "help") throw new Error(`Unknown command: ${command}. Use /codex for help.`);
+          pi.sendMessage({ customType: "codex-bridge-operator", content: HELP, details: { label: "help", raw: false }, display: true }, { triggerTurn: false });
           return;
         }
         const readOnly = !(result && typeof result === "object" && ("forked" in result || ("readOnly" in result && result.readOnly === false)));
-        pi.sendMessage({ customType: "codex-bridge-operator", content: `Codex ${label}${readOnly ? " (read-only)" : ""}:\n${JSON.stringify(result, null, 2)}`, display: true }, { triggerTurn: false });
+        pi.sendMessage({ customType: "codex-bridge-operator", content: `Codex ${label}${readOnly ? " (read-only)" : ""}:\n${JSON.stringify(result, null, 2)}`, details: { label, raw }, display: true }, { triggerTurn: false });
       } catch (error) {
-        pi.sendMessage({ customType: "codex-bridge-operator", content: `Codex operator error:\n${JSON.stringify(errorDetails(error, selectedThreadId), null, 2)}`, display: true }, { triggerTurn: false });
+        pi.sendMessage({ customType: "codex-bridge-operator", content: `Codex operator error:\n${JSON.stringify(errorDetails(error, selectedThreadId), null, 2)}`, details: { label: "error", raw }, display: true }, { triggerTurn: false });
       }
     },
   });
