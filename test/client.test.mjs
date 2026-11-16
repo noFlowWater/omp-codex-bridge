@@ -996,7 +996,7 @@ it('steers an active turn with its expected turn ID', async (t) => {
   const { client, dir } = makeClient(t);
   const first = await client.run({ prompt: 'hold', cwd });
   assert.equal(first.status, 'inProgress');
-  await client.run({ threadId: first.threadId, prompt: 'follow-up', cwd });
+  await client.steer({ threadId: first.threadId, turnId: first.turnId, prompt: 'follow-up' });
   await untilSnapshot(client, first.threadId, completed);
   assert.deepEqual(mutations(dir).map(({ method }) => method), ['thread/start', 'turn/start', 'turn/steer']);
   const [steer] = sent(dir, 'turn/steer');
@@ -1004,12 +1004,112 @@ it('steers an active turn with its expected turn ID', async (t) => {
   assert.deepEqual(steer.input, [{ type: 'text', text: 'follow-up' }]);
 });
 
+it('sends no steer when its signal aborts before the thread queue is acquired', async (t) => {
+  const { client, dir } = makeClient(t);
+  const active = await client.run({ prompt: 'hold', cwd });
+  let release;
+  let entered;
+  const gate = new Promise(resolve => { release = resolve; });
+  const ready = new Promise(resolve => { entered = resolve; });
+  const held = client.run({
+    threadId: active.threadId, prompt: 'never started', cwd,
+    onThread: async () => { entered(); await gate; },
+  });
+  await ready;
+  const controller = new AbortController();
+  const queued = client.steer({
+    threadId: active.threadId, turnId: active.turnId,
+    prompt: 'never steered', signal: controller.signal,
+  });
+  const pending = Promise.allSettled([held, queued]);
+  controller.abort();
+  release();
+  const [start, steer] = await pending;
+  assert.equal(start.status, 'rejected');
+  assert.match(start.reason.message, /already has an active turn/);
+  assert.equal(steer.status, 'rejected');
+  assert.equal(steer.reason.name, 'AbortError');
+  await assert.rejects(client.steer({
+    threadId: active.threadId, turnId: active.turnId,
+    prompt: 'already aborted', signal: controller.signal,
+  }), error => error.name === 'AbortError');
+  assert.equal(sent(dir, 'turn/steer').length, 0);
+  assert.equal(sent(dir, 'turn/start').length, 1);
+  assert.deepEqual(prompts(dir), ['hold']);
+  assert.equal(client.snapshot(active.threadId).status, 'inProgress');
+  assert.equal(client.snapshot(active.threadId).outcomeUnknown, false);
+});
+
+it('keeps racing start and explicit steer intents separate in either queue order', async (t) => {
+  const { client, dir } = makeClient(t, { steerHolds: true });
+  const active = await client.run({ prompt: 'hold', cwd, effort: 'low' });
+  for (const startFirst of [true, false]) {
+    const start = () => client.run({
+      threadId: active.threadId, prompt: 'never sent', cwd,
+      effort: 'high', outputSchema: { type: 'object' }, serviceTier: 'fast',
+    });
+    const steer = () => client.steer({
+      threadId: active.threadId, turnId: active.turnId, prompt: `follow-up ${startFirst}`,
+    });
+    const operations = startFirst ? [start(), steer()] : [steer(), start()];
+    const results = await Promise.allSettled(operations);
+    const rejected = results[startFirst ? 0 : 1];
+    assert.equal(rejected.status, 'rejected');
+    assert.match(rejected.reason.message, /already has an active turn.*no input sent/);
+    assert.equal(results[startFirst ? 1 : 0].status, 'fulfilled');
+  }
+  assert.deepEqual(prompts(dir), ['hold']);
+  assert.equal(sent(dir, 'turn/start').length, 1);
+  const steers = sent(dir, 'turn/steer');
+  assert.equal(steers.length, 2);
+  for (const steer of steers) {
+    assert.equal(steer.expectedTurnId, active.turnId);
+    assert.deepEqual(Object.keys(steer).sort(), ['expectedTurnId', 'input', 'threadId']);
+  }
+  assert.equal(client.snapshot(active.threadId).requestedReasoningEffort, 'low');
+  assert.equal(client.snapshot(active.threadId).requestedServiceTier, null);
+});
+
+it('refuses a stale steer and second start queued behind a newly admitted turn', async (t) => {
+  const { client, dir } = makeClient(t);
+  const previous = await client.run({ prompt: 'hold', cwd });
+  await client.cancel(previous.threadId);
+  await untilSnapshot(client, previous.threadId, ({ status }) => status === 'interrupted');
+  let release;
+  let entered;
+  const gate = new Promise(resolve => { release = resolve; });
+  const ready = new Promise(resolve => { entered = resolve; });
+  const next = client.run({
+    threadId: previous.threadId, prompt: 'hold', cwd,
+    onThread: async () => { entered(); await gate; },
+  });
+  await ready;
+  const pending = Promise.allSettled([
+    next,
+    client.steer({ threadId: previous.threadId, turnId: previous.turnId, prompt: 'stale input' }),
+    client.run({ threadId: previous.threadId, prompt: 'duplicate input', cwd }),
+  ]);
+  release();
+  const [started, steered, duplicate] = await pending;
+  assert.equal(started.status, 'fulfilled');
+  assert.notEqual(started.value.turnId, previous.turnId);
+  assert.equal(steered.status, 'rejected');
+  assert.match(steered.reason.message, /not the active turn.*not steered/);
+  assert.equal(duplicate.status, 'rejected');
+  assert.match(duplicate.reason.message, /already has an active turn.*no input sent/);
+  assert.deepEqual(prompts(dir), ['hold', 'hold']);
+  assert.equal(sent(dir, 'turn/start').length, 2);
+  assert.equal(sent(dir, 'turn/steer').length, 0);
+});
+
 it('keeps a successful completion when a late steer is rejected', async (t) => {
   const { client } = makeClient(t);
   const active = await client.run({ prompt: 'hold', cwd });
-  await assert.rejects(client.run({ threadId: active.threadId, prompt: 'late-steer', cwd }), (error) => {
+  await assert.rejects(client.steer({ threadId: active.threadId, turnId: active.turnId, prompt: 'late-steer' }), (error) => {
     assert.match(error.message, /no active turn/);
     assert.equal(error.threadId, active.threadId);
+    assert.equal(error.turnId, active.turnId);
+    assert.notEqual(error.outcomeUnknown, true);
     return true;
   });
   const after = client.snapshot(active.threadId);
@@ -1022,8 +1122,9 @@ it('keeps a successful completion when a late steer is rejected', async (t) => {
 it('keeps a timed-out steer unknown while native history shows the same turn active', async (t) => {
   const { client, dir } = makeClient(t, {}, { timeoutMs: 600 });
   const active = await client.run({ prompt: 'hold', cwd });
-  await assert.rejects(client.run({ threadId: active.threadId, prompt: 'steer-lost', cwd }), (error) => {
+  await assert.rejects(client.steer({ threadId: active.threadId, turnId: active.turnId, prompt: 'steer-lost' }), (error) => {
     assert.equal(error.code, 'RPC_TIMEOUT');
+    assert.equal(error.turnId, active.turnId);
     return unknownOutcome(active.threadId)(error);
   });
   const inspected = await client.status(active.threadId);
@@ -1194,12 +1295,8 @@ it('does not duplicate a mutation after its admission response times out', async
   assert.equal(typeof threadId, 'string');
   assert.equal(client.snapshot(threadId).status, 'inProgress');
   assert.equal(client.snapshot(threadId).outcomeUnknown, true);
-  // A caller retry must be blocked or steer the known active turn, never start another.
-  try {
-    await client.run({ threadId, prompt: 'caller retry', cwd });
-  } catch (error) {
-    assert.match(error.message, /unknown|progress|active|reconcil|timeout/i);
-  }
+  // A caller retry cannot become a steer or another start, even after reconciliation.
+  await assert.rejects(client.run({ threadId, prompt: 'caller retry', cwd }), /unknown|progress|active|reconcil|timeout/i);
   const done = await untilSnapshot(client, threadId, completed);
   assert.deepEqual(prompts(dir), ['hold']);
   assert.equal(done.outcomeUnknown, false);
@@ -1529,12 +1626,12 @@ it('passes native images, effort, output schema and developer instructions witho
   assert.equal(sent(dir, 'turn/start').length, 2, 'native rejection is not retried with reduced options');
 });
 
-it('rejects turn-only settings on a resumed active turn instead of discarding them', async (t) => {
+it('refuses a new start on a resumed active turn without sending turn-only settings', async (t) => {
   const { client, dir } = makeClient(t, { staleTurns: true, liveResume: true, earlyThread: true }, {}, savedStore([
     ['active', [savedTurn('running', 'inProgress')]],
   ]));
   for (const settings of [{ effort: 'high' }, { outputSchema: { type: 'object' } }, { serviceTier: 'fast' }]) {
-    await assert.rejects(client.run({ threadId: 'active', prompt: 'x', cwd, ...settings }), /cannot change an active turn/);
+    await assert.rejects(client.run({ threadId: 'active', prompt: 'x', cwd, ...settings }), /already has an active turn.*no input sent/);
   }
   assert.equal(client.snapshot('active').status, 'inProgress');
   assert.equal(sent(dir, 'thread/resume')[0].excludeTurns, true);
@@ -1542,11 +1639,11 @@ it('rejects turn-only settings on a resumed active turn instead of discarding th
   assert.equal(sent(dir, 'turn/steer').length, 0);
 });
 
-it('reconciles an omitted active turn before deciding whether run settings would change it', async (t) => {
+it('reconciles an omitted active turn before refusing a new start', async (t) => {
   const { client, dir } = makeClient(t, { staleTurns: true, liveResume: true, earlyThread: true }, {}, savedStore([
     ['active-without-id', [savedTurn('running', 'inProgress')]],
   ]));
-  await assert.rejects(client.run({ threadId: 'active-without-id', prompt: 'never sent', effort: 'high', cwd }), /cannot change an active turn/);
+  await assert.rejects(client.run({ threadId: 'active-without-id', prompt: 'never sent', effort: 'high', cwd }), /already has an active turn.*no input sent/);
   assert.equal(client.snapshot('active-without-id').turnId, 'running', 'the active turn is identified before rejection');
   assert.ok(sent(dir, 'thread/turns/list').length > 0);
   assert.equal(sent(dir, 'turn/start').length, 0);
@@ -1980,8 +2077,12 @@ it('keeps malformed successful mutation replies unknown without replaying native
       staleTurns: true, malformedTurnReply: method === 'turn/start', malformedSteerReply: method === 'turn/steer',
     });
     let threadId;
-    if (method === 'turn/steer') ({ threadId } = await client.run({ prompt: 'hold', cwd }));
-    await assert.rejects(client.run({ threadId, prompt: method === 'turn/start' ? 'hold' : 'follow-up', cwd }), error => {
+    let turnId;
+    if (method === 'turn/steer') ({ threadId, turnId } = await client.run({ prompt: 'hold', cwd }));
+    const admission = method === 'turn/start'
+      ? client.run({ prompt: 'hold', cwd })
+      : client.steer({ threadId, turnId, prompt: 'follow-up' });
+    await assert.rejects(admission, error => {
       threadId = error.threadId;
       assert.equal(typeof threadId, 'string');
       return unknownOutcome(threadId)(error);
@@ -2531,13 +2632,13 @@ it('refuses service tier changes through run or steer while keeping native input
   const { client, dir } = makeClient(t);
   const active = await client.run({ prompt: 'hold', cwd, serviceTier: 'fast' });
   for (const serviceTier of ['default', 'fast']) {
-    await assert.rejects(client.run({ threadId: active.threadId, prompt: 'not sent', cwd, serviceTier }), /cannot change an active turn/);
+    await assert.rejects(client.run({ threadId: active.threadId, prompt: 'not sent', cwd, serviceTier }), /already has an active turn.*no input sent/);
     await assert.rejects(client.steer({ threadId: active.threadId, turnId: active.turnId, prompt: 'not sent', serviceTier }), /cannot change an active turn/);
   }
   assert.equal(client.snapshot(active.threadId).requestedServiceTier, 'fast');
   assert.deepEqual(prompts(dir), ['hold']);
   assert.equal(sent(dir, 'turn/steer').length, 0);
-  await client.run({ threadId: active.threadId, prompt: 'inherit active', cwd });
+  await client.steer({ threadId: active.threadId, turnId: active.turnId, prompt: 'inherit active' });
   assert.equal(sent(dir, 'turn/steer').length, 1);
   assert.ok(!('serviceTierForTurn' in sent(dir, 'turn/steer')[0]));
 });

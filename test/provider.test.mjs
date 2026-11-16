@@ -2968,6 +2968,165 @@ test('extracted storage retains session filenames, native-config receipts and te
   }
 });
 
+test('direct run never steers; explicit steer rejects settings and stale expected turns without replacement', async () => {
+  await withHost({ turns: ['work', 'finish-later'] }, undefined, async ({ call, dir }) => {
+    const first = await call({ action: 'run', prompt: 'owned active task', cwd });
+    assert.equal(first.isError, false);
+    const identity = { threadId: first.json.threadId, turnId: first.json.turnId };
+    const accidentalStart = await call({ action: 'run', threadId: identity.threadId, prompt: 'ordinary start', effort: 'high', cwd });
+    assert.equal(accidentalStart.isError, true);
+    assert.equal(sentParams(dir, 'turn/steer').length, 0);
+    for (const settings of [{ effort: 'high' }, { serviceTier: 'priority' }, { outputSchema: {} }, { cwd }]) {
+      const refused = await call({ action: 'steer', ...identity, prompt: 'changed settings', ...settings });
+      assert.equal(refused.isError, true);
+      assert.match(refused.json.error, /Apply settings with run after this turn finishes/);
+    }
+    const steered = await call({ action: 'steer', ...identity, prompt: 'ordinary live message' });
+    assert.equal(steered.isError, false);
+    await until(async () => (await call({ action: 'status', threadId: identity.threadId })).json.status === 'completed');
+    const stale = await call({ action: 'steer', ...identity, prompt: 'too late' });
+    assert.equal(stale.isError, true);
+    assert.equal(sentParams(dir, 'turn/start').length, 1);
+    assert.equal(sentParams(dir, 'turn/steer').length, 1);
+    const next = await call({ action: 'run', threadId: identity.threadId, prompt: 'next settings', effort: 'high', serviceTier: 'priority', cwd });
+    assert.equal(next.isError, false);
+    assert.equal(sentParams(dir, 'turn/start')[1].effort, 'high');
+    assert.equal(sentParams(dir, 'turn/start')[1].serviceTierForTurn, 'priority');
+  });
+}, TIMEOUT);
+
+test('normal live messages exclude inherited effort/schema/tier and acknowledge before stream completion', async () => {
+  await withHost({ turns: ['work'], ompServiceTier: 'priority' }, undefined, async ({ providers, dir }) => {
+    let offered = false;
+    const acknowledgements = [];
+    const followup = at('normal live message with inherited settings', 74001);
+    const liveSteering = {
+      wait: signal => offered ? new Promise(resolve => signal.addEventListener('abort', resolve, { once: true })) : Promise.resolve(),
+      claim: async () => {
+        if (offered) return undefined;
+        offered = true;
+        return { messages: [followup], accept: () => acknowledgements.push('accept'), reject: () => acknowledgements.push('reject') };
+      },
+    };
+    const result = await stream(providers, { messages: [at('normal task with inherited settings', 74000)], outputSchema: {} }, {
+      sessionId: 'normal-live-settings', reasoning: 'high', serviceTier: 'priority', liveSteering,
+    });
+    // The double returns plain text even with outputSchema; delivery must succeed before validation.
+    assert.match(result.message.errorMessage, /invalid structured data/);
+    assert.deepEqual(acknowledgements, ['accept']);
+    const [start] = sentParams(dir, 'turn/start');
+    assert.equal(start.effort, 'high');
+    assert.deepEqual(start.outputSchema, {});
+    assert.equal(start.serviceTierForTurn, 'priority');
+    const [steer] = sentParams(dir, 'turn/steer');
+    assert.deepEqual(Object.keys(steer).sort(), ['expectedTurnId', 'input', 'threadId']);
+    assert.equal(sentParams(dir, 'turn/start').length, 1);
+    assert.ok(readRecord('normal-live-settings').sent.includes(inputId(followup)));
+  });
+}, TIMEOUT);
+
+for (const boundary of ['completion', 'cancellation']) {
+  test(`pending live claim settles before ${boundary} closes the stream`, async () => {
+    await withHost({ turns: [boundary === 'completion' ? 'progress' : 'work', 'finish-later'] }, undefined, async ({ providers, dir }) => {
+      const claimed = Promise.withResolvers();
+      const release = Promise.withResolvers();
+      const controller = new AbortController();
+      let offered = false;
+      const acknowledgements = [];
+      const task = at(`pending ${boundary} task`, 75000);
+      const followup = at(`pending ${boundary} followup`, 75001);
+      const liveSteering = {
+        wait: () => Promise.resolve(),
+        claim: async () => {
+          if (offered) return undefined;
+          offered = true;
+          claimed.resolve();
+          await release.promise;
+          return { messages: [followup], accept: () => acknowledgements.push('accept'), reject: () => acknowledgements.push('reject') };
+        },
+      };
+      let finished = false;
+      const pending = stream(providers, { messages: [task] }, {
+        sessionId: `pending-${boundary}`, signal: controller.signal, liveSteering,
+      }).then(result => { finished = true; return result; });
+      await claimed.promise;
+      if (boundary === 'cancellation') {
+        controller.abort();
+        await until(() => sentParams(dir, 'turn/interrupt').length === 1);
+      } else {
+        await delay(500);
+      }
+      assert.equal(finished, false, 'host cannot collect accepted/deferred claims before pending claim settles');
+      release.resolve();
+      const first = await pending;
+      assert.deepEqual(acknowledgements, ['reject']);
+      assert.equal(sentParams(dir, 'turn/steer').length, 0);
+      assert.ok(!readRecord(`pending-${boundary}`).sent.includes(inputId(followup)));
+      const next = await stream(providers, { messages: [task, first.message, followup] }, {
+        sessionId: `pending-${boundary}`, reasoning: 'high', serviceTier: 'priority',
+      });
+      assert.equal(next.final.type, 'done', next.message.errorMessage);
+      assert.equal(sentParams(dir, 'turn/start').length, 2);
+      assert.equal(sentParams(dir, 'turn/start')[1].effort, 'high');
+      assert.equal(sentParams(dir, 'turn/start')[1].serviceTierForTurn, 'priority');
+      assert.equal(deliveries(dir, followup.content), 1);
+    });
+  }, TIMEOUT);
+}
+
+for (const outcome of ['accepted', 'unknown']) {
+  test(`native completion waits for pending ${outcome} steer acknowledgement without replay`, async () => {
+    await withHost({ turns: ['work'] }, undefined, async ({ providers, dir }) => {
+      const admitted = Promise.withResolvers();
+      const release = Promise.withResolvers();
+      const { config } = providerModel(providers);
+      config.streamSimple = createCodexBridgeProvider({
+        EventStream: AssistantMessageEventStream, stateDir: STATE_DIR,
+        createClient(options) {
+          const client = new CodexAppServerClient(options);
+          const steer = client.steer.bind(client);
+          client.steer = async params => {
+            const state = await steer(params);
+            admitted.resolve();
+            await release.promise;
+            if (outcome === 'unknown') throw Object.assign(new Error('steer acknowledgement lost'), { outcomeUnknown: true });
+            return state;
+          };
+          return client;
+        },
+      });
+      const task = at(`pending ${outcome} RPC task`, 76000);
+      const followup = at(`pending ${outcome} RPC followup`, 76001);
+      let offered = false;
+      const acknowledgements = [];
+      const liveSteering = {
+        wait: signal => offered ? new Promise(resolve => signal.addEventListener('abort', resolve, { once: true })) : Promise.resolve(),
+        claim: async () => {
+          if (offered) return undefined;
+          offered = true;
+          return { messages: [followup], accept: () => acknowledgements.push('accept'), reject: () => acknowledgements.push('reject') };
+        },
+      };
+      let finished = false;
+      const pending = stream(providers, { messages: [task] }, { sessionId: `pending-rpc-${outcome}`, liveSteering })
+        .then(result => { finished = true; return result; });
+      await admitted.promise;
+      await delay(100);
+      assert.equal(finished, false);
+      assert.deepEqual(acknowledgements, []);
+      release.resolve();
+      const first = await pending;
+      assert.equal(first.final.type, 'done', first.message.errorMessage);
+      assert.deepEqual(acknowledgements, ['accept']);
+      assert.ok(readRecord(`pending-rpc-${outcome}`).sent.includes(inputId(followup)));
+      await stream(providers, { messages: [task, followup] }, { sessionId: `pending-rpc-${outcome}` });
+      assert.equal(sentParams(dir, 'turn/start').length, 1);
+      assert.equal(sentParams(dir, 'turn/steer').length, 1);
+      assert.equal(deliveries(dir, followup.content), 1);
+    });
+  }, TIMEOUT);
+}
+
 // Consumer-only double: native projection is tested in client.test.mjs; these snapshots match its public contract.
 async function progressConsumer({ initial = {}, updates = [], finalText = '{"ok":true}', onProgress } = {}) {
   const dir = mkdtempSync(join(tmpdir(), 'codex-progress-consumer-'));

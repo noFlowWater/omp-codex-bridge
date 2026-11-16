@@ -16,6 +16,8 @@ OMP task/session names are copied to native thread names on the next request. Ch
 
 Running-turn steering requires OMP's `providers.openaiLiveSteering` setting. With it disabled, a message is queued for the next native turn. Installation does not enable this setting.
 
+Live follow-ups carry only messages and the expected active turn ID. Inherited effort, output schema and processing tier are not changes to the running turn; changed settings apply when the next turn starts. Native admission acknowledges delivery, not task completion. A follow-up rejected before admission stays with OMP for the next boundary; an uncertain native admission is never automatically replayed.
+
 ### Model selection
 
 `codex-bridge/default` uses Codex's configured default model. Explicit profiles use `codex-bridge/<native-model>`, for example `codex-bridge/gpt-6.1-sol`.

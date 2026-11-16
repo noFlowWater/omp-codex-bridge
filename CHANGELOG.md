@@ -1,5 +1,10 @@
 # Changelog
 
+## 0.7.0 — 2026-11-17
+
+- Make native `run` start-only and expose explicit direct-tool `steer` with an expected turn ID; active starts never silently become follow-ups.
+- Keep inherited turn-start settings out of live messages, retain admission receipts, and distinguish delivery from task completion.
+
 ## 0.6.4 — 2026-11-17
 
 - Wait for direct native turns in print text/JSON mode so CLI disposal cannot interrupt a merely admitted task; return terminal output once and forward deadline cancellation.

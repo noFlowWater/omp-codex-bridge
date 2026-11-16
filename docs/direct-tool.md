@@ -2,7 +2,7 @@
 
 [Home](../README.md) · [Agent Hub](agent-hub.md)
 
-`codex_bridge` exposes `run`, `fork`, `status`, `cancel` and `shutdown`. Direct-tool threads do not appear in Agent Hub.
+`codex_bridge` exposes `run`, `steer`, `fork`, `status`, `cancel` and `shutdown`. Direct-tool threads do not appear in Agent Hub.
 
 ```json
 {"action":"run","cwd":"/absolute/project","model":"gpt-6.1-sol","prompt":"Inspect the parser without edits."}
@@ -41,10 +41,10 @@ Cancellation during admission is checked before submitting a new turn. If a new 
 
 Continue or cancel a thread owned by the current direct-tool server:
 
-While its turn is running, `run` sends follow-up input with `turn/steer`. Omit `effort`, `outputSchema` and `serviceTier` for that follow-up, even if they match the original request. Those options apply only when starting a new turn after the current turn finishes.
+`run` starts a new turn only. It never converts a start request into live steering. While a turn is running, use `steer` with its exact thread and turn IDs. Steering accepts additional input, not turn-start settings; `effort`, `outputSchema` and `serviceTier` belong to the next `run` after completion. A stale or interrupted target is rejected without starting a replacement turn.
 
 ```json
-{"action":"run","threadId":"<returned-thread-id>","cwd":"/absolute/project","prompt":"Check the error path next."}
+{"action":"steer","threadId":"<returned-thread-id>","turnId":"<active-turn-id>","prompt":"Check the error path next."}
 {"action":"cancel","threadId":"<returned-thread-id>"}
 ```
 

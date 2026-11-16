@@ -146,6 +146,27 @@ export function registerDirectTool(pi: ExtensionAPI, options: { onRateLimits?: (
     }
   }
 
+  async function steer(params: { threadId: string; turnId: string; prompt?: string; input?: unknown[] }, signal?: AbortSignal) {
+    const admissionBarrier = closeBarrier;
+    const active = await getClient();
+    if (admissionBarrier !== closeBarrier || signal?.aborted) throw new Error("Session changed or call cancelled before native steering; nothing was sent");
+    if (!owned.has(params.threadId)) throw Object.assign(new Error("Steering requires a thread owned by this session"), { code: "THREAD_NOT_OWNED", threadId: params.threadId });
+    runsInFlight++;
+    try {
+      const result = await active.steer({ ...params, signal });
+      return client === active ? reported(result.threadId) : summarizeRun(result);
+    } catch (error) {
+      const state = client === active ? reported(params.threadId) : undefined;
+      throw state && error instanceof Error ? Object.assign(error, { codexState: state }) : error;
+    } finally {
+      if (client === active && --runsInFlight === 0) {
+        const threads = [...held];
+        held.clear();
+        for (const threadId of threads) deliver(threadId);
+      }
+    }
+  }
+
   async function fork(params: { threadId: string; lastTurnId?: string; name?: string }) {
     const admissionBarrier = closeBarrier;
     const active = await getClient();
@@ -217,9 +238,9 @@ export function registerDirectTool(pi: ExtensionAPI, options: { onRateLimits?: (
   pi.registerTool({
     name: "codex_bridge",
     label: "Codex bridge agent",
-    description: "Direct native Codex control, outside Agent Hub. For Agent Hub delegation, spawn agent codex-bridge. run starts or continues a locally owned thread; active turns receive steering. fork creates a locally owned direct thread through a finished source boundary (completed, failed or interrupted), preserving source cwd and original history, with no inference; continue via run. Uses parent's cwd unless isolation requested. Inherits native Codex permissions/environment; optional OMP_CODEX_BRIDGE_CONFIG JSON provides operator-set native overrides. Approval requests require explicit user confirmation; unavailable UI declines them. run accepts prompt/native input, effort, outputSchema, optional name and native serviceTier for a new turn only. Omitted serviceTier preserves native defaults; availability, quota use and cost depend on the account/model. Returns bounded execution/activity/plan/file-change metadata. Print text/JSON run waits and returns terminal output; interactive TUI/RPC run returns admission and terminal results arrive as follow-ups. status reads retained state; diagnose inspects native availability. history and details inspect saved native history without ownership/resume/replay. includeDiff explicitly includes bounded native diff which may expose secrets and is not a complete audit. cancel interrupts a locally loaded thread. shutdown closes this session's server.",
+    description: "Direct native Codex control, outside Agent Hub. For Agent Hub delegation, spawn agent codex-bridge. run starts a new turn on a new or locally owned finished thread; it never steers. steer sends prompt/input to an owned active thread and requires its current turnId; a finished or changed turn is refused, never restarted. Start-only cwd/model/effort/outputSchema/name/serviceTier are rejected by steer; use run after completion for next-turn settings. fork creates a locally owned direct thread through a finished source boundary (completed, failed or interrupted), preserving source cwd and original history without inference; continue via run. Uses parent's cwd unless isolation requested. Inherits native Codex permissions/environment; optional OMP_CODEX_BRIDGE_CONFIG JSON provides operator-set native overrides. Approval requests require explicit user confirmation; unavailable UI declines them. Omitted serviceTier preserves native defaults; availability, quota use and cost depend on account/model. Returns bounded execution/activity/plan/file-change metadata. Print text/JSON run waits for terminal output; interactive TUI/RPC run returns admission and terminal results arrive as follow-ups. status reads retained state; diagnose inspects native availability. history and details inspect saved native history without ownership/resume/replay. includeDiff explicitly includes bounded native diff which may expose secrets and is not a complete audit. cancel interrupts a locally loaded thread. shutdown closes this session's server.",
     parameters: z.object({
-      action: z.enum(["run", "fork", "status", "diagnose", "history", "details", "cancel", "shutdown"]),
+      action: z.enum(["run", "steer", "fork", "status", "diagnose", "history", "details", "cancel", "shutdown"]),
       threadId: z.string().min(1).optional(),
       prompt: z.string().min(1).optional(),
       cwd: z.string().min(1).optional(),
@@ -240,7 +261,7 @@ export function registerDirectTool(pi: ExtensionAPI, options: { onRateLimits?: (
       searchTerm: z.string().min(1).optional(),
       includeItems: z.boolean().optional(),
       includeDiff: z.boolean().optional().describe("Explicit bounded native diff; may contain secrets. Never a complete audit."),
-      turnId: z.string().min(1).optional(),
+      turnId: z.string().min(1).optional().describe("Required expected active turn for steer; never starts a replacement turn."),
     }).strict(),
     renderResult(result, options) {
       const value = result.details;
@@ -270,6 +291,14 @@ export function registerDirectTool(pi: ExtensionAPI, options: { onRateLimits?: (
               name: params.name,
               serviceTier: params.serviceTier,
             }, signal, ctx.mode === "json" || ctx.mode === "print");
+            break;
+          case "steer":
+            if (!params.threadId || !params.turnId) throw new Error("steer requires threadId and expected turnId");
+            if (!params.prompt && !params.input?.length) throw new Error("steer requires prompt or input");
+            if (params.cwd !== undefined || params.model !== undefined || params.effort !== undefined || params.outputSchema !== undefined || params.name !== undefined || params.serviceTier !== undefined) {
+              throw new Error("steer accepts only threadId, turnId and prompt/input. Apply settings with run after this turn finishes; nothing was sent.");
+            }
+            result = await steer({ threadId: params.threadId, turnId: params.turnId, prompt: params.prompt, input: params.input }, signal);
             break;
           case "fork":
             if (!params.threadId) throw new Error("fork requires threadId");

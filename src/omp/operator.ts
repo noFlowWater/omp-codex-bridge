@@ -65,7 +65,7 @@ async function readHostSettings(pi: ExtensionAPI, ctx: ExtensionContext) {
         approvedAgentSelectors: { status: "unavailable", reason: "The public extension context exposes no read-only installed-agent model-grant reader. Native model discovery does not grant per-call permission." },
         remedy: "Per-task models need task.perCallModel enabled, an exact installed-agent selector grant, and any task.perCallModelAllow grant. A codex-bridge task.agentModelOverrides entry conflicts with per-call model selection; inspect settings without automatic changes.",
       },
-      note: "Native direct run steers only its locally owned active turn. OMP running-task steering also depends on the host's effective providers.openaiLiveSteering setting.",
+      note: "Native direct run starts a new turn only. Use explicit steer with the locally owned active turn ID for live input. OMP running-task steering also depends on the host's effective providers.openaiLiveSteering setting.",
     };
   } catch (error) {
     return { status: "unavailable", error: errorDetails(error), remedy: "Use OMP's settings UI to inspect effective steering settings; this command writes no settings." };

@@ -248,8 +248,9 @@ export class CodexAppServerClient {
   }
 
 
-  // onThread(threadId) runs once the thread ID is confirmed and before any turn request, so a
-  // caller can record the authoritative native ID first; if it throws, no turn is requested.
+  // Starts a new turn only; active turns require an explicit steer with their expected turn ID.
+  // onThread(threadId) runs once the thread ID is confirmed and before any turn request.
+  // If it throws, no turn is requested.
   async run({ threadId, prompt, input, cwd, model, onThread, sandbox, effort, outputSchema, developerInstructions, serviceTier, signal } = {}) {
     checkSignal(signal);
     input = userInput(prompt, input);
@@ -273,52 +274,48 @@ export class CodexAppServerClient {
         checkSignal(signal);
         if (state.status === 'inProgress' && !state.turnId) await this._reconcile(state);
         checkSignal(signal);
-        if (state.status === 'inProgress' && (effort !== undefined || outputSchema !== undefined || serviceTier != null)) {
-          throw new Error('effort, outputSchema and serviceTier cannot change an active turn through turn/steer. Omit these turn-start options for a live follow-up, or wait for completion before starting a new turn; no input sent');
-        }
         if (state.status === 'inProgress') {
-          await this._steerTurn(state, input);
-        } else {
-          this._resetTurn(state);
-          state.status = 'inProgress';
-          state.requestedReasoningEffort = effort ?? null;
-          state.requestedServiceTier = serviceTier ?? null;
-          this._publish(state);
-          const interrupt = () => {
-            cancellation ??= this.cancel(state.threadId);
-            // The serialized run releases its lock before the cancellation is awaited below.
-            cancellation.catch(() => {});
-          };
-          try {
-            checkSignal(signal);
-            signal?.addEventListener('abort', interrupt, { once: true });
-            await this._request('turn/start', {
-              threadId: state.threadId, input, cwd: directory,
-              ...(model === undefined ? {} : { model }),
-              ...(effort === undefined ? {} : { effort }),
-              // Native serviceTier persists into later turns; serviceTierForTurn is the one-turn override.
-              ...(serviceTier == null ? {} : { serviceTierForTurn: serviceTier }),
-              ...(outputSchema === undefined ? {} : { outputSchema }),
-            }, {
-              state, mutation: true,
-              onResult: (result, request) => {
-                if (!result?.turn?.id) throw new Error('Codex turn/start response has no turn ID');
-                this._applyTurn(state, result.turn);
-                this._confirmOutcome(state, request.id);
-                this._publish(state);
-              },
-            });
-          } catch (error) {
-            if (!error.outcomeUnknown && state.status === 'inProgress' && !state.turnId) {
-              state.status = 'failed';
-              state.error = error.message;
-              // The caller's rejection reports this unadmitted turn; no terminal notification duplicates it.
-              this._publish(state, true);
-            }
-            throw error;
-          } finally {
-            signal?.removeEventListener('abort', interrupt);
+          throw new Error(`Thread ${state.threadId} already has an active turn; use steer with its turn ID or wait for completion; no input sent`);
+        }
+        this._resetTurn(state);
+        state.status = 'inProgress';
+        state.requestedReasoningEffort = effort ?? null;
+        state.requestedServiceTier = serviceTier ?? null;
+        this._publish(state);
+        const interrupt = () => {
+          cancellation ??= this.cancel(state.threadId);
+          // The serialized run releases its lock before the cancellation is awaited below.
+          cancellation.catch(() => {});
+        };
+        try {
+          checkSignal(signal);
+          signal?.addEventListener('abort', interrupt, { once: true });
+          await this._request('turn/start', {
+            threadId: state.threadId, input, cwd: directory,
+            ...(model === undefined ? {} : { model }),
+            ...(effort === undefined ? {} : { effort }),
+            // Native serviceTier persists into later turns; serviceTierForTurn is the one-turn override.
+            ...(serviceTier == null ? {} : { serviceTierForTurn: serviceTier }),
+            ...(outputSchema === undefined ? {} : { outputSchema }),
+          }, {
+            state, mutation: true,
+            onResult: (result, request) => {
+              if (!result?.turn?.id) throw new Error('Codex turn/start response has no turn ID');
+              this._applyTurn(state, result.turn);
+              this._confirmOutcome(state, request.id);
+              this._publish(state);
+            },
+          });
+        } catch (error) {
+          if (!error.outcomeUnknown && state.status === 'inProgress' && !state.turnId) {
+            state.status = 'failed';
+            state.error = error.message;
+            // The caller's rejection reports this unadmitted turn; no terminal notification duplicates it.
+            this._publish(state, true);
           }
+          throw error;
+        } finally {
+          signal?.removeEventListener('abort', interrupt);
         }
         return this._threadSnapshot(state);
       } catch (error) {
@@ -478,7 +475,8 @@ export class CodexAppServerClient {
   }
 
   // Steers only the named active turn; a finished or different turn is refused (no new turn starts).
-  async steer({ threadId, turnId, prompt, input, serviceTier } = {}) {
+  async steer({ threadId, turnId, prompt, input, serviceTier, signal } = {}) {
+    checkSignal(signal);
     nonempty(threadId, 'threadId');
     nonempty(turnId, 'turnId');
     if (serviceTier != null) throw new Error('serviceTier cannot change an active turn through turn/steer');
@@ -489,7 +487,14 @@ export class CodexAppServerClient {
       if (state.outcomeUnknown || !state.attached || state.status !== 'inProgress' || state.turnId !== turnId) {
         throw new Error(`Turn ${turnId} is not the active turn of thread ${threadId}; not steered`);
       }
-      await this._steerTurn(state, input);
+      checkSignal(signal);
+      try {
+        await this._steerTurn(state, input);
+      } catch (error) {
+        const failure = withThread(error, threadId);
+        failure.turnId ??= turnId;
+        throw failure;
+      }
       return this._threadSnapshot(state);
     });
   }

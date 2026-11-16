@@ -239,17 +239,25 @@ export function createCodexBridgeProvider({ EventStream, stateDir, onRequest, on
       if (!claim) { await new Promise(resolveDelay => setTimeout(resolveDelay, 50)); continue; }
       let ids, input, text;
       try {
-        ids = claim.messages.map(inputId);
-        input = claim.messages.flatMap(inputBlocks);
-        text = claim.messages.map(textOf).filter(part => part.trim()).join('\n\n');
+        const fresh = claim.messages.filter(message => !session.sent.has(inputId(message)));
+        ids = fresh.map(inputId);
+        input = fresh.flatMap(inputBlocks);
+        text = fresh.map(textOf).filter(part => part.trim()).join('\n\n');
       } catch (error) {
         // OMP owns undeliverable input again; every claimed batch must settle exactly once.
         claim.reject();
         note(`steering rejected before submission: ${error.message}`);
         continue;
       }
+      // Requeued accepted claims still need an acknowledgement, never another native send.
+      if (!ids.length) { claim.accept(); continue; }
       // A full record cannot hold the steer: OMP delivers it with the next request, which then stops.
-      if (!input.length || signal.aborted || session.sent.size + ids.length > SENT_LIMIT) { claim.reject(); continue; }
+      if (!input.length || signal.aborted || client.snapshot(threadId)?.turnId !== turnId
+        || client.snapshot(threadId)?.status !== 'inProgress' || session.sent.size + ids.length > SENT_LIMIT) {
+        claim.reject();
+        note('steering deferred to the next turn; active turn ended or delivery was cancelled');
+        return;
+      }
       // Recorded first: if OMP requeues this input after an abort, it is not sent again.
       for (const id of ids) session.sent.add(id);
       try { saveSession(stateDir, session); } catch {
@@ -272,6 +280,7 @@ export function createCodexBridgeProvider({ EventStream, stateDir, onRequest, on
           // ponytail: if this rewrite fails, only the on-disk record still lists the unsent steer; a later revive then refuses it as "already submitted" (fail closed, never a duplicate).
           try { saveSession(stateDir, session); } catch { /* fail closed: see above */ }
           claim.reject();
+          note(`steering deferred to the next turn: ${error.message}`);
         }
       }
     }
@@ -368,10 +377,14 @@ export function createCodexBridgeProvider({ EventStream, stateDir, onRequest, on
       if (signal?.aborted) void interrupt();
       else signal?.addEventListener('abort', interrupt, { once: true, signal: ended.signal });
     });
-    void steerInputs(session, options.liveSteering, ended.signal, note).catch(() => {});
+    const steering = steerInputs(session, options.liveSteering, ended.signal, note).catch(() => {});
 
     try {
       const result = await Promise.race([settled(client, threadId, turnId, ended.signal), interrupted.then(() => undefined)]);
+      // Host collects claim acknowledgements when this stream ends. Settle pending delivery first,
+      // including an RPC whose acknowledgement raced native completion or cancellation.
+      ended.abort();
+      await steering;
       if (progress) stream.push({ type: 'thinking_end', contentIndex: 0, content: progress.thinking, partial: output });
       return { result, abortDetail };
     } finally {
