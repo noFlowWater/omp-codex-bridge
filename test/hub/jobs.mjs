@@ -156,7 +156,7 @@ try {
   await choose(1);
   await until("finished boundary selector", async () => (await text()).includes("Continue through a finished native turn"));
   await keys("enter");
-  await until("explicit continuation question", async () => (await text()).includes("Continue in a new Codex Hub child"));
+  await until("explicit continuation question", async () => (await text()).includes("Question for a new Codex Hub child"));
   assert.equal(mutations().length, beforeHistory, "history and boundary inspection submit no native mutation");
   await capture("history question before explicit submission");
   await enter(QUESTION);

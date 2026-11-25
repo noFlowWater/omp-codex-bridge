@@ -1,5 +1,12 @@
 # Changelog
 
+## 0.9.1 — 2026-11-25
+
+- Report the first turn of a resumed or forked thread as token usage unavailable instead of letting OMP's numeric placeholder read as zero; cards and a notice say so.
+- Keep history continuation details readable at 80 columns: source and directory move into option descriptions and the question placeholder.
+- Label finished turns with their time and status; the turn ID stays in the option description.
+- Doctor distinguishes unset native config (Codex default) from a failed read and points to `/codex status` for applied values.
+
 ## 0.9.0 — 2026-11-25
 
 - Support OMP 19.2.0: render operator and direct-tool cards with native pi-tui `card`/`md` nodes; the removed pi-tui component import stopped the extension from loading.

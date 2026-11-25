@@ -682,6 +682,11 @@ export function createCodexBridgeProvider({ EventStream, stateDir, onRequest, on
     const { result, abortDetail } = await watchTurn(stream, output, session, options);
     if (!result) return finish('aborted', `${abortDetail}; native completion is not confirmed`);
     applyUsage(output, result);
+    // OMP usage fields are numeric-only; a resumed or forked thread has no native baseline for the
+    // first turn, so say the zeros mean "not reported" instead of letting them pass as real counts.
+    if (!result.turnUsage && result.tokenUsageTurnId === turnId) {
+      try { onNotice?.(`Codex turn ${clip(turnId, 80)} token usage is unavailable (resumed thread without a native baseline); OMP shows 0 as a placeholder. Native context: ${result.tokenUsage?.last?.totalTokens ?? 'unknown'} tokens.`, 'info'); } catch { /* UI only. */ }
+    }
     if (result.status === 'completed') return complete(result.text ?? '', turnId, result);
     const detail = result.error ? `: ${result.error}` : '';
     if (result.status === 'interrupted') {

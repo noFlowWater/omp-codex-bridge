@@ -45,10 +45,11 @@ test('history continuation pages finished boundaries and cancels without sending
     let turnPage = 0;
     const ctx = { cwd, ui: {
       async select(title, choices) {
-        if (title.startsWith('Source')) return 'Continue in Agent Hub';
+        if (title.startsWith('Saved thread')) return 'Continue in Agent Hub';
         if (!title.startsWith('Continue through')) return choices[0];
         turnPage++;
-        return turnPage === 1 ? 'Next page' : submit ? choices[0] : 'Cancel';
+        // The host returns the chosen option's label.
+        return turnPage === 1 ? 'Next page' : submit ? choices[0].label : 'Cancel';
       },
       async input() { return 'explicit question'; },
     } };
@@ -73,6 +74,23 @@ test('operator summary preserves diagnostic failures, quota warnings and termina
   for (const text of ['Not signed in', 'unavailable', 'server offline', 'Check PATH', '58% used', 'resets', 'spend control reached', 'ordinary usage is not allowed']) assert.ok(card.includes(text), text);
   assert.doesNotMatch(card, /\u001b/);
   assert.doesNotMatch(operatorCard('doctor', {}), /undefined|NaN|Invalid Date/);
+});
+
+test('doctor separates unset native config from a failed read, and cards never report missing turn usage as zero', () => {
+  const unset = operatorCard('doctor', { permissions: { status: 'available', value: { config: { status: 'available', value: { sandboxMode: null, approvalPolicy: null, model: null } } } } });
+  assert.match(unset, /not set \(Codex default\)/);
+  assert.match(unset, /\/codex status/);
+  const failed = operatorCard('doctor', { permissions: { status: 'unavailable', value: { config: { status: 'unavailable' } } } });
+  assert.doesNotMatch(failed, /not set/);
+  const resumed = summarizeRun({ threadId: 't', turnId: 'u', status: 'completed', tokenUsage: { last: { totalTokens: 16948 } }, tokenUsageTurnId: 'u', turnUsage: null });
+  assert.equal(resumed.usage, null);
+  assert.equal(resumed.usageUnavailable, true);
+  assert.match(operatorCard('status', resumed), /Tokens.*Unavailable/);
+  assert.doesNotMatch(operatorCard('status', resumed), /Tokens\s*\|\s*0\b/);
+  // A follow-up turn awaiting its first usage report still holds the previous turn's counters.
+  const pending = summarizeRun({ threadId: 't', turnId: 'next', status: 'inProgress', tokenUsage: { last: { totalTokens: 150 } }, tokenUsageTurnId: 'u', turnUsage: null });
+  assert.equal(pending.usageUnavailable, false);
+  assert.doesNotMatch(operatorCard('status', pending), /Unavailable/);
 });
 
 test('operator renderer summarizes doctor and empty status while expanded and JSON views keep native data', async () => {
@@ -149,7 +167,7 @@ test('history continues only after an explicit question and passes the finished 
     const starts = [];
     await withOperator({ ui: {
       select: async (title, choices) => title.startsWith('Codex saved history') ? choices[0]
-        : title.startsWith('Source') ? 'Continue in Agent Hub' : choices[0],
+        : title.startsWith('Saved thread') ? 'Continue in Agent Hub' : choices[0].label ?? choices[0],
       input: async () => question,
     }, continueHistory: () => async (source, text) => {
       starts.push({ source, text });
@@ -517,7 +535,8 @@ test('interactive history pages with filters, views details, and cancels without
     assert.match(screens[0].choices[0], /saved operator first/);
     assert.ok(screens[0].choices[0].endsWith('· .'));
     assert.ok(!screens[0].choices[0].includes('saved-one'));
-    assert.ok(screens.some(screen => screen.title.includes('Source saved-one') && screen.title.includes(cwd)));
+    const sourceScreen = screens.find(screen => screen.title.startsWith('Saved thread'));
+    assert.ok(sourceScreen.choices.some(choice => choice.description?.includes('saved-one')));
     assert.ok(screens[1].choices.includes('Previous page'));
     for (const entry of trace().filter(entry => entry.message?.method === 'thread/list')) {
       assert.equal(entry.message.params.searchTerm, 'saved operator');

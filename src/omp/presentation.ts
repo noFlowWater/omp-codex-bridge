@@ -62,6 +62,7 @@ function threadCard(value: unknown): string {
   ];
   if (state.commandFailure) rows.push(["Command failed", `exit ${screenLine(failure.exitCode)}`]);
   if (typeof tokens === "number") rows.push(["Tokens", tokens.toLocaleString("en-US")], ["Cost", "Not reported"]);
+  else if (state.usageUnavailable || (state.tokenUsage && !state.turnUsage && state.tokenUsageTurnId === state.turnId)) rows.push(["Tokens", "Unavailable for this turn (resumed thread without a native baseline)"]);
   const blocks = [metadata(rows)];
   if (state.outcomeUnknown || data.outcomeUnknown) blocks.push("Outcome unknown. Do not automatically retry, resume or replay.");
   if (data.forked) blocks.push("Created a direct-tool thread. No inference started.");
@@ -85,16 +86,22 @@ function doctorCard(result: Record<string, unknown>): string {
   if (auth.authenticated === true) login = "Signed in";
   if (auth.authenticated === false) login = "Not signed in";
   if (auth.mode) login += ` · ${screenLine(auth.mode)}`;
+  // A readable config without a value means Codex applies its own default, not a failed check.
+  const configured = (value: unknown) => config.status !== "available" ? "unknown"
+    : value == null ? "not set (Codex default)" : screenLine(value);
   const rows: [string, unknown][] = [
     ["Versions", `OMP ${screenLine(result.ompVersion)} · ${screenLine(objectRecord(result.executable).version)}`],
     check("connection"),
     ["Login", login],
-    check("permissions", `${screenLine(settings.sandboxMode)} · approval=${screenLine(settings.approvalPolicy)} · source=${screenLine(result.permissionSource)}`),
-    ["Configured", `${screenLine(settings.model)} · effort=${screenLine(settings.modelReasoningEffort)}`],
+    check("permissions", `${configured(settings.sandboxMode)} · approval=${configured(settings.approvalPolicy)} · source=${screenLine(result.permissionSource)}`),
+    ["Configured", `${configured(settings.model)} · effort=${configured(settings.modelReasoningEffort)}`],
     ["Cost", "Not reported · native account usage applies; OMP free/$0 is a placeholder"],
   ];
   for (const name of ["auth", "executable", "models", "steering", "rateLimits"]) {
     if (objectRecord(result[name]).status !== "available") rows.push(check(name));
+  }
+  if (config.status === "available" && [settings.sandboxMode, settings.approvalPolicy, settings.model].some(value => value == null)) {
+    rows.push(["Effective values", "Unset values use Codex defaults; a running thread's `/codex status` shows the applied sandbox, approval and model."]);
   }
   if (objectRecord(result.hubControls).status !== "available") rows.push(["Agent Hub controls", check("hubControls")[1]]);
   for (const name of ["primary", "secondary"]) {
@@ -240,7 +247,7 @@ export type RunSnapshot = {
   threadId: string; turnId: string | null; status: string; name?: string | null;
   text?: string; textTruncated?: boolean; error?: string | null; outcomeUnknown?: boolean;
   model?: string | null; execution?: unknown; latestActivity?: unknown; latestPlan?: unknown;
-  fileChanges?: unknown; commandFailure?: unknown; turnUsage?: unknown;
+  fileChanges?: unknown; commandFailure?: unknown; turnUsage?: unknown; tokenUsage?: unknown; tokenUsageTurnId?: string | null;
 };
 
 // The explicit status/details response retains native data. Automatic admissions/follow-ups stay small.
@@ -267,6 +274,7 @@ export function summarizeRun(state: RunSnapshot) {
     name: utf8Preview(state.name, 256).text || null,
     outcomeUnknown: Boolean(state.outcomeUnknown), model: utf8Preview(state.model, 256).text || null,
     execution, latestActivity, latestPlan, fileChanges, commandFailure, usage, cost: null,
+    usageUnavailable: !usage && Boolean(state.tokenUsage) && state.tokenUsageTurnId === state.turnId,
     fileChangesOmitted: changes.length - fileChanges.length,
     error: error && (error.truncated ? `${error.text}…` : error.text), text: text.text,
     truncated: text.truncated || Boolean(state.textTruncated) || Boolean(error?.truncated),

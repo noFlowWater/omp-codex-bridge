@@ -22,15 +22,23 @@ export async function historyDetails(params: HistoryParams, client: CodexAppServ
   };
 }
 
-async function pickFinishedTurn(threadId: string, firstPage: { data: { id: string; status: string }[]; nextCursor?: string | null },
+// OMP draws a dialog title on one row, so details live in option descriptions and the input placeholder.
+const when = (seconds: unknown) => typeof seconds === "number"
+  ? new Date(seconds > 1e12 ? seconds : seconds * 1000).toLocaleString(undefined, { dateStyle: "short", timeStyle: "short" }) : "time unknown";
+
+async function pickFinishedTurn(threadId: string, firstPage: { data: { id: string; status: string; startedAt?: number | null; completedAt?: number | null }[]; nextCursor?: string | null },
   client: CodexAppServerClient, ctx: ExtensionContext) {
   let page = firstPage;
   let cursor: string | undefined;
   const previous: (string | undefined)[] = [];
   for (;;) {
     const turns = page.data.filter(turn => NATIVE_TERMINAL.has(turn.status));
-    const labels = turns.map((turn, index) => `${index + 1}. ${pickerLabel(turn.id, 512)} · ${pickerLabel(turn.status, 512)}`);
-    const choice = await ctx.ui.select("Continue through a finished native turn", [...labels,
+    const options = turns.map((turn, index) => ({
+      label: `${index + 1}. ${when(turn.completedAt ?? turn.startedAt)} · ${pickerLabel(turn.status, 32)}`,
+      description: `turn ${pickerLabel(turn.id, 512)}`,
+    }));
+    const labels = options.map(option => option.label);
+    const choice = await ctx.ui.select("Continue through a finished native turn", [...options,
       ...(previous.length ? ["Previous page"] : []), ...(page.nextCursor ? ["Next page"] : []), "Cancel"]);
     if (choice === undefined || choice === "Cancel") return;
     if (choice === "Next page") {
@@ -38,7 +46,7 @@ async function pickFinishedTurn(threadId: string, firstPage: { data: { id: strin
       previous.push(cursor);
       cursor = page.nextCursor;
     } else if (choice === "Previous page") cursor = previous.pop();
-    else return turns[labels.indexOf(choice)]?.id;
+    else return turns[labels.indexOf(choice)];
     page = (await client.getThreadDetails(threadId, { limit: 100, cursor })).turns;
   }
 }
@@ -71,24 +79,25 @@ export async function pickHistory(params: HistoryParams, client: CodexAppServerC
     const threadId = page.data[index].id;
     const details = await historyDetails({ threadId, limit: 100 }, client);
     const boundary = details.turns.data.find(turn => NATIVE_TERMINAL.has(turn.status))?.id;
-    const action = await ctx.ui.select(
-      `Source ${pickerLabel(threadId, 512)} | name ${pickerLabel(details.thread.name, 512)} | cwd ${pickerLabel(details.thread.cwd, 512)}`,
-      ["View details", ...(continueHistory ? ["Continue in Agent Hub"] : []), "Fork as new direct thread", "Cancel"]);
+    const action = await ctx.ui.select(`Saved thread ${pickerLabel(details.thread.name || threadId, 80)}`, [
+      { label: "View details", description: `source ${pickerLabel(threadId, 512)}` },
+      ...(continueHistory ? [{ label: "Continue in Agent Hub", description: `directory ${pickerLabel(details.thread.cwd, 512)}` }] : []),
+      { label: "Fork as new direct thread", description: "no inference starts" }, "Cancel"]);
     if (action === "View details") return details;
     if (action === "Continue in Agent Hub" && continueHistory) {
-      const lastTurnId = await pickFinishedTurn(threadId, details.turns, client, ctx);
-      if (!lastTurnId) return { readOnly: true, cancelled: true };
-      const source = historySource({ threadId, lastTurnId, cwd: details.thread.cwd });
-      const question = await ctx.ui.input(`Continue in a new Codex Hub child\nSource ${pickerLabel(threadId, 512)} · turn ${pickerLabel(source.lastTurnId, 512)}\nDirectory ${pickerLabel(source.cwd, 512)}\nSubmitting your question starts the new task; the source stays unchanged.`);
+      const turn = await pickFinishedTurn(threadId, details.turns, client, ctx);
+      if (!turn) return { readOnly: true, cancelled: true };
+      const source = historySource({ threadId, lastTurnId: turn.id, cwd: details.thread.cwd });
+      const question = await ctx.ui.input("Question for a new Codex Hub child",
+        `Continues from ${when(turn.completedAt ?? turn.startedAt)} in ${pickerLabel(source.cwd, 512)}; submitting starts the task, the source stays unchanged.`);
       if (!question?.trim()) return { readOnly: true, cancelled: true };
       try { return { readOnly: false, continued: true, source, child: await continueHistory(source, question) }; }
       catch (error) { return { readOnly: false, error, draft: question }; }
     }
     if (action !== "Fork as new direct thread") return { readOnly: true, cancelled: true };
     if (!boundary) throw new Error("Source has no finished turn boundary to fork");
-    const confirm = await ctx.ui.select(
-      `Fork ${pickerLabel(threadId, 512)} through finished turn ${pickerLabel(boundary, 512)}?\nCreates a direct-tool thread outside Agent Hub. Source stays unchanged. No inference starts.`,
-      ["Cancel", "Confirm fork"]);
+    const confirm = await ctx.ui.select(`Fork through finished turn ${pickerLabel(boundary, 512)}?`, [
+      "Cancel", { label: "Confirm fork", description: "Creates a direct-tool thread outside Agent Hub. Source stays unchanged. No inference starts." }]);
     if (confirm !== "Confirm fork") return { readOnly: true, cancelled: true };
     return fork({ threadId, lastTurnId: boundary });
   }

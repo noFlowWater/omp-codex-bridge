@@ -6,7 +6,7 @@
 
 Run [Codex](https://github.com/openai/codex) workers in [Oh My Pi](https://github.com/can1357/oh-my-pi)'s Agent Hub.
 
-Current release: [v0.9.0](https://github.com/noFlowWater/omp-codex-bridge/releases/tag/v0.9.0). See the [changelog](CHANGELOG.md) for changes and [installation guide](docs/installation.md) for upgrades.
+Current release: [v0.9.1](https://github.com/noFlowWater/omp-codex-bridge/releases/tag/v0.9.1). See the [changelog](CHANGELOG.md) for changes and [installation guide](docs/installation.md) for upgrades.
 
 The bridge connects OMP to `codex app-server --stdio`. Codex handles inference, tools, authentication and persistent threads. OMP handles delegation, live progress, steering and results.
 
@@ -25,7 +25,7 @@ Requires **OMP 19.2.0** and an authenticated **Codex CLI 0.172.0** on `PATH`. Th
 
 ```sh
 codex login
-git clone --branch v0.9.0 https://github.com/noFlowWater/omp-codex-bridge.git
+git clone --branch v0.9.1 https://github.com/noFlowWater/omp-codex-bridge.git
 cd omp-codex-bridge
 omp plugin install .
 ```

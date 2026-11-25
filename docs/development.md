@@ -27,7 +27,7 @@ CI pins OMP 19.2.0 and runs the unit and isolated package/Hub checks without cre
 
 ## Releases
 
-The package version, top changelog entry, README release link and installation tag must identify the same release (currently **0.9.0**). Check both stock-host and patched-host CI before tagging the reviewed commit. Push an annotated `vVERSION` tag without moving existing tags, then publish the matching GitHub release with compatibility requirements, host-patch setup and known limits. GitHub source archives include the packaged host patch; no compiled host binary is distributed by this project. Local package installs follow their checkout and need an OMP restart after updates.
+The package version, top changelog entry, README release link and installation tag must identify the same release (currently **0.9.1**). Check both stock-host and patched-host CI before tagging the reviewed commit. Push an annotated `vVERSION` tag without moving existing tags, then publish the matching GitHub release with compatibility requirements, host-patch setup and known limits. GitHub source archives include the packaged host patch; no compiled host binary is distributed by this project. Local package installs follow their checkout and need an OMP restart after updates.
 
 ## JavaScript maintenance conventions
 

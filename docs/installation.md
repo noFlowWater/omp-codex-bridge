@@ -12,10 +12,10 @@ Command-driven Hub management and saved-history continuation additionally requir
 
 ## Install
 
-The current release is **v0.9.0**. Pin it when installing:
+The current release is **v0.9.1**. Pin it when installing:
 
 ```sh
-git clone --branch v0.9.0 https://github.com/noflowwater/omp-codex-bridge.git
+git clone --branch v0.9.1 https://github.com/noflowwater/omp-codex-bridge.git
 cd omp-codex-bridge
 omp plugin install .
 ```
@@ -26,7 +26,7 @@ Local installation links the whole package into OMP's user plugin directory. Kee
 
 ```sh
 git fetch origin --tags
-git switch --detach v0.9.0
+git switch --detach v0.9.1
 omp plugin install .
 ```
 
