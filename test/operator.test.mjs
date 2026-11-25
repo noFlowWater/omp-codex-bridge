@@ -8,8 +8,9 @@ import { fileURLToPath } from 'node:url';
 import * as zod from 'zod';
 import { CodexAppServerClient } from '../src/codex/client.mjs';
 
-mock.module('@oh-my-pi/pi-tui/chat/custom-message', () => ({
-  CustomMessageComponent: class { constructor(message) { this.message = message; this.text = `${message.customType}\n${message.content}`; } },
+// OMP 19 renders extension output as pi-tui nodes; the double flattens a card to "head\nmarkdown".
+mock.module('@oh-my-pi/pi-tui/jsx-runtime', () => ({
+  jsx: (type, props) => ({ type, props, text: type === 'card' ? `${props.head}\n${props.children.text}` : props.text }),
 }));
 
 // The public host setting reader is a boundary; no real OMP configuration is loaded or written.

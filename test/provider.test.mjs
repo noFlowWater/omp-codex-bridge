@@ -70,8 +70,8 @@ process.env.OMP_CODEX_BRIDGE_STATE_DIR = STATE_DIR;
 mock.module('@oh-my-pi/pi-coding-agent', () => ({
   getAgentDir: () => STATE_DIR,
 }));
-mock.module('@oh-my-pi/pi-tui/chat/custom-message', () => ({
-  CustomMessageComponent: class { constructor(message) { this.message = message; this.text = `${message.customType}\n${message.content}`; } },
+mock.module('@oh-my-pi/pi-tui/jsx-runtime', () => ({
+  jsx: (type, props) => ({ type, props, text: type === 'card' ? `${props.head}\n${props.children.text}` : props.text }),
 }));
 afterAll(() => {
   rmSync(STATE_DIR, { recursive: true, force: true });

@@ -4,7 +4,7 @@
 
 ## Requirements
 
-- Compatibility target: OMP 18.21.0 and Codex CLI 0.169.0. Protocol doubles exercise native contracts; real-server startup, diagnostics, permissions and naming checks run without model inference. Re-run the [development checks](development.md) after upgrades.
+- Compatibility target: OMP 19.2.0 and Codex CLI 0.172.0. Protocol doubles exercise native contracts; real-server startup, diagnostics, permissions and naming checks run without model inference. Re-run the [development checks](development.md) after upgrades.
 - Codex CLI on `PATH`, authenticated with `codex login`. OMP uses its embedded Bun runtime to load the plugin.
 - Development: Node.js 20.19 or newer and Bun 1.4.2 or newer. The standalone client also supports Node.js 20.19+.
 
@@ -12,10 +12,10 @@ Command-driven Hub management and saved-history continuation additionally requir
 
 ## Install
 
-The current release is **v0.8.0**. Pin it when installing:
+The current release is **v0.9.0**. Pin it when installing:
 
 ```sh
-git clone --branch v0.8.0 https://github.com/noflowwater/omp-codex-bridge.git
+git clone --branch v0.9.0 https://github.com/noflowwater/omp-codex-bridge.git
 cd omp-codex-bridge
 omp plugin install .
 ```
@@ -26,7 +26,7 @@ Local installation links the whole package into OMP's user plugin directory. Kee
 
 ```sh
 git fetch origin --tags
-git switch --detach v0.8.0
+git switch --detach v0.9.0
 omp plugin install .
 ```
 

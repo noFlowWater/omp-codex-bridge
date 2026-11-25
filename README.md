@@ -6,7 +6,7 @@
 
 Run [Codex](https://github.com/openai/codex) workers in [Oh My Pi](https://github.com/can1357/oh-my-pi)'s Agent Hub.
 
-Current release: [v0.8.0](https://github.com/noFlowWater/omp-codex-bridge/releases/tag/v0.8.0). See the [changelog](CHANGELOG.md) for changes and [installation guide](docs/installation.md) for upgrades.
+Current release: [v0.9.0](https://github.com/noFlowWater/omp-codex-bridge/releases/tag/v0.9.0). See the [changelog](CHANGELOG.md) for changes and [installation guide](docs/installation.md) for upgrades.
 
 The bridge connects OMP to `codex app-server --stdio`. Codex handles inference, tools, authentication and persistent threads. OMP handles delegation, live progress, steering and results.
 
@@ -21,11 +21,11 @@ The bridge connects OMP to `codex app-server --stdio`. Codex handles inference, 
 
 ## Quick start
 
-Requires **OMP 18.21.0** and an authenticated **Codex CLI 0.169.0** on `PATH`. These are the current compatibility targets.
+Requires **OMP 19.2.0** and an authenticated **Codex CLI 0.172.0** on `PATH`. These are the current compatibility targets.
 
 ```sh
 codex login
-git clone --branch v0.8.0 https://github.com/noFlowWater/omp-codex-bridge.git
+git clone --branch v0.9.0 https://github.com/noFlowWater/omp-codex-bridge.git
 cd omp-codex-bridge
 omp plugin install .
 ```
@@ -62,7 +62,7 @@ Start with `/codex doctor` to check the connection without model inference. Use 
 
 Add `--json` immediately after a subcommand for raw data. Closing a picker produces `Cancelled.` and submits no work.
 
-`/codex jobs` lists current direct workers and offers details, messages and interruption without copying IDs. Hub controls and **Continue in Agent Hub** require the host API supplied by the [optional OMP patch](patches/README.md). Stock OMP 18.21.0 keeps direct-worker controls and existing Agent Hub delegation; doctor reports the missing API. The plugin never silently replaces your host.
+`/codex jobs` lists current direct workers and offers details, messages and interruption without copying IDs. Hub controls and **Continue in Agent Hub** require the host API supplied by the [optional OMP patch](patches/README.md). Stock OMP 19.2.0 keeps direct-worker controls and existing Agent Hub delegation; doctor reports the missing API. The plugin never silently replaces your host.
 
 Hub workers use `codex-bridge/default` unless a native model selector is chosen. Per-task model selection requires OMP's operator grants. Running-turn steering requires `providers.openaiLiveSteering`; otherwise messages wait for the next turn. See [Agent Hub](docs/agent-hub.md).
 

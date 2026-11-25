@@ -1,5 +1,5 @@
 import type { ExtensionAPI, ExtensionContext } from "@oh-my-pi/pi-coding-agent";
-import { CustomMessageComponent } from "@oh-my-pi/pi-tui/chat/custom-message";
+import { jsx } from "@oh-my-pi/pi-tui/jsx-runtime";
 import type { CodexAppServerClient } from "../codex/client.mjs";
 import { operatorContent, utf8Preview } from "./presentation.ts";
 import { pickJobs, type JobsAccess } from "./jobs.ts";
@@ -123,6 +123,9 @@ History offers inspection, a confirmed direct fork, or a new Hub child when supp
 
 Advanced options: docs/direct-tool.md. Requested diffs may contain secrets.`;
 
+/** OMP's themed card around native Markdown; shared by operator messages and direct-tool results. */
+export const messageCard = (head: string, text: string) => jsx("card", { head, children: jsx("md", { text }) });
+
 export function registerOperator(pi: ExtensionAPI, access: {
   getClient(): Promise<CodexAppServerClient>;
   status(threadId?: string): Promise<unknown>;
@@ -132,19 +135,14 @@ export function registerOperator(pi: ExtensionAPI, access: {
 }) {
   pi.registerMessageRenderer<{ label: string; raw: boolean; result?: unknown }>("codex-bridge-operator", (message, options) => {
     const details = message.details;
-    if (details?.label === "help") return new CustomMessageComponent({ ...message, customType: "Codex commands" });
+    if (details?.label === "help") return messageCard("Codex commands", String(message.content));
     if (!details || details.raw) return undefined;
     if (typeof message.content !== "string") return undefined;
     const result = details.result ?? JSON.parse(message.content.slice(message.content.indexOf("\n") + 1));
-    if (options.expanded) return details.result === undefined ? undefined : new CustomMessageComponent({ ...message,
-      content: `${message.content.slice(0, message.content.indexOf("\n"))}\n${JSON.stringify(result, null, 2)}`,
-    });
+    const title = message.content.slice(0, message.content.indexOf("\n"));
+    if (options.expanded) return details.result === undefined ? undefined : messageCard(title, `\`\`\`json\n${JSON.stringify(result, null, 2)}\n\`\`\``);
     const summary = operatorContent(details.label, result);
-    if (summary === undefined) return undefined;
-    // Reuse OMP's frame, theme and native Markdown tables without nesting custom renderers.
-    return new CustomMessageComponent({ ...message,
-      customType: message.content.slice(0, message.content.indexOf("\n")), content: summary,
-    });
+    return summary === undefined ? undefined : messageCard(title, summary);
   });
   function report(title: string, label: string, result: unknown, raw: boolean, ctx: ExtensionContext) {
     const summary = ctx.hasUI && !raw ? operatorContent(label, result) : undefined;

@@ -196,7 +196,8 @@ async function tui() {
     if (mode === "tui-operator") {
       await enter("/model");
       await until("model picker opened", async () => /free per M|Search models/i.test(await painted()));
-      await ask({ op: "paste", text: "codex-bridge" });
+      // OMP 19.2's picker searches typed input; a bracketed paste does not reach its query.
+      await ask({ op: "bytes", data: "codex-bridge" });
       await until("model picker discloses unknown native cost", async () => {
         const text = await painted();
         return text.includes("codex-bridge") && text.includes("cost unknown");

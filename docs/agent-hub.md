@@ -12,7 +12,7 @@ Open Agent Hub with `Alt+A` or double left-arrow on an empty editor. Focus the c
 
 Run `/codex` diagnostics and inspection commands in the main session. From a focused child, press double left-arrow on an empty editor to return to the main session first.
 
-Hosts exposing `ctx.agents` also support `/codex jobs` for native worker selection and `/codex history` → **Continue in Agent Hub**. Stock OMP 18.21.0 needs the [optional host patch](../patches/README.md) for these command-driven Hub actions; normal assistant delegation already works without it.
+Hosts exposing `ctx.agents` also support `/codex jobs` for native worker selection and `/codex history` → **Continue in Agent Hub**. Stock OMP 19.2.0 needs the [optional host patch](../patches/README.md) for these command-driven Hub actions; normal assistant delegation already works without it.
 
 History continuation creates one fresh child in the current workspace. Choose a finished source turn and enter the new question before submission. Only that question becomes new input; the child provider forks native context once and records its ownership before starting inference. An uncertain fork is retained as an error and never automatically replayed. The source is inspected without resuming it, and the direct-tool client never owns the child's fork.
 
@@ -52,7 +52,7 @@ Model picker labels identify the native model and say `cost unknown`. OMP may st
 
 The [app-server API](https://learn.chatgpt.com/docs/app-server) reports token usage and account limits, not a per-turn billed amount. Its model catalog does not include prices. OMP's zero-valued price fields are placeholders for unavailable pricing, not a claim that execution is free.
 
-OMP 18.21 requires numeric response costs and does not expose unknown billing through its public provider registration API. Its built-in total therefore cannot represent this missing charge. Use the native account dashboard for billing; the bridge's `cost: null` applies to its own result summaries.
+OMP 19.2 requires numeric response costs and does not expose unknown billing through its public provider registration API. Its built-in total therefore cannot represent this missing charge. Use the native account dashboard for billing; the bridge's `cost: null` applies to its own result summaries.
 
 The [official pricing page](https://learn.chatgpt.com/docs/pricing) publishes token-based credit rates and links to API pricing. Those rates can support estimates; included subscription usage, purchased credits, processing tier and plan-specific billing determine the actual charge. Check the native usage dashboard for account usage.
 

@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.9.0 — 2026-11-25
+
+- Support OMP 19.2.0: render operator and direct-tool cards with native pi-tui `card`/`md` nodes; the removed pi-tui component import stopped the extension from loading.
+- Support Codex CLI 0.172.0: honor answer moderation display instructions and withhold hidden, blocked or unreadable answers from every bridge surface.
+- Port the optional Hub host patch to OMP v19.2.0 (`patches/omp-v19.2-hub-api.patch`) and pin CI to the v19.2.0 release asset and embedded native addon layout.
+
 ## 0.8.0 — 2026-11-17
 
 - Add `/codex jobs` with native worker selection, details, messages and targeted interruption; retain failed drafts and reject stale turn selections.

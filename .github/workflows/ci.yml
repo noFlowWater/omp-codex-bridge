@@ -26,9 +26,9 @@ jobs:
         run: |
           mkdir -p "$RUNNER_TEMP/bin"
           curl --fail --location --silent --show-error \
-            https://github.com/can1357/oh-my-pi/releases/download/v18.21.0/omp-linux-x64 \
+            https://github.com/can1357/oh-my-pi/releases/download/v19.2.0/omp-linux-x64 \
             --output "$RUNNER_TEMP/bin/omp"
-          echo "b00bd7ecdf7ad24d103ea56850969c9a8cc050527e1b9db64c25bbbf13fbedcc  $RUNNER_TEMP/bin/omp" | sha256sum --check
+          echo "74cb641d3fcdc22fa3f2141dafa4e66c9fc581d7d2d71753e690160980472c31  $RUNNER_TEMP/bin/omp" | sha256sum --check
           chmod 755 "$RUNNER_TEMP/bin/omp"
           echo "$RUNNER_TEMP/bin" >> "$GITHUB_PATH"
       - run: bun install --frozen-lockfile
@@ -52,16 +52,16 @@ jobs:
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
           repository: can1357/oh-my-pi
-          ref: 6f03614d761366972e80e84e25d1418ed678d2c7
+          ref: 5c5ecb16fa4903c09a57a84983e482d9c9c2232e
           path: .host-source
           persist-credentials: false
       - name: Build the patched Agent Hub host
         shell: bash
         run: |
-          git -C .host-source apply "$GITHUB_WORKSPACE/patches/omp-v18.21-hub-api.patch"
+          git -C .host-source apply "$GITHUB_WORKSPACE/patches/omp-v19.2-hub-api.patch"
           cd .host-source
           bun install --frozen-lockfile
-          cp "$RUNNER_TEMP/omp-stock-addon/natives/18.21.0"/pi_natives.linux-x64*.node packages/natives/native/
+          cp "$RUNNER_TEMP/omp-stock-addon/natives/19.2.0"/embedded-*/pi_natives.linux-x64*.node packages/natives/native/
           bun packages/coding-agent/scripts/build-binary.ts
       - name: Patched-host history and mixed-worker checks
         env:

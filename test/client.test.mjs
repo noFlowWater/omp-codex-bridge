@@ -1562,6 +1562,19 @@ it('includes message separators in the snapshot truncation flag', () => {
   assert.equal(threadSnapshot(state).textTruncated, true);
 });
 
+it('withholds moderated answers unless the native display instruction says show', () => {
+  const answer = (id, moderation) => {
+    const state = { messages: new Map(), textSize: 0, textTruncated: false, events: [], fileChanges: [] };
+    recordItem(state, { type: 'agentMessage', id, phase: 'final_answer', text: 'SECRET_ANSWER', moderation });
+    return threadSnapshot(state).finalText;
+  };
+  assert.equal(answer('plain'), 'SECRET_ANSWER');
+  assert.equal(answer('shown', { moderated: true, display: { mode: 'show', version: 1, trustedContacts: 'skip' } }), 'SECRET_ANSWER');
+  assert.match(answer('blocked', { moderated: true, display: { mode: 'block', version: 1, reason: { kind: 'cyber' } } }), /withheld.*blocked \(cyber\)/);
+  assert.match(answer('hidden', { moderated: false, display: { mode: 'hide', version: 1, replacement: { kind: 'wellbeingPromptHelpline' } } }), /withheld.*hidden/);
+  assert.match(answer('unreadable', { moderated: true, display: null }), /withheld.*restricted/);
+});
+
 it('does not submit a turn after cancellation while thread admission is pending', async (t) => {
   const { client, dir } = makeClient(t, { startDelay: 200, turns: ['hold'] });
   const controller = new AbortController();

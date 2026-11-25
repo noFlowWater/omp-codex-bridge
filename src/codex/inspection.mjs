@@ -49,12 +49,23 @@ function turnMetadata(turn) {
   };
 }
 
+// Codex 0.170+ answer display: only an explicit `show` reveals a moderated answer; an unreadable,
+// hidden or blocked instruction keeps the native text out of every bridge surface.
+function answerText(item) {
+  const original = typeof item.text === 'string' ? item.text : '';
+  const moderation = item.moderation;
+  const mode = moderation?.display?.mode;
+  if (mode === 'show' || (!moderation?.moderated && mode !== 'hide' && mode !== 'block')) return original;
+  const reason = mode === 'block' ? `blocked (${text(moderation.display.reason?.kind, 32) || 'unspecified'})` : mode === 'hide' ? 'hidden' : 'restricted';
+  return `[Answer withheld by Codex moderation: ${reason}]`;
+}
+
 // Semantic public projection selects valuable fields before generic bounded() limits incidental data.
 // Native file events describe reported edits, not a complete filesystem audit. Diff retrieval is explicit.
 export function projectItem(item, { includeDiff = false, textLimit = MAX_EVENT_TEXT } = {}) {
   if (!item || typeof item !== 'object' || Array.isArray(item)) return bounded(item);
   if (item.type === 'agentMessage') {
-    const original = typeof item.text === 'string' ? item.text : '';
+    const original = answerText(item);
     const kept = original.slice(0, textLimit);
     return { type: 'agentMessage', id: text(item.id, 256), text: kept,
       textTruncated: item.textTruncated === true || kept.length < original.length,
@@ -138,7 +149,7 @@ function recordMessage(state, id, value, phase) {
 export function recordItem(state, item) {
   if (!item || typeof item !== 'object') return;
   if (item.type === 'agentMessage') {
-    recordMessage(state, item.id, item.text ?? '', item.phase);
+    recordMessage(state, item.id, answerText(item), item.phase);
     if (item.textTruncated) state.textTruncated = true;
   } else if (item.type === 'fileChange') {
     const projected = projectItem(item);

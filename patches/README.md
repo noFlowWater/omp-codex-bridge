@@ -1,12 +1,12 @@
 # Optional Agent Hub host API
 
-Stock OMP 18.21.0 has no host-bound extension API to create or control Hub workers. The bridge detects this explicitly: `/codex jobs` still manages direct workers, and normal assistant delegation still uses OMP's task tool. Command-driven Hub controls and history continuation require this patch.
+Stock OMP 19.2.0 has no host-bound extension API to create or control Hub workers. The bridge detects this explicitly: `/codex jobs` still manages direct workers, and normal assistant delegation still uses OMP's task tool. Command-driven Hub controls and history continuation require this patch.
 
-`omp-v18.21-hub-api.patch` targets official OMP tag `v18.21.0`, commit `6f03614d761366972e80e84e25d1418ed678d2c7`. It adds `ctx.agents` to an interactive host context and delegates through the native task tool, async manager and Agent Hub lifecycle. The plugin does not install this patch or replace your executable.
+`omp-v19.2-hub-api.patch` targets official OMP tag `v19.2.0`, commit `5c5ecb16fa4903c09a57a84983e482d9c9c2232e`. It adds `ctx.agents` to an interactive host context and delegates through the native task tool, async manager and Agent Hub lifecycle. The plugin does not install this patch or replace your executable.
 
 The API lists current root-session jobs and supports spawn, focus, send, interrupt and cancel. Callers retain the complete returned job handle. Actions reject stale root, job, session and run identities rather than selecting the latest worker implicitly. Model grants, task policies and live-steering settings still apply. Trusted child initialization is persisted before child extensions start and is not part of the model-facing task schema. Operator-origin child completion remains visible in the Hub and job records without waking the parent model; ordinary model-origin task completion delivery is unchanged. Input admission awaits revival and a stale-handle check, while the child model turn remains asynchronous and later failures stay on the native job record.
 
-Build a separate executable and keep the standard `omp` intact. The following commands target Linux x64 and require Git, Bun **1.4.4 or newer**, and the official stock **OMP 18.21.0** executable on `PATH`. The stock executable contains the matching native addon; a clean RPC startup with only `get_state` extracts it into a dedicated temporary cache. No account, model request, Cargo installation, or existing user cache is needed.
+Build a separate executable and keep the standard `omp` intact. The following commands target Linux x64 and require Git, Bun **1.4.4 or newer**, and the official stock **OMP 19.2.0** executable on `PATH`. The stock executable contains the matching native addon; a clean RPC startup with only `get_state` extracts it into a dedicated temporary cache. No account, model request, Cargo installation, or existing user cache is needed.
 
 Run from this bridge checkout:
 
@@ -23,12 +23,12 @@ printf '%s\n' '{"id":"native-addon-bootstrap","type":"get_state"}' | \
     OPENAI_API_KEY=sk-no-inference-bootstrap \
     "$stock_omp" --mode rpc --no-ui --no-session --no-extensions \
       --model openai/gpt-4o > "$build_root/stock-state.jsonl"
-git clone --branch v18.21.0 --depth 1 https://github.com/can1357/oh-my-pi.git "$host_root"
-git -C "$host_root" checkout --detach 6f03614d761366972e80e84e25d1418ed678d2c7
-git -C "$host_root" apply "$bridge_root/patches/omp-v18.21-hub-api.patch"
+git clone --branch v19.2.0 --depth 1 https://github.com/can1357/oh-my-pi.git "$host_root"
+git -C "$host_root" checkout --detach 5c5ecb16fa4903c09a57a84983e482d9c9c2232e
+git -C "$host_root" apply "$bridge_root/patches/omp-v19.2-hub-api.patch"
 cd "$host_root"
 bun install --frozen-lockfile
-cp "$build_root/natives/18.21.0"/pi_natives.linux-x64*.node packages/natives/native/
+cp "$build_root/natives/19.2.0"/embedded-*/pi_natives.linux-x64*.node packages/natives/native/
 bun packages/coding-agent/scripts/build-binary.ts
 "$host_root/packages/coding-agent/dist/omp" --version
 ```
